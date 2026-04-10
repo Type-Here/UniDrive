@@ -1,0 +1,36 @@
+name: unidrive
+
+channels:
+  - conda-forge
+  - pytorch
+
+dependencies:
+  - python=3.10
+  - pillow
+  - imageio
+  - scikit-image
+  - numpy<2.0
+  - pandas
+  - scipy
+  - pytorch>=2.2
+  - torchvision>=0.17
+  - torchaudio
+  - cpuonly
+  - pip
+  - pip:
+      - opencv-python==4.9.0.80
+      - labelme==5.4.1
+      - segmentation-models-pytorch==0.3.4
+      - transformers==4.41
+      - albumentations==1.4.10
+      - pycocotools
+      - lightning==2.3
+      - torchmetrics==1.4
+      - wandb
+      - tensorboard
+      - tqdm
+      - matplotlib
+      - seaborn
+      - pyyaml
+      - rich
+      - python-dotenv

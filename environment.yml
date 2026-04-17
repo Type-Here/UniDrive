@@ -16,6 +16,9 @@ dependencies:
   - torchvision>=0.17
   - torchaudio
   - cpuonly
+  - rosbags
+  - labelme
+  - matplotlib
   - pip
   - pip:
       - opencv-python==4.9.0.80

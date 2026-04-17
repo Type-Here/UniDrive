@@ -12,13 +12,13 @@ Capture Modality:
 
 Output Structure:
   dataset/
-  └── session_YYYYMMDD_HHMMSS/
-      ├── rgb/
-      │   ├── frame_000001.jpg
-      │   └── ...
-      └── depth/          ← solo se SAVE_DEPTH = True
-          ├── frame_000001.png
-          └── ...
+  └-- session_YYYYMMDD_HHMMSS/
+      ├-- rgb/
+      │   ├-- frame_000001.jpg
+      │   └-- ...
+      └-- depth/          ← solo se SAVE_DEPTH = True
+          ├-- frame_000001.png
+          └-- ...
 
 Dependencies:
   pip install opencv-python numpy
@@ -38,9 +38,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  CONFIGURATION
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 # Backend: True = OpenNI2 (depth available), False = only OpenCV (RGB only)
 USE_OPENNI = False
@@ -71,9 +71,9 @@ JPEG_QUALITY      = 95
 # Show Preview Windows
 SHOW_PREVIEW      = False
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  SESSION SETUP
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def create_session_dirs(base: Path):
     session_name = "session_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -87,9 +87,9 @@ def create_session_dirs(base: Path):
     return session_dir, rgb_dir, depth_dir
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  BACKEND OPENNI2
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def init_openni():
     """Init OpenNI2 and open RGB flow and (optionally) depth."""
@@ -142,9 +142,9 @@ def read_openni_frame(rgb_stream, depth_stream):
     return rgb, depth_colored
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  BACKEND OPENCV
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def init_opencv():
     cap = cv2.VideoCapture(OPENCV_DEVICE_INDEX, cv2.CAP_V4L2)
@@ -169,20 +169,20 @@ def read_opencv_frame(cap):
     return frame, None
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  SAVE FRAME
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def save_frame(rgb, depth_colored, rgb_dir, depth_dir, counter):
     filename = f"frame_{counter:06d}"
 
-    # RGB → JPEG
+    # RGB -> JPEG
     rgb_path = rgb_dir / f"{filename}.jpg"
     cv2.imwrite(str(rgb_path),
                 rgb,
                 [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
 
-    # Depth → PNG (lossless)
+    # Depth -> PNG (lossless)
     if depth_colored is not None and SAVE_DEPTH:
         depth_path = depth_dir / f"{filename}.png"
         cv2.imwrite(str(depth_path), depth_colored)
@@ -190,9 +190,9 @@ def save_frame(rgb, depth_colored, rgb_dir, depth_dir, counter):
     return rgb_path
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  OVERLAY HUD on preview
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def draw_hud(frame, counter, auto_active, last_saved_path):
     h, w = frame.shape[:2]
@@ -221,9 +221,9 @@ def draw_hud(frame, counter, auto_active, last_saved_path):
     return frame
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  MAIN LOOP
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def main():
     print("=" * 55)
@@ -248,9 +248,9 @@ def main():
     last_saved     = None
 
     print("\nControlli:")
-    print("  SPAZIO → salva frame manuale")
-    print("  A      → avvia / pausa cattura automatica")
-    print("  Q      → esci e chiudi\n")
+    print("  SPAZIO -> salva frame manuale")
+    print("  A      -> avvia / pausa cattura automatica")
+    print("  Q      -> esci e chiudi\n")
 
     try:
         while True:
@@ -290,13 +290,13 @@ def main():
                                             rgb_dir, depth_dir, counter)
                     print(f"[MANUALE] Salvato frame {counter:06d}")
 
-                # ── Toggle AUTO ─────────────────────────────
+                # -- Toggle AUTO -----------------------------
                 elif key == ord('a'):
                     auto_active = not auto_active
                     stato = "AVVIATA" if auto_active else "IN PAUSA"
                     print(f"[INFO] Cattura automatica {stato}")
 
-                # ── EXIT ────────────────────────────────────
+                # -- EXIT ------------------------------------
                 elif key == ord('q'):
                     break
             else:

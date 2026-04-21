@@ -19,6 +19,7 @@ dependencies:
   - rosbags
   - labelme
   - matplotlib
+  - pyyaml
   - pip
   - pip:
       - opencv-python==4.9.0.80
@@ -37,3 +38,4 @@ dependencies:
       - pyyaml
       - rich
       - python-dotenv
+      - albumentations[headless]

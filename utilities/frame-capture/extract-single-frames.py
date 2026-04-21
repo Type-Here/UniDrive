@@ -13,7 +13,7 @@ Defaults:
 import sys, os
 import cv2
 
-def extract(video_path, n_frames=90, out_dir=None):
+def extract(video_path, n_frames=90, out_dir=None, use_jpg=False):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"ERROR: cannot open {video_path}"); sys.exit(1)
@@ -45,8 +45,12 @@ def extract(video_path, n_frames=90, out_dir=None):
             print(f"  Warning: could not read frame {idx}")
             continue
         t_sec = idx / fps
-        fname = os.path.join(out_dir, f"frame_{i:03d}_t{t_sec:.2f}s.jpg")
-        cv2.imwrite(fname, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if use_jpg:
+            fname = os.path.join(out_dir, f"frame_{i:03d}_t{t_sec:.2f}s.jpg")
+            cv2.imwrite(fname, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        else:
+            fname = os.path.join(out_dir, f"frame_{i:03d}_t{t_sec:.2f}s.png")
+            cv2.imwrite(fname, frame)
         saved += 1
         print(f"  [{i+1:3d}/{n_frames}] t={t_sec:6.2f}s  -> {os.path.basename(fname)}")
 
@@ -54,10 +58,12 @@ def extract(video_path, n_frames=90, out_dir=None):
     print(f"\n  Done - {saved} frames saved to '{out_dir}'")
 
 if __name__ == "__main__":
+
     if len(sys.argv) < 2:
-        print("Usage: python3 extract_frames.py <video> [n_frames] [output_dir]")
+        print("Usage: python3 extract_frames.py <video> [n_frames] [output_dir] [jpg]")
         sys.exit(1)
     video   = sys.argv[1]
     n       = int(sys.argv[2]) if len(sys.argv) > 2 else 90
     out     = sys.argv[3]      if len(sys.argv) > 3 else None
-    extract(video, n, out)
+    use_jpg = sys.argv[4].lower() == "jpg" if len(sys.argv) > 4 else False
+    extract(video, n, out, use_jpg)

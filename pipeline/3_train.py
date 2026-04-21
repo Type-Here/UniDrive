@@ -24,7 +24,6 @@ Outputs:
 
 import argparse
 import csv
-import sys
 import time
 from pathlib import Path
 
@@ -32,7 +31,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-from torch.cuda.amp import GradScaler, autocast
+from sympy.physics.units import current
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, PolynomialLR
 from transformers import SegformerForSemanticSegmentation
@@ -158,7 +158,7 @@ def build_criterion(cfg: dict, device: torch.device) -> nn.CrossEntropyLoss:
 
 # -- Scheduler -----------------------------------------------------------------
 
-def build_scheduler(optimizer, cfg: dict, num_steps: int):
+def build_scheduler(optimizer, cfg: dict):
     tr      = cfg["training"]
     sched   = tr.get("scheduler", "cosine")
     epochs  = tr["epochs"]
@@ -281,7 +281,7 @@ def run_epoch(model, loader, criterion, optimizer,
             images = batch["image"].to(device, non_blocking=True)
             masks  = batch["mask"].to(device,  non_blocking=True)
 
-            with autocast(enabled=use_amp):
+            with autocast(device, enabled=use_amp):
                 outputs = model(pixel_values=images)
                 # SegFormer outputs logits at 1/4 resolution -- upsample to mask size
                 logits  = outputs.logits
@@ -350,7 +350,7 @@ def train(cfg: dict, resume_path: str = None):
     # Model
     print(f"  Loading model: {cfg['model']['name']} ...")
     model     = build_model(cfg).to(device)
-    criterion = build_criterion(cfg, device)
+    criterion = build_criterion(cfg, device) # Loss
 
     # Optimizer
     tr     = cfg["training"]
@@ -363,7 +363,7 @@ def train(cfg: dict, resume_path: str = None):
     warmup_ep   = tr.get("warmup_epochs", 5)
     patience    = tr.get("early_stopping_patience", 15)
     save_every  = tr.get("save_every", 10)
-    scheduler   = build_scheduler(optim, cfg, len(train_dl))
+    scheduler   = build_scheduler(optim, cfg)
 
     metrics     = SegmentationMetrics(num_classes, ignore_bg=False)
     logger      = Logger(log_dir)
@@ -383,6 +383,8 @@ def train(cfg: dict, resume_path: str = None):
 
     print(f"\n  Training for {epochs} epochs "
           f"(warmup={warmup_ep}, patience={patience})\n")
+
+    current_epoch = start_epoch
 
     # Training loop
     for epoch in range(start_epoch, epochs + 1):
@@ -471,10 +473,11 @@ def train(cfg: dict, resume_path: str = None):
             print(f"\n  Early stopping at epoch {epoch} "
                   f"(no improvement for {patience} epochs)")
             break
+        current_epoch = epoch + 1
 
     # Final checkpoint
     save_checkpoint({
-        "epoch":     epoch,
+        "epoch":     current_epoch,
         "model":     model.state_dict(),
         "optimizer": optim.state_dict(),
         "scaler":    scaler.state_dict(),

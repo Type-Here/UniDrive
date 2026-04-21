@@ -160,7 +160,7 @@ class LaneDataset(Dataset):
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         # Load mask as single-channel uint8 (values 0..num_classes-1)
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED) # Prevent cv2 from converting uint8 to bgr
         if mask is None:
             raise IOError(f"Cannot read mask: {mask_path}")
 

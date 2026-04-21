@@ -23,6 +23,9 @@ from pathlib import Path
 
 import cv2
 import matplotlib
+
+from config import PIPELINE_CONFIG
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -370,7 +373,7 @@ def evaluate(cfg: dict, checkpoint_path: Path, split: str,
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate a SegFormer checkpoint on val or test split")
-    parser.add_argument("--config",     default="config.yaml")
+    parser.add_argument("--config",     default=f"{PIPELINE_CONFIG}")
     parser.add_argument("--checkpoint", default="checkpoints/best.pth")
     parser.add_argument("--split",      default="test",
                         choices=["val", "test"])

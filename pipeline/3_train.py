@@ -41,6 +41,9 @@ from transformers import SegformerForSemanticSegmentation
 # module names cannot start with a digit. We use importlib to load it.
 import importlib.util as _ilu
 
+from config import PIPELINE_CONFIG
+
+
 def _load_dataset_module():
     _here = Path(__file__).parent
     for candidate in ("dataset.py", "2_dataset.py"):
@@ -498,7 +501,7 @@ def train(cfg: dict, resume_path: str = None):
 def main():
     parser = argparse.ArgumentParser(
         description="Fine-tune SegFormer for lane segmentation")
-    parser.add_argument("--config",  default="config.yaml")
+    parser.add_argument("--config",  default=f"{PIPELINE_CONFIG}")
     parser.add_argument("--resume",  default=None,
                         help="Path to checkpoint to resume from")
     parser.add_argument("--model",   default=None,

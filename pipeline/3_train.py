@@ -284,7 +284,7 @@ def run_epoch(model, loader, criterion, optimizer,
             images = batch["image"].to(device, non_blocking=True)
             masks  = batch["mask"].to(device,  non_blocking=True)
 
-            with autocast(device, enabled=use_amp):
+            with autocast(device.type, enabled=use_amp):
                 outputs = model(pixel_values=images)
                 # SegFormer outputs logits at 1/4 resolution -- upsample to mask size
                 logits  = outputs.logits

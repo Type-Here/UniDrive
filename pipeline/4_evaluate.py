@@ -288,8 +288,8 @@ def evaluate(cfg: dict, checkpoint_path: Path, split: str,
 
     num_classes  = ckpt_cfg["num_classes"]
     class_colors = ckpt_cfg["class_colors"]
-    class_names  = [ckpt_cfg["model"]["id2label"][str(i)]
-                    for i in range(num_classes)]
+    id2label = {int(k): v for k, v in ckpt_cfg["model"]["id2label"].items()}
+    class_names = [id2label[i] for i in range(num_classes)]
 
     cm = ConfusionMatrix(num_classes)
 

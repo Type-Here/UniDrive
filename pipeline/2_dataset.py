@@ -17,7 +17,6 @@ Usage (standalone test):
 """
 
 import argparse
-import random
 from pathlib import Path
 
 import cv2

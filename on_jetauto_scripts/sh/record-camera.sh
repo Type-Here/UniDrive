@@ -13,10 +13,7 @@ echo "  Output : $OUTFILE"
 echo "  Press Ctrl+C to stop"
 echo "============================================"
 
-rosbag record \
-    /depth_cam/rgb/image_raw \
-    /odom \
-    -O "$OUTFILE"
+rosbag record /depth_cam/rgb/image_raw /odom -O "$OUTFILE"
 
 echo ""
 echo "Saved: $OUTFILE"

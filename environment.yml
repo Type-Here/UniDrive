@@ -1,41 +1,76 @@
 name: unidrive
 
+# Channel priority: pytorch must come before conda-forge so that
+# the correct pytorch build (cpu or cuda) is resolved first.
 channels:
-  - conda-forge
   - pytorch
+  - conda-forge
 
 dependencies:
   - python=3.10
+
+  # --- Core scientific stack (conda handles binary compatibility) ---
+  - numpy<2.0        # pinned because some packages break with numpy 2.x
   - pillow
   - imageio
   - scikit-image
-  - numpy<2.0
   - pandas
   - scipy
+  - matplotlib
+  - pyyaml
+
+  # --- PyTorch (CPU build) ---
+  # To switch to CUDA 11.8 replace these two lines with:
+  #   - pytorch>=2.2
+  #   - torchvision>=0.17
+  #   - torchaudio
+  #   - pytorch-cuda=11.8
+  # To switch to CUDA 12.1 replace with:
+  #   - pytorch>=2.2
+  #   - torchvision>=0.17
+  #   - torchaudio
+  #   - pytorch-cuda=12.1
   - pytorch>=2.2
   - torchvision>=0.17
   - torchaudio
-  - cpuonly
-  - rosbags
-  - labelme
-  - matplotlib
-  - pyyaml
+  - cpuonly            # <-- remove this line when using a cuda variant above
+
+  # --- Tooling ---
   - pip
+
   - pip:
+      # --- Computer vision and annotation ---
       - opencv-python==4.9.0.80
       - labelme==5.4.1
-      - segmentation-models-pytorch==0.3.4
-      - transformers==4.41
-      - albumentations==1.4.10
       - pycocotools
+
+      # --- Segmentation and transformers ---
+      # segmentation-models-pytorch 0.3.4 supports torch>=2.0
+      - segmentation-models-pytorch==0.3.4
+      - transformers==4.41.0
+
+      # --- Augmentation ---
+      # Use albumentations[headless] to avoid requiring a display (Qt/GTK) on headless servers.
+      - albumentations[headless]==1.4.10
+
+      # --- Training utilities ---
+      # lightning 2.3 requires torch>=2.1, compatible with torch>=2.2
       - lightning==2.3
       - torchmetrics==1.4
       - wandb
       - tensorboard
       - tqdm
-      - matplotlib
-      - seaborn
-      - pyyaml
       - rich
+
+      # --- ROS bag reading ---
+      - rosbags
+
+      # --- ONNX export ---
+      - onnx
+      - onnxruntime     # for CPU inference and export verification
+      # - onnxruntime-gpu  # <-- replace onnxruntime with this for GPU inference
+      - onnxsim         # optional: simplifies the ONNX graph after export
+
+      # --- Misc ---
+      - seaborn
       - python-dotenv
-      - albumentations[headless]

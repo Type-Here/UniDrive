@@ -138,6 +138,7 @@ def export_onnx(model: nn.Module, cfg: dict,
             "segmentation_mask":{0: "batch_size"},
         },
         do_constant_folding=True,
+        dynamo=False
     )
     size_mb = out_path.stat().st_size / 1024 / 1024
     print(f"  Saved   : {out_path.resolve()}  ({size_mb:.1f} MB)")

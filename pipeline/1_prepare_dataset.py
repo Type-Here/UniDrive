@@ -27,7 +27,6 @@ import argparse
 import json
 import math
 import random
-import shutil
 import sys
 from pathlib import Path
 
@@ -155,19 +154,56 @@ def compute_stats(masks: list[np.ndarray], num_classes: int) -> dict:
 
 # -- Split ---------------------------------------------------------------------
 
+# Known illumination condition prefixes.
+# Images not matching any prefix are grouped as "other".
+ILLUMINATION_PREFIXES = ("normal_", "reflex_", "night_")
+
+
 def split_files(files: list[Path], train_frac: float,
                 val_frac: float, seed: int):
+    """
+    Stratified split by illumination condition.
+    Files are grouped by their name prefix (normal_, reflex_, night_).
+    The split fractions are applied independently within each group
+    so every condition is proportionally represented in train/val/test.
+    """
     rng = random.Random(seed)
-    shuffled = files[:]
-    rng.shuffle(shuffled)
 
-    n        = len(shuffled)
-    n_train  = math.floor(n * train_frac)
-    n_val    = math.floor(n * val_frac)
+    # Group files by illumination prefix
+    groups: dict[str, list[Path]] = {}
+    for f in files:
+        matched = False
+        for prefix in ILLUMINATION_PREFIXES:
+            if f.name.startswith(prefix):
+                groups.setdefault(prefix, []).append(f)
+                matched = True
+                break
+        if not matched:
+            groups.setdefault("other", []).append(f)
 
-    train = shuffled[:n_train]
-    val   = shuffled[n_train:n_train + n_val]
-    test  = shuffled[n_train + n_val:]
+    print(f"  Illumination groups found:")
+    for group, members in sorted(groups.items()):
+        print(f"    {group:<12}: {len(members)} images")
+
+    train, val, test = [], [], []
+
+    for group, members in groups.items():
+        rng.shuffle(members)
+        n = len(members)
+        n_train = math.floor(n * train_frac)
+        n_val = math.floor(n * val_frac)
+        # Ensure at least 1 image per split when group is large enough
+        if n >= 3:
+            n_train = max(1, n_train)
+            n_val = max(1, n_val)
+        train += members[:n_train]
+        val += members[n_train:n_train + n_val]
+        test += members[n_train + n_val:]
+
+    # Shuffle the final lists so groups are interleaved during training
+    rng.shuffle(train)
+    rng.shuffle(val)
+    rng.shuffle(test)
 
     return train, val, test
 
@@ -345,7 +381,7 @@ def main():
         for cls_id in range(num_classes):
             name  = class_names.get(cls_id, str(cls_id))
             freq  = stats["frequencies"][cls_id]
-            count = stats["counts"][cls_id]
+            #count = stats["counts"][cls_id]
             bar   = "█" * int(freq * 40)
             print(f"    {cls_id} {name:14s}  {freq*100:5.1f}%  {bar}")
         print()

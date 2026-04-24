@@ -125,5 +125,5 @@ evaluation:
 
 # -- Export --------------------------------------------------------------------
 export:
-  opset_version: 17
+  opset_version: 11
   simplify: true                # run onnx-simplifier after export

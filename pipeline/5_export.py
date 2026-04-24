@@ -114,32 +114,59 @@ def load_model(checkpoint_path: Path) -> tuple:
 # -- ONNX export ---------------------------------------------------------------
 
 def export_onnx(model: nn.Module, cfg: dict,
-                out_path: Path, batch_size: int, opset: int):
+                out_path: Path, batch_size: int, opset: int, dynamo=True):
     """
     Export the wrapped model to ONNX with dynamic batch size.
     """
     out_h = cfg["image"]["model_h"]
     out_w = cfg["image"]["model_w"]
 
+    # batch_size is fixed to 1 for TRT 8.2.1 static batch compatibility.
+    # Ignore the --batch argument when targeting TRT 8.2.1.
+    if opset <= 11 and batch_size != 1:
+        print(f"  Warning: opset {opset} does not support dynamic batch size.")
+        print(f"  Ignoring --batch {batch_size} and using batch_size=1 for export.")
+        batch_size = 1
+
     dummy = torch.zeros(batch_size, 3, out_h, out_w)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"\n  Exporting to ONNX (opset {opset}) ...")
-    torch.onnx.export(
-        model,
-        dummy,
-        str(out_path),
-        opset_version=opset,
-        input_names=["pixel_values"],
-        output_names=["segmentation_mask"],
-        dynamic_axes={
-            "pixel_values":     {0: "batch_size"},
-            "segmentation_mask":{0: "batch_size"},
-        },
-        do_constant_folding=True,
-        dynamo=False
-    )
+    # Use legacy exporter (dynamo=False) with static batch=1 and opset<=11
+    # for TensorRT 8.2.1 compatibility on Jetson Nano.
+    # - opset 11: LayerNorm is decomposed into primitives (ReduceMean, Sub,
+    #             Pow, Add, Sqrt, Div, Mul) which TRT 8.2.1 supports natively.
+    # - static batch=1: avoids dynamic shape issues in TRT 8.2.1.
+    # - dynamo=False: uses the stable trace-based exporter of PyTorch 1.10.
+    if opset <= 11:
+        print("  Using legacy ONNX exporter for opset <= 11 compatibility.")
+        torch.onnx.export(
+            model,
+            dummy,
+            str(out_path),
+            opset_version=opset,
+            input_names=["pixel_values"],
+            output_names=["segmentation_mask"],
+            do_constant_folding=True,
+        )
+
+    else:
+        torch.onnx.export(
+            model,
+            dummy,
+            str(out_path),
+            opset_version=opset,
+            input_names=["pixel_values"],
+            output_names=["segmentation_mask"],
+            dynamic_axes={
+                "pixel_values":     {0: "batch_size"},
+                "segmentation_mask":{0: "batch_size"},
+            },
+            do_constant_folding=True,
+            dynamo=dynamo
+        )
+
     size_mb = out_path.stat().st_size / 1024 / 1024
     print(f"  Saved   : {out_path.resolve()}  ({size_mb:.1f} MB)")
 

@@ -50,12 +50,14 @@ Options:
 
 import argparse
 import json
+import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
 import rospy
-from cv_bridge import CvBridge
+# cv_bridge is not used -- raw numpy conversion avoids Python 2/3 issues
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Image
 
@@ -130,19 +132,24 @@ class ONNXBackend:
 
 class TensorRTBackend:
     """
-    Inference via TensorRT -- optimal for Jetson Nano.
+    Inference via TensorRT using PyTorch CUDA tensors -- no pycuda needed.
 
-    Requires:
-        pip install tensorrt pycuda
+    Uses torch.cuda tensors as GPU buffers and ctypes to pass pointers
+    to TensorRT execute_v2. Requires only tensorrt + torch with CUDA.
+
     The engine file must have been compiled on the same Jetson device.
     """
 
     def __init__(self, engine_path: str):
         import tensorrt as trt
-        import pycuda.autoinit          # noqa: F401 -- initialises CUDA context
-        import pycuda.driver as cuda
+        import torch
 
-        self.cuda = cuda
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "TensorRT backend requires CUDA. "
+                "torch.cuda.is_available() returned False.")
+
+        self.torch = torch
         TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
         with open(engine_path, "rb") as f:
@@ -151,49 +158,55 @@ class TensorRTBackend:
 
         self.context = self.engine.create_execution_context()
 
-        # Allocate host/device buffers
-        self.inputs  = []
-        self.outputs = []
-        self.bindings = []
+        # Allocate GPU tensors for each binding using PyTorch
+        self.gpu_bufs  = []   # list of torch CUDA tensors
+        self.bindings  = []   # list of data_ptr() for execute_v2
+        self.in_idx    = []   # indices of input bindings
+        self.out_idx   = []   # indices of output bindings
+        self.out_shapes = []  # shapes of output bindings
 
-        for binding in self.engine:
-            shape = self.engine.get_binding_shape(binding)
-            size  = abs(int(np.prod(shape)))
-            dtype = np.float32
+        for i, binding in enumerate(self.engine):
+            shape = tuple(self.engine.get_binding_shape(binding))
+            # Replace any -1 dynamic dims with 1
+            shape = tuple(max(s, 1) for s in shape)
+            buf   = torch.zeros(shape, dtype=torch.float32, device="cuda")
+            self.gpu_bufs.append(buf)
+            self.bindings.append(buf.data_ptr())
 
-            host_mem   = cuda.pagelocked_empty(size, dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-
-            self.bindings.append(int(device_mem))
             if self.engine.binding_is_input(binding):
-                self.inputs.append({"host": host_mem, "device": device_mem,
-                                    "shape": shape})
+                self.in_idx.append(i)
             else:
-                self.outputs.append({"host": host_mem, "device": device_mem,
-                                     "shape": shape})
+                self.out_idx.append(i)
+                self.out_shapes.append(shape)
 
-        self.stream = cuda.Stream()
         rospy.loginfo("[lane_follower] TensorRT backend loaded: %s", engine_path)
+        rospy.loginfo("[lane_follower] Input  shape: %s",
+                      tuple(self.engine.get_binding_shape(
+                          list(self.engine)[self.in_idx[0]])))
+        rospy.loginfo("[lane_follower] Output shape: %s",
+                      self.out_shapes[0])
 
     def infer(self, img_chw: np.ndarray) -> np.ndarray:
-        inp = img_chw[np.newaxis].astype(np.float32).ravel()
-        np.copyto(self.inputs[0]["host"], inp)
-        self.cuda.memcpy_htod_async(
-            self.inputs[0]["device"],
-            self.inputs[0]["host"],
-            self.stream)
-        self.context.execute_async_v2(
-            bindings=self.bindings,
-            stream_handle=self.stream.handle)
-        self.cuda.memcpy_dtoh_async(
-            self.outputs[0]["host"],
-            self.outputs[0]["device"],
-            self.stream)
-        self.stream.synchronize()
+        """
+        img_chw: float32 numpy array (3, H, W) normalised
+        Returns: int64 numpy array (H, W) with class indices
+        """
+        torch = self.torch
 
-        out   = self.outputs[0]["host"]
-        shape = self.outputs[0]["shape"]
-        return out.reshape(shape)[0].astype(np.int64)   # (H, W)
+        # Copy input numpy array to GPU tensor
+        inp_tensor = torch.from_numpy(
+            img_chw[np.newaxis].astype(np.float32)).cuda()
+        self.gpu_bufs[self.in_idx[0]].copy_(inp_tensor)
+
+        # Run inference synchronously
+        self.context.execute_v2(bindings=self.bindings)
+
+        # Copy output from GPU to CPU numpy
+        out_tensor = self.gpu_bufs[self.out_idx[0]]
+        out_np     = out_tensor.cpu().numpy()
+
+        # Output is (1, H, W) -- remove batch dim and cast to int
+        return out_np[0].astype(np.int64)
 
 
 # -- Image preprocessing -------------------------------------------------------
@@ -407,7 +420,7 @@ class LaneFollowerNode:
         self.speed   = args.speed
         self.dry_run = args.dry_run
         self.debug   = args.debug
-        self.bridge  = CvBridge()
+        # No CvBridge -- use raw numpy conversion instead
 
         # State
         self.last_error    = 0.0
@@ -442,11 +455,26 @@ class LaneFollowerNode:
     def image_cb(self, msg: Image):
         t0 = time.time()
 
-        # Convert ROS image to BGR numpy array
+        # Convert ROS Image message to BGR numpy array without cv_bridge.
+        # Works with Python 3 on ROS Melodic where cv_bridge is Python 2 only.
         try:
-            img_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            dtype   = np.uint8
+            n_ch    = {"rgb8": 3, "bgr8": 3, "mono8": 1,
+                       "rgba8": 4, "bgra8": 4}.get(msg.encoding, 3)
+            img_raw = np.frombuffer(msg.data, dtype=dtype)
+            img_raw = img_raw.reshape(msg.height, msg.width, n_ch)
+
+            if msg.encoding == "rgb8":
+                img_bgr = img_raw[:, :, ::-1].copy()   # RGB -> BGR
+            elif msg.encoding in ("bgr8", "bgra8", "rgba8"):
+                img_bgr = img_raw[:, :, :3].copy()     # drop alpha if present
+            elif msg.encoding == "mono8":
+                img_bgr = np.stack([img_raw[:, :, 0]] * 3, axis=-1)
+            else:
+                # Unknown encoding -- try treating as BGR
+                img_bgr = img_raw[:, :, :3].copy()
         except Exception as e:
-            rospy.logwarn_throttle(5, "[lane_follower] imgmsg_to_cv2 failed: %s", e)
+            rospy.logwarn_throttle(5, "[lane_follower] image conversion failed: %s", e)
             return
 
         # Preprocess
@@ -508,8 +536,13 @@ class LaneFollowerNode:
             dbg = make_debug_image(img_disp, mask, bev_mask,
                                    error_norm, n_pixels, angular_z)
             try:
-                dbg_msg = self.bridge.cv2_to_imgmsg(dbg, encoding="bgr8")
-                dbg_msg.header = msg.header
+                dbg_msg          = Image()
+                dbg_msg.header   = msg.header
+                dbg_msg.height   = dbg.shape[0]
+                dbg_msg.width    = dbg.shape[1]
+                dbg_msg.encoding = "bgr8"
+                dbg_msg.step     = dbg.shape[1] * 3
+                dbg_msg.data     = dbg.tobytes()
                 self.debug_pub.publish(dbg_msg)
             except Exception:
                 pass

@@ -216,3 +216,6 @@ artifacts/
 data/
 checkpoints/
 exports/
+
+# MacOS
+.DS_Store

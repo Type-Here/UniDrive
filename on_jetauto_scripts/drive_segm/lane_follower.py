@@ -46,6 +46,8 @@ Options:
     --tensorrt         Use TensorRT engine instead of ONNX runtime
     --debug            Publish debug image on /lane_follower/debug_image
     --dry-run          Run inference but do not publish cmd_vel
+    --publish-masks    Publish /lane_mask and /lane_mask_bev (mono8) for external lane_controller.
+                       Default: off. Can be combined with --dry-run.
 """
 
 import argparse
@@ -74,6 +76,11 @@ except ImportError:
 CAMERA_TOPIC  = "/depth_cam/rgb/image_raw"
 CMDVEL_TOPIC  = "/jetauto_controller/cmd_vel"
 DEBUG_TOPIC   = "/lane_follower/debug_image"
+
+# Topic for the external lane_controller (Python 2.7, separate node).
+# Published only if you pass --publish-masks via CLI.
+LANE_MASK_TOPIC      = "/lane_mask"        # maschera in image space, mono8
+LANE_MASK_BEV_TOPIC  = "/lane_mask_bev"    # maschera in BEV, mono8
 
 # Model input size -- must match training config
 MODEL_H = 256
@@ -420,7 +427,7 @@ class LaneFollowerNode:
         self.speed   = args.speed
         self.dry_run = args.dry_run
         self.debug   = args.debug
-        # No CvBridge -- use raw numpy conversion instead
+        self.publish_masks = args.publish_masks
 
         # State
         self.last_error    = 0.0
@@ -435,6 +442,16 @@ class LaneFollowerNode:
             self.debug_pub = rospy.Publisher(
                 DEBUG_TOPIC, Image, queue_size=1)
 
+        # Mask publishers for external lane_controller (opt-in with --publish-masks).
+        if self.publish_masks:
+            self.lane_mask_pub     = rospy.Publisher(
+                LANE_MASK_TOPIC, Image, queue_size=1)
+            self.lane_mask_bev_pub = rospy.Publisher(
+                LANE_MASK_BEV_TOPIC, Image, queue_size=1)
+            rospy.loginfo(
+                "[lane_follower] publish_masks ON: %s, %s",
+                LANE_MASK_TOPIC, LANE_MASK_BEV_TOPIC)
+
         # Subscriber -- process every frame (queue_size=1 drops old frames)
         self.sub = rospy.Subscriber(
             CAMERA_TOPIC, Image, self.image_cb,
@@ -445,6 +462,7 @@ class LaneFollowerNode:
                       self.speed, args.kp, args.ki, args.kd)
         rospy.loginfo("[lane_follower] Dry-run: %s  Debug: %s",
                       self.dry_run, self.debug)
+        rospy.loginfo("[lane_follower] Publish masks: %s", self.publish_masks)
         if self.dry_run:
             rospy.logwarn("[lane_follower] DRY-RUN mode -- no cmd_vel published")
 
@@ -490,6 +508,19 @@ class LaneFollowerNode:
 
         # BEV transform
         bev_mask = self.bev.mask_to_bev(mask)
+
+        # Publish masks for external lane_controller (opt-in).
+        if self.publish_masks:
+            try:
+                if self.lane_mask_pub.get_num_connections() > 0:
+                    self.lane_mask_pub.publish(
+                        self._make_mono8_msg(mask, msg.header))
+                if self.lane_mask_bev_pub.get_num_connections() > 0:
+                    self.lane_mask_bev_pub.publish(
+                        self._make_mono8_msg(bev_mask, msg.header))
+            except Exception as e:
+                rospy.logwarn_throttle(
+                    5, "[lane_follower] mask publish err: %s", e)
 
         # Lateral error
         error_norm, n_pixels = self.bev.lateral_error(bev_mask)
@@ -549,6 +580,19 @@ class LaneFollowerNode:
 
     # -- Helpers ---------------------------------------------------------------
 
+    @staticmethod
+    def _make_mono8_msg(mask, header):
+        """Convert an HxW uint8 mask to a sensor_msgs/Image mono8.
+        Same raw-numpy pattern as the debug_image, no cv_bridge."""
+        msg          = Image()
+        msg.header   = header
+        msg.height   = mask.shape[0]
+        msg.width    = mask.shape[1]
+        msg.encoding = "mono8"
+        msg.step     = mask.shape[1]
+        msg.data     = mask.astype(np.uint8).tobytes()
+        return msg
+
     def _publish_stop(self):
         """Publish zero velocity to stop the robot safely."""
         if not self.dry_run:
@@ -581,6 +625,11 @@ def main():
                         help="Use TensorRT backend instead of ONNX")
     parser.add_argument("--debug",    action="store_true",
                         help="Publish debug image on /lane_follower/debug_image")
+    parser.add_argument("--publish-masks", action="store_true",
+                        dest="publish_masks",
+                        help="Publish /lane_mask and /lane_mask_bev (mono8) "
+                             "for external lane_controller. Default: off. "
+                             "Can be combined with --dry-run.")
     parser.add_argument("--dry-run",  action="store_true", dest="dry_run",
                         help="Run inference without publishing cmd_vel")
 

@@ -61,6 +61,9 @@ import rospy
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Image
 
+import ctypes
+import ctypes.util
+
 # Optional debug image publisher
 try:
     from sensor_msgs.msg import Image as RosImage
@@ -137,113 +140,129 @@ class ONNXBackend:
 
 class TensorRTBackend:
     """
-    Inference via TensorRT using ctypes + CUDA driver API directly.
-    No PyTorch needed at runtime -- eliminates ~1.5GB PyTorch CUDA overhead.
+    Inference via TensorRT using ctypes + CUDA Runtime API.
+    No PyTorch needed -- saves ~1.5GB RAM on Jetson Nano.
 
-    Requires only:
-        tensorrt  (linked from /usr/lib/python3.6/dist-packages/tensorrt)
-        ctypes    (stdlib)
-        numpy     (already needed)
-        libcuda.so (always present on Jetson)
+    Uses cudaRT (libcudart.so) instead of the driver API so that
+    TensorRT and our memory transfers share the same CUDA context,
+    avoiding the "invalid resource handle" error that occurs when
+    mixing cuCtxCreate (driver API) with TensorRT (runtime API).
+
+    Requires only: tensorrt + numpy + libcudart.so (always on Jetson)
     """
 
     def __init__(self, engine_path: str):
         import tensorrt as trt
-        import ctypes
-        import ctypes.util
 
-        self.trt    = trt
-        self.ctypes = ctypes
+        # Load CUDA Runtime library (runtime API -- same one TensorRT uses)
+        for lib_name in ("libcudart.so.10.2",
+                         "libcudart.so",
+                         "/usr/local/cuda/lib64/libcudart.so"):
+            try:
+                self.rt = ctypes.CDLL(lib_name)
+                break
+            except OSError:
+                continue
+        else:
+            raise RuntimeError(
+                "Cannot find libcudart.so -- check CUDA installation")
 
-        # Load CUDA driver API
-        cuda_lib = ctypes.util.find_library("cuda")
-        if not cuda_lib:
-            cuda_lib = "/usr/lib/aarch64-linux-gnu/tegra/libcuda.so"
-        self.cuda = ctypes.CDLL(cuda_lib)
-
-        # Initialize CUDA driver and create context
-        self._cu(self.cuda.cuInit(0))
-        device = ctypes.c_int(0)
-        self._cu(self.cuda.cuDeviceGet(ctypes.byref(device), 0))
-        ctx = ctypes.c_void_p()
-        self._cu(self.cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, device))
-        self.cu_ctx = ctx
-
-        # Load engine
+        # Load TensorRT engine
         TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
         with open(engine_path, "rb") as f:
-            self.engine  = trt.Runtime(TRT_LOGGER).deserialize_cuda_engine(
+            self.engine = trt.Runtime(TRT_LOGGER).deserialize_cuda_engine(
                 f.read())
         self.context = self.engine.create_execution_context()
 
-        # Allocate host + device buffers per binding
-        self.host_bufs  = []
-        self.dev_bufs   = []
-        self.bindings   = []
-        self.in_idx     = []
-        self.out_idx    = []
+        # Create CUDA stream via runtime API (cudaStreamCreate)
+        # cudaStream_t is a pointer -- represent as c_void_p
+        self.stream = ctypes.c_void_p()
+        self._rt(self.rt.cudaStreamCreate(ctypes.byref(self.stream)))
+
+        # Allocate host (pinned) + device buffers per binding
+        self.host_bufs = []
+        self.dev_bufs = []
+        self.bindings = []
+        self.in_idx = []
+        self.out_idx = []
         self.out_shapes = []
 
         for i, binding in enumerate(self.engine):
             shape = tuple(max(s, 1) for s in
                           self.engine.get_binding_shape(binding))
-            n     = int(np.prod(shape))
-            h_buf = np.empty(n, dtype=np.float32)
-            d_buf = ctypes.c_void_p()
-            self._cu(self.cuda.cuMemAlloc_v2(ctypes.byref(d_buf), n * 4))
-            self.host_bufs.append(h_buf)
-            self.dev_bufs.append(d_buf)
-            self.bindings.append(d_buf.value)
+            n = int(np.prod(shape))
+
+            trt_dtype = self.engine.get_binding_dtype(binding)
+            dtype_map = {
+                trt.DataType.FLOAT: (np.float32, 4),
+                trt.DataType.HALF: (np.float16, 2),
+                trt.DataType.INT32: (np.int32, 4),
+                trt.DataType.INT8: (np.int8, 1),
+            }
+            np_dtype, item_size = dtype_map.get(trt_dtype, (np.float32, 4))
+
+            h_ptr = ctypes.c_void_p()
+            self._rt(self.rt.cudaMallocHost(
+                ctypes.byref(h_ptr), n * item_size))
+            h_buf = np.frombuffer(
+                (ctypes.c_char * (n * item_size)).from_address(h_ptr.value),
+                dtype=np_dtype)
+
+            d_ptr = ctypes.c_void_p()
+            self._rt(self.rt.cudaMalloc(
+                ctypes.byref(d_ptr), n * item_size))
+
+            self.host_bufs.append((h_ptr, h_buf, item_size))
+            self.dev_bufs.append(d_ptr)
+            self.bindings.append(d_ptr.value)
+
             if self.engine.binding_is_input(binding):
                 self.in_idx.append(i)
             else:
                 self.out_idx.append(i)
                 self.out_shapes.append(shape)
 
-        # CUDA stream
-        self.stream = ctypes.c_void_p()
-        self._cu(self.cuda.cuStreamCreate(ctypes.byref(self.stream), 0))
-
-        rospy.loginfo("[lane_follower] TensorRT/ctypes backend: %s", engine_path)
+        rospy.loginfo("[lane_follower] TensorRT/cudart backend: %s", engine_path)
         rospy.loginfo("[lane_follower] Input  shape: %s",
                       tuple(self.engine.get_binding_shape(
                           list(self.engine)[self.in_idx[0]])))
         rospy.loginfo("[lane_follower] Output shape: %s", self.out_shapes[0])
 
-    def _cu(self, result):
+
+    def _rt(self, result):
+        """Check cudaError_t -- 0 = cudaSuccess."""
         if result != 0:
-            raise RuntimeError(f"CUDA driver error code: {result}")
-
-    def _htod(self, idx, data):
-        n = data.size
-        np.copyto(self.host_bufs[idx][:n], data.ravel())
-        self._cu(self.cuda.cuMemcpyHtoDAsync_v2(
-            self.dev_bufs[idx],
-            self.host_bufs[idx].ctypes.data_as(self.ctypes.c_void_p),
-            n * 4, self.stream))
-
-    def _dtoh(self, idx, n):
-        self._cu(self.cuda.cuMemcpyDtoHAsync_v2(
-            self.host_bufs[idx].ctypes.data_as(self.ctypes.c_void_p),
-            self.dev_bufs[idx],
-            n * 4, self.stream))
-        self._cu(self.cuda.cuStreamSynchronize(self.stream))
-        return self.host_bufs[idx][:n].copy()
+            raise RuntimeError(f"CUDA runtime error code: {result}")
 
     def infer(self, img_chw: np.ndarray) -> np.ndarray:
-        """
-        img_chw: float32 (3, H, W) normalized
-        Returns: int64  (H, W) class indices
-        """
         ii = self.in_idx[0]
         oi = self.out_idx[0]
-        self._htod(ii, img_chw[np.newaxis].astype(np.float32))
+
+        # Input e' sempre float32
+        inp = img_chw[np.newaxis].astype(np.float32).ravel()
+        np.copyto(self.host_bufs[ii][1][:inp.size], inp)
+        self._rt(self.rt.cudaMemcpyAsync(
+            self.dev_bufs[ii],
+            self.host_bufs[ii][0],
+            inp.size * 4,  # input sempre float32 = 4 bytes
+            ctypes.c_int(1), self.stream))
+
         self.context.execute_async_v2(
             bindings=self.bindings,
             stream_handle=self.stream.value)
-        out = self._dtoh(oi, int(np.prod(self.out_shapes[0])))
-        return out.reshape(self.out_shapes[0])[0].astype(np.int64)
 
+        # Output -- usa item_size corretto (4 per int32)
+        n_out = int(np.prod(self.out_shapes[0]))
+        item_size = self.host_bufs[oi][2]
+        self._rt(self.rt.cudaMemcpyAsync(
+            self.host_bufs[oi][0],
+            self.dev_bufs[oi],
+            n_out * item_size,  # item_size dal dtype rilevato
+            ctypes.c_int(2), self.stream))
+        self._rt(self.rt.cudaStreamSynchronize(self.stream))
+
+        out = self.host_bufs[oi][1][:n_out].reshape(self.out_shapes[0])
+        return out[0].astype(np.int64)  # (H, W)
 
 
 class TensorRTBackendTorch:
@@ -327,19 +346,20 @@ class TensorRTBackendTorch:
 
 # -- Image preprocessing -------------------------------------------------------
 
-def preprocess(img_bgr: np.ndarray, crop_top_frac: float) -> np.ndarray:
+def preprocess(img_rgb: np.ndarray, crop_top_frac: float) -> np.ndarray:
     """
     Crop top, resize to model input, normalize with ImageNet stats.
     Returns float32 array (3, MODEL_H, MODEL_W) ready for inference.
     """
-    h = img_bgr.shape[0]
-    crop_px   = int(h * crop_top_frac)
-    cropped   = img_bgr[crop_px:, :]
-    resized   = cv2.resize(cropped, (MODEL_W, MODEL_H),
-                           interpolation=cv2.INTER_LINEAR)
-    rgb       = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    normalised = (rgb - IMAGENET_MEAN) / IMAGENET_STD   # (H, W, 3)
-    return normalised.transpose(2, 0, 1)                 # (3, H, W)
+    h = img_rgb.shape[0]
+    crop_px = int(h * crop_top_frac)
+    cropped = img_rgb[crop_px:, :]
+    resized = cv2.resize(cropped, (MODEL_W, MODEL_H),
+                         interpolation=cv2.INTER_LINEAR)
+    # Input is already RGB -- normalize directly
+    normalised = (resized.astype(np.float32) / 255.0
+                  - IMAGENET_MEAN) / IMAGENET_STD
+    return normalised.transpose(2, 0, 1)  # HWC -> CHW               # (3, H, W)
 
 
 # -- BEV + lateral error -------------------------------------------------------
@@ -584,21 +604,32 @@ class LaneFollowerNode:
 
         # Convert ROS Image message to BGR numpy array without cv_bridge.
         # Works with Python 3 on ROS Melodic where cv_bridge is Python 2 only.
+        # Sostituisci il blocco di conversione in image_cb con questo:
         try:
-            dtype   = np.uint8
-            n_ch    = {"rgb8": 3, "bgr8": 3, "mono8": 1,
-                       "rgba8": 4, "bgra8": 4}.get(msg.encoding, 3)
+            dtype = np.uint8
+            n_ch = {"rgb8": 3, "bgr8": 3, "mono8": 1,
+                    "rgba8": 4, "bgra8": 4}.get(msg.encoding, 3)
             img_raw = np.frombuffer(msg.data, dtype=dtype)
+            rospy.loginfo_once("[lane_follower] Camera encoding: %s", msg.encoding)
+            rospy.loginfo_throttle(2, "[lane_follower] encoding=%s shape=%s dtype=%s "
+                                      "min=%.1f max=%.1f",
+                                   msg.encoding, img_raw.shape, img_raw.dtype,
+                                   float(img_raw.min()), float(img_raw.max()))
             img_raw = img_raw.reshape(msg.height, msg.width, n_ch)
 
             if msg.encoding == "rgb8":
-                img_bgr = img_raw[:, :, ::-1].copy()   # RGB -> BGR
-            elif msg.encoding in ("bgr8", "bgra8", "rgba8"):
-                img_bgr = img_raw[:, :, :3].copy()     # drop alpha if present
+                # Already RGB -- no conversion needed, preprocess expects RGB
+                img_bgr = img_raw[:, :, :3].copy()
+            elif msg.encoding == "bgr8":
+                # Convert BGR->RGB for preprocess
+                img_bgr = img_raw[:, :, ::-1].copy()
+            elif msg.encoding in ("rgba8",):
+                img_bgr = img_raw[:, :, :3].copy()  # RGB, drop alpha
+            elif msg.encoding in ("bgra8",):
+                img_bgr = img_raw[:, :, 2::-1].copy()  # BGR->RGB, drop alpha
             elif msg.encoding == "mono8":
                 img_bgr = np.stack([img_raw[:, :, 0]] * 3, axis=-1)
             else:
-                # Unknown encoding -- try treating as BGR
                 img_bgr = img_raw[:, :, :3].copy()
         except Exception as e:
             rospy.logwarn_throttle(5, "[lane_follower] image conversion failed: %s", e)
@@ -610,6 +641,9 @@ class LaneFollowerNode:
         # Inference
         try:
             mask = self.model.infer(img_chw)   # (MODEL_H, MODEL_W) int
+            unique, counts = np.unique(mask, return_counts=True)
+            rospy.loginfo_throttle(1, "[lane_follower] mask classes: %s counts: %s",
+                                   unique.tolist(), counts.tolist())
         except Exception as e:
             rospy.logerr("[lane_follower] Inference failed: %s", e)
             self._publish_stop()

@@ -137,6 +137,117 @@ class ONNXBackend:
 
 class TensorRTBackend:
     """
+    Inference via TensorRT using ctypes + CUDA driver API directly.
+    No PyTorch needed at runtime -- eliminates ~1.5GB PyTorch CUDA overhead.
+
+    Requires only:
+        tensorrt  (linked from /usr/lib/python3.6/dist-packages/tensorrt)
+        ctypes    (stdlib)
+        numpy     (already needed)
+        libcuda.so (always present on Jetson)
+    """
+
+    def __init__(self, engine_path: str):
+        import tensorrt as trt
+        import ctypes
+        import ctypes.util
+
+        self.trt    = trt
+        self.ctypes = ctypes
+
+        # Load CUDA driver API
+        cuda_lib = ctypes.util.find_library("cuda")
+        if not cuda_lib:
+            cuda_lib = "/usr/lib/aarch64-linux-gnu/tegra/libcuda.so"
+        self.cuda = ctypes.CDLL(cuda_lib)
+
+        # Initialize CUDA driver and create context
+        self._cu(self.cuda.cuInit(0))
+        device = ctypes.c_int(0)
+        self._cu(self.cuda.cuDeviceGet(ctypes.byref(device), 0))
+        ctx = ctypes.c_void_p()
+        self._cu(self.cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, device))
+        self.cu_ctx = ctx
+
+        # Load engine
+        TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, "rb") as f:
+            self.engine  = trt.Runtime(TRT_LOGGER).deserialize_cuda_engine(
+                f.read())
+        self.context = self.engine.create_execution_context()
+
+        # Allocate host + device buffers per binding
+        self.host_bufs  = []
+        self.dev_bufs   = []
+        self.bindings   = []
+        self.in_idx     = []
+        self.out_idx    = []
+        self.out_shapes = []
+
+        for i, binding in enumerate(self.engine):
+            shape = tuple(max(s, 1) for s in
+                          self.engine.get_binding_shape(binding))
+            n     = int(np.prod(shape))
+            h_buf = np.empty(n, dtype=np.float32)
+            d_buf = ctypes.c_void_p()
+            self._cu(self.cuda.cuMemAlloc_v2(ctypes.byref(d_buf), n * 4))
+            self.host_bufs.append(h_buf)
+            self.dev_bufs.append(d_buf)
+            self.bindings.append(d_buf.value)
+            if self.engine.binding_is_input(binding):
+                self.in_idx.append(i)
+            else:
+                self.out_idx.append(i)
+                self.out_shapes.append(shape)
+
+        # CUDA stream
+        self.stream = ctypes.c_void_p()
+        self._cu(self.cuda.cuStreamCreate(ctypes.byref(self.stream), 0))
+
+        rospy.loginfo("[lane_follower] TensorRT/ctypes backend: %s", engine_path)
+        rospy.loginfo("[lane_follower] Input  shape: %s",
+                      tuple(self.engine.get_binding_shape(
+                          list(self.engine)[self.in_idx[0]])))
+        rospy.loginfo("[lane_follower] Output shape: %s", self.out_shapes[0])
+
+    def _cu(self, result):
+        if result != 0:
+            raise RuntimeError(f"CUDA driver error code: {result}")
+
+    def _htod(self, idx, data):
+        n = data.size
+        np.copyto(self.host_bufs[idx][:n], data.ravel())
+        self._cu(self.cuda.cuMemcpyHtoDAsync_v2(
+            self.dev_bufs[idx],
+            self.host_bufs[idx].ctypes.data_as(self.ctypes.c_void_p),
+            n * 4, self.stream))
+
+    def _dtoh(self, idx, n):
+        self._cu(self.cuda.cuMemcpyDtoHAsync_v2(
+            self.host_bufs[idx].ctypes.data_as(self.ctypes.c_void_p),
+            self.dev_bufs[idx],
+            n * 4, self.stream))
+        self._cu(self.cuda.cuStreamSynchronize(self.stream))
+        return self.host_bufs[idx][:n].copy()
+
+    def infer(self, img_chw: np.ndarray) -> np.ndarray:
+        """
+        img_chw: float32 (3, H, W) normalized
+        Returns: int64  (H, W) class indices
+        """
+        ii = self.in_idx[0]
+        oi = self.out_idx[0]
+        self._htod(ii, img_chw[np.newaxis].astype(np.float32))
+        self.context.execute_async_v2(
+            bindings=self.bindings,
+            stream_handle=self.stream.value)
+        out = self._dtoh(oi, int(np.prod(self.out_shapes[0])))
+        return out.reshape(self.out_shapes[0])[0].astype(np.int64)
+
+
+
+class TensorRTBackendTorch:
+    """
     Inference via TensorRT using PyTorch CUDA tensors -- no pycuda needed.
 
     Uses torch.cuda tensors as GPU buffers and ctypes to pass pointers

@@ -31,7 +31,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-from torch.amp import GradScaler, autocast
+try:
+    from torch.amp import GradScaler, autocast
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast
+
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, PolynomialLR
 

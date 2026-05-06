@@ -22,7 +22,6 @@ After export you can convert to TensorRT on the Jetson with:
             --saveEngine=exports/model.trt \
             --fp16
 """
-
 import argparse
 import sys
 from pathlib import Path
@@ -31,8 +30,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-from markdown.util import deprecated
-from transformers import SegformerForSemanticSegmentation
 
 from config import PIPELINE_CONFIG
 
@@ -45,9 +42,6 @@ def load_config(path: str) -> dict:
 
 
 # -- Wrapper model -------------------------------------------------------------
-
-@deprecated("SegFormerExportWrapper is deprecated in favor of ModelExportWrapper, which "
-            "handles multiple model types and normalizes outputs to (B, H, W) int64 masks.")
 class SegFormerExportWrapper(nn.Module):
     """
     Thin wrapper that:
@@ -109,27 +103,60 @@ class ModelExportWrapper(nn.Module):
 # -- Load model from checkpoint ------------------------------------------------
 
 def load_model(checkpoint_path: Path) -> tuple:
-    ckpt      = torch.load(checkpoint_path, map_location="cpu")
-    cfg       = ckpt["cfg"]
+    ckpt       = torch.load(checkpoint_path, map_location="cpu")
+    cfg        = ckpt["cfg"]
     model_name = cfg["model"]["name"]
-    num_cls   = cfg["num_classes"]
-    out_h     = cfg["image"]["model_h"]
-    out_w     = cfg["image"]["model_w"]
+    num_cls    = cfg["num_classes"]
+    out_h      = cfg["image"]["model_h"]
+    out_w      = cfg["image"]["model_w"]
 
-    # Rebuild base model with same factory as training
-    # (reuse build_model from 3_train.py via importlib)
-    import importlib.util as ilu
-    here = Path(__file__).parent
-    for candidate in ("3_train.py", "train.py"):
-        p = here / candidate
-        if p.exists():
-            spec = ilu.spec_from_file_location("train", p)
-            mod  = ilu.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            base_model = mod.build_model(cfg)
-            break
+    # Build model directly without importing 3_train.py
+    if model_name == "mobilenet_v3":
+        from torchvision.models.segmentation import lraspp_mobilenet_v3_large
+        from torchvision.models import MobileNet_V3_Large_Weights
+        base_model = lraspp_mobilenet_v3_large(
+            weights_backbone=None,   # no pretrained weights needed for export
+            num_classes=num_cls,
+        )
+
+    elif model_name == "fastscnn":
+        import segmentation_models_pytorch as smp
+        base_model = smp.create_model(
+            arch="unetplusplus",
+            encoder_name="timm-mobilenetv3_large_100",
+            encoder_weights=None,
+            in_channels=3,
+            classes=num_cls,
+        )
+
+    elif model_name in ("segformer-b0", "segformer-b1"):
+        from transformers import SegformerForSemanticSegmentation
+        model_cfg = cfg["model"]
+        id2label  = {int(k): v for k, v in model_cfg["id2label"].items()}
+        label2id  = model_cfg["label2id"]
+        hf_name   = ("nvidia/mit-b0" if model_name == "segformer-b0"
+                     else "nvidia/mit-b1")
+        base_model = SegformerForSemanticSegmentation.from_pretrained(
+            hf_name,
+            num_labels=num_cls,
+            id2label=id2label,
+            label2id=label2id,
+            ignore_mismatched_sizes=True,
+        )
     else:
-        raise ImportError("Cannot find 3_train.py next to 5_export.py")
+        raise ValueError(f"Unknown model: {model_name}")
+
+    base_model.load_state_dict(ckpt["model"])
+    base_model.eval()
+
+    wrapped = ModelExportWrapper(base_model, model_name, out_h, out_w)
+    wrapped.eval()
+
+    print(f"  Model    : {model_name}")
+    print(f"  Epoch    : {ckpt.get('epoch', '?')}")
+    print(f"  Val mIoU : {ckpt.get('best_miou', 0.0):.4f}")
+    print(f"  Input    : 3 x {out_h} x {out_w}")
+    return wrapped, cfg
 
     base_model.load_state_dict(ckpt["model"])
     base_model.eval()

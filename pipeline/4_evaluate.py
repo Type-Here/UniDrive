@@ -3,7 +3,7 @@
 4_evaluate.py -- Evaluate a trained SegFormer checkpoint on val or test split.
 
 Computes per-class IoU, mean IoU, pixel accuracy and confusion matrix.
-Saves prediction visualisations for manual inspection.
+Saves prediction visualizations for manual inspection.
 
 Usage:
     python3 4_evaluate.py --checkpoint checkpoints/best.pth [options]

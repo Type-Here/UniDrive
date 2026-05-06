@@ -31,6 +31,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
+from markdown.util import deprecated
 from transformers import SegformerForSemanticSegmentation
 
 from config import PIPELINE_CONFIG
@@ -45,6 +46,8 @@ def load_config(path: str) -> dict:
 
 # -- Wrapper model -------------------------------------------------------------
 
+@deprecated("SegFormerExportWrapper is deprecated in favor of ModelExportWrapper, which "
+            "handles multiple model types and normalizes outputs to (B, H, W) int64 masks.")
 class SegFormerExportWrapper(nn.Module):
     """
     Thin wrapper that:
@@ -73,41 +76,71 @@ class SegFormerExportWrapper(nn.Module):
         )
         return logits.argmax(dim=1)
 
+class ModelExportWrapper(nn.Module):
+    """
+    Wraps any segmentation model for ONNX export.
+    Normalizes the output to always return a (B, H, W) int64 mask.
+    """
+
+    def __init__(self, model: nn.Module, model_name: str,
+                 out_h: int, out_w: int):
+        super().__init__()
+        self.model      = model
+        self.model_name = model_name
+        self.out_h      = out_h
+        self.out_w      = out_w
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        outputs = self.model(pixel_values)
+
+        if self.model_name in ("segformer-b0", "segformer-b1"):
+            logits = outputs.logits
+        else:
+            logits = outputs["out"]
+
+        logits = nn.functional.interpolate(
+            logits,
+            size=(self.out_h, self.out_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return logits.argmax(dim=1)   # (B, H, W) int64
 
 # -- Load model from checkpoint ------------------------------------------------
 
 def load_model(checkpoint_path: Path) -> tuple:
-    """
-    Returns (wrapped_model, cfg) reconstructed from the checkpoint.
-    """
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    cfg  = ckpt["cfg"]
-
-    model_cfg = cfg["model"]
+    ckpt      = torch.load(checkpoint_path, map_location="cpu")
+    cfg       = ckpt["cfg"]
+    model_name = cfg["model"]["name"]
     num_cls   = cfg["num_classes"]
-    id2label  = {int(k): v for k, v in model_cfg["id2label"].items()}
-    label2id  = model_cfg["label2id"]
+    out_h     = cfg["image"]["model_h"]
+    out_w     = cfg["image"]["model_w"]
 
-    base_model = SegformerForSemanticSegmentation.from_pretrained(
-        model_cfg["name"],
-        num_labels=num_cls,
-        id2label=id2label,
-        label2id=label2id,
-        ignore_mismatched_sizes=True,
-    )
+    # Rebuild base model with same factory as training
+    # (reuse build_model from 3_train.py via importlib)
+    import importlib.util as ilu
+    here = Path(__file__).parent
+    for candidate in ("3_train.py", "train.py"):
+        p = here / candidate
+        if p.exists():
+            spec = ilu.spec_from_file_location("train", p)
+            mod  = ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            base_model = mod.build_model(cfg)
+            break
+    else:
+        raise ImportError("Cannot find 3_train.py next to 5_export.py")
+
     base_model.load_state_dict(ckpt["model"])
     base_model.eval()
 
-    out_h   = cfg["image"]["model_h"]
-    out_w   = cfg["image"]["model_w"]
-    wrapped = SegFormerExportWrapper(base_model, out_h, out_w)
+    wrapped = ModelExportWrapper(base_model, model_name, out_h, out_w)
     wrapped.eval()
 
-    print(f"  Loaded  : {model_cfg['name']}")
-    print(f"  Epoch   : {ckpt.get('epoch', '?')}")
-    print(f"  Val mIoU: {ckpt.get('best_miou', 0.0):.4f}")
-    print(f"  Input   : 3 x {out_h} x {out_w}")
-    print(f"  Classes : {num_cls}")
+    print(f"  Model    : {model_name}")
+    print(f"  Epoch    : {ckpt.get('epoch', '?')}")
+    print(f"  Val mIoU : {ckpt.get('best_miou', 0.0):.4f}")
+    print(f"  Input    : 3 x {out_h} x {out_w}")
     return wrapped, cfg
 
 

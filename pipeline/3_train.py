@@ -31,11 +31,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-from sympy.physics.units import current
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, PolynomialLR
-from transformers import SegformerForSemanticSegmentation
 
 # Local modules -- 2_dataset.py cannot be imported directly because Python
 # module names cannot start with a digit. We use importlib to load it.
@@ -131,20 +129,54 @@ class SegmentationMetrics:
 
 # -- Model factory -------------------------------------------------------------
 
-def build_model(cfg: dict) -> SegformerForSemanticSegmentation:
-    model_cfg = cfg["model"]
+def build_model(cfg: dict) -> nn.Module:
+    name      = cfg["model"]["name"]
     num_cls   = cfg["num_classes"]
 
-    id2label = {int(k): v for k, v in model_cfg["id2label"].items()}
-    label2id = model_cfg["label2id"]
+    if name == "mobilenet_v3":
+        # MobileNetV3-Large + LR-ASPP head
+        # pretrained backbone on ImageNet, head randomly initialised
+        from torchvision.models.segmentation import (
+            lraspp_mobilenet_v3_large,
+            LRASPP_MobileNet_V3_Large_Weights,
+        )
+        weights_backbone = LRASPP_MobileNet_V3_Large_Weights.COCO_WITH_VOC_LABELS_V1
+        model = lraspp_mobilenet_v3_large(
+            weights_backbone=weights_backbone,
+            num_classes=num_cls,
+        )
 
-    model = SegformerForSemanticSegmentation.from_pretrained(
-        model_cfg["name"],
-        num_labels=num_cls,
-        id2label=id2label,
-        label2id=label2id,
-        ignore_mismatched_sizes=True,
-    )
+    elif name == "fastscnn":
+        # FastSCNN -- install with: pip install segmentation-models-pytorch
+        import segmentation_models_pytorch as smp
+        model = smp.create_model(
+            arch="unetplusplus",
+            encoder_name="timm-mobilenetv3_large_100",
+            encoder_weights="imagenet",
+            in_channels=3,
+            classes=num_cls,
+        )
+
+    elif name in ("segformer-b0", "segformer-b1"):
+        # Keep SegFormer support for comparison
+        from transformers import SegformerForSemanticSegmentation
+        model_cfg = cfg["model"]
+        id2label  = {int(k): v for k, v in model_cfg["id2label"].items()}
+        label2id  = model_cfg["label2id"]
+        hf_name   = ("nvidia/mit-b0" if name == "segformer-b0"
+                     else "nvidia/mit-b1")
+        model = SegformerForSemanticSegmentation.from_pretrained(
+            hf_name,
+            num_labels=num_cls,
+            id2label=id2label,
+            label2id=label2id,
+            ignore_mismatched_sizes=True,
+        )
+
+    else:
+        raise ValueError(f"Unknown model name: {name}. "
+                         "Choose: mobilenet_v3 | fastscnn | segformer-b0 | segformer-b1")
+
     return model
 
 
@@ -266,16 +298,14 @@ class Logger:
 def run_epoch(model, loader, criterion, optimizer,
               scaler, metrics, device, cfg,
               is_train: bool) -> dict:
-    """
-    Run one training or validation epoch.
-    Returns a dict with loss, mean_iou, pixel_acc.
-    """
+
     model.train() if is_train else model.eval()
     metrics.reset()
 
     total_loss = 0.0
     n_batches  = 0
     use_amp    = cfg["training"].get("amp", True) and device.type == "cuda"
+    model_name = cfg["model"]["name"]
 
     ctx = torch.enable_grad() if is_train else torch.no_grad()
 
@@ -284,16 +314,31 @@ def run_epoch(model, loader, criterion, optimizer,
             images = batch["image"].to(device, non_blocking=True)
             masks  = batch["mask"].to(device,  non_blocking=True)
 
-            with autocast(device.type, enabled=use_amp):
-                outputs = model(pixel_values=images)
-                # SegFormer outputs logits at 1/4 resolution -- upsample to mask size
-                logits  = outputs.logits
-                logits  = nn.functional.interpolate(
-                    logits,
-                    size=masks.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
+            with autocast(enabled=use_amp, device_type=device.type):
+                outputs = model(images)
+
+                # --- Extract logits depending on model type ---
+                if model_name in ("segformer-b0", "segformer-b1"):
+                    # SegFormer returns an object with .logits at 1/4 resolution
+                    logits = outputs.logits
+                    logits = nn.functional.interpolate(
+                        logits,
+                        size=masks.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                else:
+                    # torchvision models return a dict with key "out"
+                    # already at full resolution
+                    logits = outputs["out"]
+                    if logits.shape[-2:] != masks.shape[-2:]:
+                        logits = nn.functional.interpolate(
+                            logits,
+                            size=masks.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+
                 loss = criterion(logits, masks)
 
             if is_train:
@@ -311,7 +356,6 @@ def run_epoch(model, loader, criterion, optimizer,
 
             preds = logits.argmax(dim=1)
             metrics.update(preds, masks)
-
             total_loss += loss.item()
             n_batches  += 1
 

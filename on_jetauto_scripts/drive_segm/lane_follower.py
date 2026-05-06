@@ -52,9 +52,7 @@ Options:
 
 import argparse
 import json
-import sys
 import time
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -73,7 +71,7 @@ except ImportError:
 
 # -- Configuration defaults ----------------------------------------------------
 
-CAMERA_TOPIC  = "/depth_cam/rgb/image_raw"
+CAMERA_TOPIC  = "/depth_cam/rgb/image_raw" # Or "/astra_cam/rgb/image_raw"
 CMDVEL_TOPIC  = "/jetauto_controller/cmd_vel"
 DEBUG_TOPIC   = "/lane_follower/debug_image"
 

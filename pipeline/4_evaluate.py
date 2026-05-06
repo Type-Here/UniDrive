@@ -18,7 +18,6 @@ Options:
 
 import argparse
 import importlib.util as ilu
-import sys
 from pathlib import Path
 
 import cv2
@@ -140,15 +139,19 @@ class ConfusionMatrix:
 # -- Inference -----------------------------------------------------------------
 
 def predict_batch(model, images: torch.Tensor,
-                  target_size: tuple, device: torch.device) -> torch.Tensor:
-    """
-    Run inference on a batch of images.
-    Returns predicted class indices of shape (N, H, W).
-    """
+                  target_size: tuple, device: torch.device,
+                  model_name: str) -> torch.Tensor:
     with torch.no_grad():
-        outputs = model(pixel_values=images.to(device))
-        logits  = outputs.logits
-        logits  = nn.functional.interpolate(
+        outputs = model(pixel_values=images.to(device)) \
+            if model_name in ("segformer-b0", "segformer-b1") \
+            else model(images.to(device))
+
+        if model_name in ("segformer-b0", "segformer-b1"):
+            logits = outputs.logits
+        else:
+            logits = outputs["out"]
+
+        logits = nn.functional.interpolate(
             logits,
             size=target_size,
             mode="bilinear",
@@ -305,7 +308,8 @@ def evaluate(cfg: dict, checkpoint_path: Path, split: str,
         filenames = batch["filename"]
 
         target_size = tuple(masks_gt.shape[-2:])
-        preds = predict_batch(model, images, target_size, device)
+        preds = predict_batch(model, images, target_size, device,
+                              ckpt_cfg["model"]["name"])
 
         cm.update(preds, masks_gt)
 

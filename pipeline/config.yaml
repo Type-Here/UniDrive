@@ -53,8 +53,13 @@ split:
   seed:  42
 
 # -- Model ---------------------------------------------------------------------
+  # Choose among::
+  #   "mobilenet_v3"  -- MobileNetV3+LR-ASPP, good accuracy/speed balance, recommended for Nano
+  #   "fastscnn"      -- faster, less accurate
+  #   "segformer-b0"  -- lighter transformer, not ideal on Nano
+  #   "segformer-b1"  -- slower, not recommended on Nano
 model:
-  name: "nvidia/mit-b1"          # swap to "nvidia/mit-b0" for lighter model
+  name: "mobilenet_v3"          # swap to "nvidia/mit-b0" for lighter model
   pretrained: true
   id2label:                      # used by HuggingFace SegFormer head
     0: "background"

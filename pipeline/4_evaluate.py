@@ -58,32 +58,52 @@ def _load_dataset_module(here: Path):
 # -- Model loading -------------------------------------------------------------
 
 def load_model(checkpoint_path: Path, device: torch.device):
-    """
-    Load model architecture and weights from a checkpoint saved by 3_train.py.
-    The checkpoint stores the full cfg so we can reconstruct the model exactly.
-    """
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    cfg  = ckpt["cfg"]
+    ckpt       = torch.load(checkpoint_path, map_location="cpu")
+    cfg        = ckpt["cfg"]
+    model_name = cfg["model"]["name"]
+    num_cls    = cfg["num_classes"]
 
-    model_cfg = cfg["model"]
-    num_cls   = cfg["num_classes"]
-    id2label  = {int(k): v for k, v in model_cfg["id2label"].items()}
-    label2id  = model_cfg["label2id"]
+    if model_name == "mobilenet_v3":
+        from torchvision.models.segmentation import lraspp_mobilenet_v3_large
+        base_model = lraspp_mobilenet_v3_large(
+            weights_backbone=None,
+            num_classes=num_cls,
+        )
 
-    model = SegformerForSemanticSegmentation.from_pretrained(
-        model_cfg["name"],
-        num_labels=num_cls,
-        id2label=id2label,
-        label2id=label2id,
-        ignore_mismatched_sizes=True,
-    )
-    model.load_state_dict(ckpt["model"])
-    model.to(device)
-    model.eval()
+    elif model_name == "fastscnn":
+        import segmentation_models_pytorch as smp
+        base_model = smp.create_model(
+            arch="unetplusplus",
+            encoder_name="timm-mobilenetv3_large_100",
+            encoder_weights=None,
+            in_channels=3,
+            classes=num_cls,
+        )
+
+    elif model_name in ("segformer-b0", "segformer-b1"):
+        from transformers import SegformerForSemanticSegmentation
+        model_cfg = cfg["model"]
+        id2label  = {int(k): v for k, v in model_cfg["id2label"].items()}
+        label2id  = model_cfg["label2id"]
+        hf_name   = ("nvidia/mit-b0" if model_name == "segformer-b0"
+                     else "nvidia/mit-b1")
+        base_model = SegformerForSemanticSegmentation.from_pretrained(
+            hf_name,
+            num_labels=num_cls,
+            id2label=id2label,
+            label2id=label2id,
+            ignore_mismatched_sizes=True,
+        )
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    base_model.load_state_dict(ckpt["model"])
+    base_model.to(device)
+    base_model.eval()
 
     print(f"  Loaded checkpoint: epoch={ckpt.get('epoch', '?')}"
           f"  best_miou={ckpt.get('best_miou', 0.0):.4f}")
-    return model, cfg
+    return base_model, cfg
 
 
 # -- Metrics -------------------------------------------------------------------

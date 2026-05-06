@@ -216,6 +216,7 @@ artifacts/
 data/
 checkpoints/
 exports/
+logs/
 
 # MacOS
 .DS_Store

@@ -1,0 +1,134 @@
+# -----------------------------------------------------------------------------
+# config.yaml - Central configuration for lane segmentation pipeline
+# -----------------------------------------------------------------------------
+
+# -- Paths ---------------------------------------------------------------------
+paths:
+  raw_images:   "data/raw/images"       # original JPGs from LabelMe
+  raw_labels:   "data/raw/labels"       # LabelMe JSON annotations
+  dataset:      "data/dataset"          # prepared dataset root
+  checkpoints:  "checkpoints"           # model checkpoints
+  logs:         "logs"                  # training logs
+  exports:      "exports"               # ONNX / TensorRT exports
+
+# -- Classes -------------------------------------------------------------------
+# Order matters: classes rendered later overwrite earlier ones in the mask.
+# Keep background=0, then least-precise first, most-precise last.
+classes:
+  background:   0
+  road:         1
+  lane_marking: 2
+  lane_dashed:  3
+  zebra:        4
+
+num_classes: 5
+
+# Colors for mask visualisation (BGR for OpenCV, RGB for matplotlib)
+class_colors:
+  - [0,   0,   0]    # 0 background  - black
+  - [70,  130, 180]  # 1 road        - steel blue
+  - [255, 255,   0]  # 2 lane_marking - yellow
+  - [0,   255, 255]  # 3 lane_dashed  - cyan
+  - [255,   0,   0]  # 4 zebra        - red
+
+# -- Image preprocessing -------------------------------------------------------
+image:
+  original_h: 480
+  original_w: 640
+
+  # Fraction of image height to crop from the top (sky/wall/ceiling = noise).
+  # At 0.45 the crop line falls just above the road horizon.
+  crop_top_frac: 0.45          # pixels removed = floor(480 * 0.45) = 216
+
+  # Final size fed to the model - must be multiples of 32 for SegFormer.
+  # After crop: 264h x 640w → resize to 256x640.
+  model_h: 256
+  model_w: 640
+
+# -- Dataset split -------------------------------------------------------------
+split:
+  train: 0.70
+  val:   0.15
+  test:  0.15
+  seed:  42
+
+# -- Model ---------------------------------------------------------------------
+  # Choose among::
+  #   "mobilenet_v3"  -- MobileNetV3+LR-ASPP, good accuracy/speed balance, recommended for Nano
+  #   "fastscnn"      -- faster, less accurate
+  #   "segformer-b0"  -- lighter transformer, not ideal on Nano
+  #   "segformer-b1"  -- slower, not recommended on Nano
+model:
+  name: "mobilenet_v3"          # swap to "nvidia/mit-b0" for lighter model
+  pretrained: true
+  id2label:                      # used by HuggingFace SegFormer head
+    0: "background"
+    1: "road"
+    2: "lane_marking"
+    3: "lane_dashed"
+    4: "zebra"
+  label2id:
+    background:   0
+    road:         1
+    lane_marking: 2
+    lane_dashed:  3
+    zebra:        4
+
+# -- Training ------------------------------------------------------------------
+training:
+  epochs:        100
+  batch_size:    8               # reduce to 4 if GPU OOM
+  num_workers:   4
+  lr:            6.0e-5
+  weight_decay:  0.01
+  scheduler:     "cosine"        # "cosine" | "poly"
+  warmup_epochs: 5
+  early_stopping_patience: 15   # stop if val mIoU doesn't improve
+
+  # Class weights for CrossEntropyLoss - inverse of expected pixel frequency.
+  # road covers large areas → lower weight; zebra is rare → higher weight.
+  # Set to null to disable weighting.
+  class_weights: [0.5, 1.0, 3.0, 4.0, 5.0]   # bg, road, lane_marking, lane_dashed, zebra
+
+  # Mixed precision (fp16) - speeds up training on modern GPUs
+  amp: true
+
+  # Save checkpoint every N epochs (best val mIoU always saved regardless)
+  save_every: 10
+
+# -- Augmentation --------------------------------------------------------------
+augmentation:
+  # Geometric - applied identically to image AND mask
+  hflip_prob:      0.5     # horizontal flip
+  rotate_limit:    10      # degrees, applied with prob 0.3
+  rotate_prob:     0.3
+  shift_limit:     0.1     # fraction of image size
+  shift_prob:      0.3
+
+  # Photometric - applied to image ONLY (not mask)
+  brightness_limit: 0.3    # ±30% brightness
+  contrast_limit:   0.3
+  photo_prob:       0.5
+
+  hue_shift:        10     # hue shift in degrees
+  sat_shift:        30
+  val_shift:        20
+  hue_prob:         0.3
+
+  blur_limit:       3      # max kernel size for Gaussian blur
+  blur_prob:        0.2
+
+  noise_var:        0.01   # variance for Gaussian noise
+  noise_prob:       0.2
+
+  shadow_prob:      0.3    # random shadow on road surface
+
+# -- Evaluation ----------------------------------------------------------------
+evaluation:
+  primary_metric: "mean_iou"    # metric used for early stopping + best model
+  log_images_every: 5           # log prediction images every N epochs
+
+# -- Export --------------------------------------------------------------------
+export:
+  opset_version: 11
+  simplify: true                # run onnx-simplifier after export

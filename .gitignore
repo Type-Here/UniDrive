@@ -210,3 +210,13 @@ __marimo__/
 # LLMs
 .github
 .claude
+
+# Local ignore
+artifacts/
+data/
+checkpoints/
+exports/
+logs/
+
+# MacOS
+.DS_Store

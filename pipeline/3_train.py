@@ -136,13 +136,11 @@ def build_model(cfg: dict) -> nn.Module:
     if name == "mobilenet_v3":
         # MobileNetV3-Large + LR-ASPP head
         # pretrained backbone on ImageNet, head randomly initialised
-        from torchvision.models.segmentation import (
-            lraspp_mobilenet_v3_large,
-            LRASPP_MobileNet_V3_Large_Weights,
-        )
-        weights_backbone = LRASPP_MobileNet_V3_Large_Weights.COCO_WITH_VOC_LABELS_V1
+        from torchvision.models.segmentation import (lraspp_mobilenet_v3_large)
+        from torchvision.models import MobileNet_V3_Large_Weights
+
         model = lraspp_mobilenet_v3_large(
-            weights_backbone=weights_backbone,
+            weights_backbone=MobileNet_V3_Large_Weights.IMAGENET1K_V1,
             num_classes=num_cls,
         )
 

@@ -218,5 +218,8 @@ checkpoints/
 exports/
 logs/
 
+#Maps
+maps/
+
 # MacOS
 .DS_Store

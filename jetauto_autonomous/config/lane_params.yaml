@@ -1,0 +1,94 @@
+# =============================================================================
+# Parametri lane_controller_node + waypoint_manager_node  (v3)
+# Logica per-classe: continua (2) e dashed (3) trattate separatamente
+# =============================================================================
+
+lane_controller:
+  # ---- Topic ----
+  # NB: il topic /lane_mask è quello pubblicato dal modello di lane detection. 
+  # /lane_mask_bev è invece quello warpato in BEV, usato solo se input_mode = "bev_warp".
+  mask_topic:   "/lane_mask_bev"
+  rgb_topic:    "/depth_cam/rgb/image_raw"
+  cmd_topic:    "/jetauto_controller/cmd_vel"
+  debug_topic:  "/lane_debug/image"
+  state_topic:  "/lane_controller/state"
+  enable_topic: "/lane_controller/enable"
+
+  # ---- Modalità input ----
+  # "camera"    -> image space (default)
+  # "bev_topic" -> il nodo upstream pubblica già la maschera warpata
+  # "bev_warp"  -> warp interno usando bev_config_path
+  input_mode: "bev_topic"
+  bev_config_path: ""    # es. "$(find jetauto_autonomous)/config/bev_config.json"
+
+  # ---- Velocità ----
+  linear_x_speed: 0.0   # m/s, da regolare in laboratorio
+  max_linear_y:   0.15
+  max_angular_z:  1.20
+
+  # ---- Gain P (image space) ----
+  Kp_lat: 0.0030         # px-error -> linear.y
+  Kp_ang: 0.0         # slope-px -> angular.z (azzerato in BEV) 0.010 non BEV
+
+  # ---- Logica corsie ----
+  # Offset (px) usato nei casi SINGLE_LINE / SINGLE_DASHED
+  lateral_offset_px: 60
+
+  # Pixel minimi totali per considerare una classe "presente"
+  min_pixels_threshold: 80
+  # Pixel minimi per ciascun lato quando si fa lo split sx/dx (caso PAIR)
+  min_pixels_per_side: 40
+  # Distanza minima (px) tra centroidi sx/dx per riconoscerli come separati
+  min_lr_separation: 60
+
+  # ROI: quanto della maschera analizzare. 0.55 = solo il 45% inferiore
+  mask_roi_top_fraction: 0.55
+
+  # EMA sull'errore laterale (anti-jitter)
+  smooth_alpha: 0.5
+
+  # Modalità per SINGLE_LINE (continua):
+  # "spatial"     -> sx/dx in base alla posizione del cluster (default)
+  # "fixed_right" -> assume sempre destra
+  # "fixed_left"  -> assume sempre sinistra
+  single_line_mode: "spatial"
+
+  # ---- Anti-flicker / grace period ----
+  # Frame consecutivi senza linee tollerati prima di andare in STOP.
+  # Nel frattempo si ripete l'ultimo Twist scalato per `no_lane_decay`.
+  # Esempio: a 20 Hz, 3 frame ≈ 150 ms.
+  no_lane_grace_frames: 3
+  no_lane_decay: 0.5
+
+  # ---- Class IDs ----
+  class_lane_marking: 2     # continue
+  class_lane_dashed:  3     # tratteggiate
+
+  # ---- Debug ----
+  publish_debug: true
+  debug_scale:   0.5
+
+  # Frequenza loop di controllo. Domani in lab, dopo aver misurato il
+  # frame-rate del modello (rostopic hz /lane_mask), regolare:
+  #   se modello a ~10 FPS -> control_rate_hz: 12-15
+  #   se modello a ~20 FPS -> control_rate_hz: 20  (default)
+  #   se modello a ~30 FPS -> control_rate_hz: 25-30
+  # Tenere control_rate_hz <= FPS_modello + 5 evita lavoro inutile.
+  control_rate_hz: 10
+
+# =============================================================================
+waypoint_manager:
+  # NB: map_file viene sovrascritto a runtime da start_all.sh con il path
+  # assoluto della mappa. Il valore qui sotto è solo un placeholder.
+  map_file: "/tmp/UNSET_MAP_FILE"
+  odom_topic: "/odom"
+  goal_topic: "/waypoint_manager/goal"
+  status_topic: "/waypoint_manager/status"
+  cmd_topic: "/jetauto_controller/cmd_vel"
+  lane_enable_topic: "/lane_controller/enable"
+
+  waypoint_tolerance: 0.18
+  junction_slowdown: 0.06
+  junction_radius: 0.22
+  rate_hz: 10
+  goal_completion_msg: "GOAL_REACHED"

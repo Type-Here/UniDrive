@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>JetAuto Autonomous Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161a22;
+    --border: #242a36;
+    --text: #e6e9ef;
+    --muted: #8a93a4;
+    --accent: #4ea1ff;
+    --green: #36d399;
+    --red: #f87272;
+    --yellow: #f6c453;
+    --orange: #ff9f43;
+    --teal: #2dd4bf;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .conn { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .conn .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+               background: var(--red); margin-right: 6px; vertical-align: middle; }
+  .conn.ok .dot { background: var(--green); }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; min-height: 0; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--muted); margin: 0; padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-body { flex: 1; padding: 10px; overflow: auto; min-height: 0; display:flex; flex-direction:column; }
+
+  /* Video */
+  #videoWrap {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    background: #000; border-radius: 6px; overflow: hidden; min-height: 200px;
+    position: relative;
+  }
+  #videoWrap img { max-width: 100%; max-height: 100%; display: block; }
+  #videoWrap .ph { color: var(--muted); font-size: 13px; }
+  #videoSourceLabel {
+    position: absolute; top: 6px; left: 8px;
+    background: rgba(0,0,0,0.55); color: var(--muted);
+    font-size: 11px; padding: 2px 7px; border-radius: 4px;
+    pointer-events: none; z-index: 2;
+  }
+
+  /* Topic selector */
+  .topic-selector {
+    display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;
+  }
+  .topic-btn {
+    flex: 1; border: 1px solid var(--border); background: #0a0c10;
+    color: var(--muted); padding: 5px 8px; border-radius: 4px;
+    font: inherit; font-size: 12px; cursor: pointer; transition: all .15s;
+    white-space: nowrap; text-align: center;
+  }
+  .topic-btn:hover { border-color: var(--accent); color: var(--text); }
+  .topic-btn.active { background: rgba(78,161,255,.15); border-color: var(--accent); color: var(--accent); }
+
+  /* Drive bar */
+  .drive-bar {
+    display: flex; gap: 8px; align-items: center; margin-top: 8px;
+    padding: 8px 10px; background: #0a0c10; border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+  .drive-label { font-size: 12px; color: var(--muted); }
+  .drive-state  { font-size: 12px; font-weight: 600; margin-left: auto; }
+  .drive-state.running { color: var(--green); }
+  .drive-state.stopped { color: var(--red); }
+
+  /* Status badges */
+  .status-bar { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: #262d3b; color: var(--muted); }
+  .badge.tracking-cc   { background: rgba(54,211,153,.18);  color: var(--green); }
+  .badge.tracking-dc   { background: rgba(45,212,191,.20);  color: var(--teal); }
+  .badge.single-line   { background: rgba(255,159,67,.18);   color: var(--orange); }
+  .badge.single-dashed { background: rgba(246,196,83,.18);   color: var(--yellow); }
+  .badge.grace         { background: rgba(255,159,67,.30);   color: var(--orange); }
+  .badge.stop          { background: rgba(248,114,114,.18);  color: var(--red); }
+  .badge.disabled      { background: #262d3b;                color: var(--muted); }
+  .badge.nav           { background: rgba(78,161,255,.18);   color: var(--accent); }
+  .badge.junction      { background: rgba(246,196,83,.18);   color: var(--yellow); }
+  .badge.done          { background: rgba(54,211,153,.18);   color: var(--green); }
+
+  .info-row { display: flex; gap: 20px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .info-row b { color: var(--text); }
+
+  /* Map */
+  #mapSvg { width: 100%; height: 100%; min-height: 300px; background: #0a0c10; border-radius: 6px; }
+
+  /* Odom bar */
+  .odom-bar {
+    display: flex; gap: 16px; padding: 8px 12px; font-size: 12px;
+    border-top: 1px solid var(--border); color: var(--muted); flex-wrap: wrap;
+  }
+  .odom-bar b { color: var(--text); }
+
+  /* Controls */
+  .controls {
+    display: flex; gap: 8px; align-items: center; padding: 10px;
+    border-top: 1px solid var(--border); flex-wrap: wrap;
+  }
+  .controls label { color: var(--muted); font-size: 12px; }
+  .controls input[type=number] {
+    width: 70px; background: #0a0c10; border: 1px solid var(--border);
+    color: var(--text); padding: 5px 8px; border-radius: 4px; font: inherit;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  /* Input "in ascolto" di un click sulla mappa */
+  .controls input[type=number].picking {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(78,161,255,.25);
+  }
+  /* Cursore crosshair sulla mappa durante la selezione */
+  #mapSvg.picking-mode,
+  #mapSvg.picking-mode .node { cursor: crosshair; }
+  /* Bottone calibrazione */
+  .btn.calib {
+    background: #0a0c10; color: var(--teal);
+    border: 1px solid var(--teal);
+  }
+  .btn.calib:hover { background: rgba(45,212,191,.12); }
+
+  /* Buttons */
+  .btn { border: none; padding: 7px 16px; border-radius: 4px; font-weight: 600; font-size: 13px; cursor: pointer; transition: opacity .15s; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.start   { background: var(--green);  color: #062117; }
+  .btn.stop    { background: var(--red);    color: #2a0808; }
+  .btn.ghost   { background: #262d3b;       color: var(--text); }
+  .btn.enable  { background: var(--green);  color: #062117; }
+  .btn.disable { background: var(--red);    color: #2a0808; }
+
+  /* SVG map styles */
+  .edge { stroke: #2f3645; stroke-width: 1.5; fill: none; }
+  .edge.path { stroke: var(--accent); stroke-width: 3.5; }
+  .node { fill: #4a5263; stroke: #1b1f29; stroke-width: 1; cursor: pointer; }
+  .node:hover { fill: var(--accent); }
+  .node.junction { fill: var(--yellow); }
+  .node.start { fill: var(--green); stroke: #fff; stroke-width: 2; }
+  .node.end   { fill: var(--red);   stroke: #fff; stroke-width: 2; }
+  .node-label { fill: #8a93a4; font-size: 7px; pointer-events: none; font-family: monospace; }
+  .robot { fill: var(--accent); stroke: #fff; stroke-width: 1.5; }
+
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🚗 JetAuto Autonomous Dashboard</h1>
+  <div class="conn" id="connStatus"><span class="dot"></span><span>Disconnected</span></div>
+</header>
+
+<main>
+  <!-- LEFT: Camera feed + drive controls + lane status -->
+  <section class="panel">
+    <h2>Camera + Lane Detection</h2>
+    <div class="panel-body">
+
+      <!-- Video feed -->
+      <div id="videoWrap">
+        <div class="ph">In attesa del feed video…</div>
+        <div id="videoSourceLabel"></div>
+      </div>
+
+      <!-- Topic selector -->
+      <div class="topic-selector">
+        <button class="topic-btn" id="btnCamera" onclick="switchTopic('camera')">📷 Camera raw</button>
+        <button class="topic-btn" id="btnMask"   onclick="switchTopic('mask')">🎭 Maschera</button>
+        <button class="topic-btn active" id="btnDebug" onclick="switchTopic('debug')">🔍 Debug</button>
+      </div>
+
+      <!-- Drive enable/disable -->
+      <div class="drive-bar">
+        <span class="drive-label">Guida autonoma</span>
+        <button class="btn enable"  onclick="setDriveEnabled(true)">▶ AVVIA</button>
+        <button class="btn disable" onclick="setDriveEnabled(false)">■ FERMA</button>
+        <span class="drive-state stopped" id="driveState">● FERMA</span>
+      </div>
+
+      <!-- Lane / nav badges -->
+      <div class="status-bar">
+        <span class="badge" id="laneState">LANE: --</span>
+        <span class="badge" id="navState">NAV: IDLE</span>
+        <span class="badge" id="goalBadge" style="display:none">GOAL: --</span>
+      </div>
+      <div class="info-row">
+        <span>Path length: <b id="pathLen">--</b></span>
+        <span>Waypoints: <b id="pathCount">--</b></span>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- RIGHT: Map + odom + nav controls -->
+  <section class="panel">
+    <h2>Map (frame: <span id="mapFrame">odom</span>)</h2>
+    <div class="panel-body" style="padding: 0;">
+      <svg id="mapSvg" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+
+    <!-- Odometry readout -->
+    <div class="odom-bar">
+      <span>X: <b id="odomX">--</b> m</span>
+      <span>Y: <b id="odomY">--</b> m</span>
+      <span>θ: <b id="odomYaw">--</b>°</span>
+      <span>|v|: <b id="odomVx">--</b> m/s</span>
+    </div>
+
+    <!-- Waypoint / navigation controls -->
+    <div class="controls">
+      <label title="Clicca qui poi clicca un nodo sulla mappa">Start
+        <input type="number" id="startInput" min="0" max="155" value="0" />
+      </label>
+      <label title="Clicca qui poi clicca un nodo sulla mappa">End
+        <input type="number" id="endInput"   min="0" max="155" value="50" />
+      </label>
+      <button class="btn ghost" id="previewBtn">Preview</button>
+      <button class="btn start" id="startBtn">▶ NAVIGA</button>
+      <button class="btn stop"  id="stopBtn" title="Annulla navigazione corrente">■ STOP NAV</button>
+      <button class="btn calib" id="calibBtn" title="Imposta la posizione attuale del robot come origine (nodo 0)">⊕ Calibra</button>
+    </div>
+  </section>
+</main>
+
+<script src="vendor/eventemitter2.min.js"></script>
+<script src="vendor/roslib.min.js"></script>
+<script>
+// ─── Config ───────────────────────────────────────────────────────────────────
+const CONFIG = {
+  rosbridge_url:    `ws://${location.hostname || 'localhost'}:9090`,
+  video_server_url: `http://${location.hostname || 'localhost'}:8080`,
+  map_yaml_url:     'map.yaml',
+  topic_camera:     '/depth_cam/rgb/image_raw',
+  topic_mask_bev:   '/lane_mask_bev',
+  topic_mask_raw:   '/lane_mask',
+  topic_debug:      '/lane_debug/image',
+};
+
+// Quale topic maschera è disponibile (rilevato via rosapi, default = bev)
+let resolvedMaskTopic = CONFIG.topic_mask_bev;
+let currentTopicMode  = 'debug';
+
+// ─── ROS ──────────────────────────────────────────────────────────────────────
+const ros    = new ROSLIB.Ros({ url: CONFIG.rosbridge_url });
+const connEl = document.getElementById('connStatus');
+
+ros.on('connection', () => {
+  connEl.classList.add('ok');
+  connEl.children[1].textContent = 'Connected';
+  setupTopics();
+  probeMaskTopic();          // scopre quale topic maschera è attivo
+  switchTopic(currentTopicMode);
+});
+ros.on('error', () => { connEl.classList.remove('ok'); connEl.children[1].textContent = 'Error'; });
+ros.on('close', () => { connEl.classList.remove('ok'); connEl.children[1].textContent = 'Disconnected'; });
+
+// ─── Video feed ───────────────────────────────────────────────────────────────
+function topicForMode(mode) {
+  if (mode === 'camera') return CONFIG.topic_camera;
+  if (mode === 'mask')   return resolvedMaskTopic;
+  return CONFIG.topic_debug;
+}
+
+function labelForMode(mode) {
+  if (mode === 'camera') return CONFIG.topic_camera;
+  if (mode === 'mask')   return resolvedMaskTopic;
+  return CONFIG.topic_debug;
+}
+
+function switchTopic(mode) {
+  currentTopicMode = mode;
+  ['camera','mask','debug'].forEach(m => {
+    const id = 'btn' + m.charAt(0).toUpperCase() + m.slice(1);
+    document.getElementById(id).classList.toggle('active', m === mode);
+  });
+  document.getElementById('videoSourceLabel').textContent = labelForMode(mode);
+  renderVideo(topicForMode(mode));
+}
+
+function renderVideo(topic) {
+  const wrap  = document.getElementById('videoWrap');
+  const label = document.getElementById('videoSourceLabel');
+  const url   = `${CONFIG.video_server_url}/stream?topic=${encodeURIComponent(topic)}&type=mjpeg&quality=60`;
+  wrap.innerHTML = '';
+  wrap.appendChild(label);                 // rimette il label overlay
+  const img = document.createElement('img');
+  img.alt = 'video feed';
+  img.onerror = () => {
+    wrap.innerHTML = '';
+    wrap.appendChild(label);
+    const ph = document.createElement('div');
+    ph.className = 'ph';
+    ph.textContent = `Feed non disponibile: ${topic}`;
+    wrap.appendChild(ph);
+  };
+  img.src = url;
+  wrap.appendChild(img);
+}
+
+// Interroga rosapi per capire se /lane_mask_bev o /lane_mask è disponibile
+function probeMaskTopic() {
+  const svc = new ROSLIB.Service({ ros, name: '/rosapi/topics', serviceType: 'rosapi/Topics' });
+  svc.callService(new ROSLIB.ServiceRequest(), (res) => {
+    const list = res.topics || [];
+    if (list.includes(CONFIG.topic_mask_bev)) {
+      resolvedMaskTopic = CONFIG.topic_mask_bev;
+    } else if (list.includes(CONFIG.topic_mask_raw)) {
+      resolvedMaskTopic = CONFIG.topic_mask_raw;
+    }
+    // Aggiorna label bottone maschera
+    document.getElementById('btnMask').textContent = '🎭 Maschera';
+    document.getElementById('videoSourceLabel').textContent = labelForMode(currentTopicMode);
+    if (currentTopicMode === 'mask') switchTopic('mask');
+  }, () => { /* rosapi non disponibile – mantieni default */ });
+}
+
+// ─── Drive enable / disable ───────────────────────────────────────────────────
+let laneEnablePub = null;
+let driveEnabled  = false;
+
+function setDriveEnabled(val) {
+  if (!laneEnablePub) { alert('ROS non connesso'); return; }
+  laneEnablePub.publish(new ROSLIB.Message({ data: val }));
+  driveEnabled = val;
+  syncDriveUI(val);
+}
+
+function syncDriveUI(val) {
+  const el = document.getElementById('driveState');
+  if (val) { el.textContent = '● IN MARCIA'; el.className = 'drive-state running'; }
+  else     { el.textContent = '● FERMA';      el.className = 'drive-state stopped'; }
+}
+
+// ─── ROS topics ───────────────────────────────────────────────────────────────
+let goalPub = null;
+
+function setupTopics() {
+  goalPub = new ROSLIB.Topic({
+    ros, name: '/waypoint_manager/goal', messageType: 'std_msgs/Int32MultiArray'
+  });
+  laneEnablePub = new ROSLIB.Topic({
+    ros, name: '/lane_controller/enable', messageType: 'std_msgs/Bool'
+  });
+
+  new ROSLIB.Topic({ ros, name: '/waypoint_manager/status', messageType: 'std_msgs/String' })
+    .subscribe(m => updateNavBadge(m.data));
+
+  new ROSLIB.Topic({ ros, name: '/waypoint_manager/path', messageType: 'std_msgs/Int32MultiArray' })
+    .subscribe(m => highlightPath(m.data));
+
+  new ROSLIB.Topic({ ros, name: '/lane_controller/state', messageType: 'std_msgs/String' })
+    .subscribe(m => {
+      updateLaneBadge(m.data);
+      // Sincronizza il pulsante drive con lo stato reale del controller
+      if (m.data === 'DISABLED') {
+        driveEnabled = false; syncDriveUI(false);
+      } else if (!driveEnabled && m.data !== 'STOP') {
+        driveEnabled = true; syncDriveUI(true);
+      }
+    });
+
+  new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 200 })
+    .subscribe(m => updateOdom(m));
+}
+
+// ─── Lane / Nav badges ────────────────────────────────────────────────────────
+const LANE_CLASS = {
+  TRACKING_CC:'tracking-cc', TRACKING_DC:'tracking-dc',
+  SINGLE_LINE:'single-line', SINGLE_DASHED:'single-dashed',
+  GRACE:'grace', STOP:'stop', DISABLED:'disabled', NONE:'stop',
+};
+const LANE_LABEL = {
+  TRACKING_CC:'TRACKING (2 cont.)', TRACKING_DC:'TRACKING (dashed+cont.)',
+  SINGLE_LINE:'SINGLE LINE', SINGLE_DASHED:'SINGLE DASHED',
+  GRACE:'GRACE (recovering)', STOP:'STOP', DISABLED:'DISABLED',
+};
+
+function updateLaneBadge(s) {
+  const b = document.getElementById('laneState');
+  b.textContent = 'LANE: ' + (LANE_LABEL[s] || s);
+  b.className   = 'badge ' + (LANE_CLASS[s] || '');
+}
+
+function updateNavBadge(s) {
+  const b = document.getElementById('navState');
+  b.textContent = 'NAV: ' + s;
+  if      (s.startsWith('NAVIGATING')) b.className = 'badge nav';
+  else if (s.startsWith('JUNCTION'))   b.className = 'badge junction';
+  else if (s.startsWith('GOAL'))       b.className = 'badge done';
+  else if (s.startsWith('ERROR'))      b.className = 'badge stop';
+  else                                  b.className = 'badge';
+}
+
+// ─── Odometry ─────────────────────────────────────────────────────────────────
+function updateOdom(msg) {
+  const p = msg.pose.pose.position;
+  const q = msg.pose.pose.orientation;
+  const v = msg.twist.twist.linear;
+  const siny = 2*(q.w*q.z + q.x*q.y);
+  const cosy = 1 - 2*(q.y*q.y + q.z*q.z);
+
+  // Salva posizione raw per la calibrazione
+  lastRawOdom.x = p.x;
+  lastRawOdom.y = p.y;
+
+  // Posizione calibrata (offset applicato)
+  const cx = p.x - odomOffset.x;
+  const cy = p.y - odomOffset.y;
+
+  document.getElementById('odomX').textContent   = cx.toFixed(3);
+  document.getElementById('odomY').textContent   = cy.toFixed(3);
+  document.getElementById('odomYaw').textContent = (Math.atan2(siny,cosy)*180/Math.PI).toFixed(1);
+  document.getElementById('odomVx').textContent  = Math.hypot(v.x, v.y).toFixed(3);
+  updateRobot(cx, cy);
+}
+
+// ─── Map ──────────────────────────────────────────────────────────────────────
+let mapData = null, svgViewBox = null;
+
+async function loadMap() {
+  try {
+    const txt = await (await fetch(CONFIG.map_yaml_url)).text();
+    mapData = parseMapYaml(txt);
+    renderMap();
+  } catch(e) {
+    document.getElementById('mapSvg').innerHTML =
+      `<text x="20" y="40" fill="#f87272">Errore caricamento mappa: ${e}</text>`;
+  }
+}
+
+function parseMapYaml(text) {
+  const nodes={}, edges=[];
+  let frame='odom', section=null, cur=null;
+
+  const flush = () => {
+    if (!cur) return;
+    if (section==='nodes' && cur.id!==undefined && cur.x!==undefined)
+      nodes[cur.id] = {x:cur.x, y:cur.y};
+    if (section==='edges' && cur.from!==undefined)
+      edges.push({from:cur.from, to:cur.to, length:cur.length||0});
+    cur = null;
+  };
+
+  for (const raw of text.split('\n')) {
+    const l = raw.replace(/\r/g,'');
+    if (!l.trim()) continue;
+
+    // List item (may start at column 0): must check BEFORE top-level key test
+    if (/^-\s/.test(l)) {
+      flush();
+      cur = {};
+      const m = l.match(/^-\s+(\w+)\s*:\s*(.+)/);
+      if (m) cur[m[1]] = isNaN(+m[2]) ? m[2] : +m[2];
+      continue;
+    }
+
+    // Continuation property "  key: value"
+    if (cur !== null && /^\s+\w+\s*:/.test(l)) {
+      const m = l.match(/^\s+(\w+)\s*:\s*(.+)/);
+      if (m) cur[m[1]] = isNaN(+m[2]) ? m[2] : +m[2];
+      continue;
+    }
+
+    // Top-level section headers
+    if (/^frame_id\s*:/.test(l))  { frame = l.split(':').slice(1).join(':').trim(); continue; }
+    if (/^nodes\s*:\s*$/.test(l)) { flush(); section='nodes'; continue; }
+    if (/^edges\s*:\s*$/.test(l)) { flush(); section='edges'; continue; }
+    // Any other top-level key = ignore
+    if (/^\w/.test(l)) { flush(); section=null; continue; }
+  }
+  flush();
+  return {frame, nodes, edges};
+}
+
+// ─── Map node picking (click su input → poi click sul nodo) ──────────────────
+// activeField: null | 'start' | 'end'
+let activeField = null;
+
+function setActiveField(field) {
+  activeField = field;
+  ['start','end'].forEach(f => {
+    document.getElementById(f+'Input').classList.toggle('picking', f === field);
+  });
+  document.getElementById('mapSvg').classList.toggle('picking-mode', field !== null);
+}
+
+// Quando l'utente clicca su un input, lo attiva per la picking
+['startInput','endInput'].forEach(id => {
+  const el = document.getElementById(id);
+  const field = id.replace('Input','');
+  el.addEventListener('focus', () => setActiveField(field));
+  el.addEventListener('blur',  () => {
+    // Piccolo delay: se il blur è causato da un click sul SVG non disattivare subito
+    setTimeout(() => { if(activeField === field) setActiveField(null); }, 200);
+  });
+});
+
+function renderMap() {
+  const svg = document.getElementById('mapSvg');
+  document.getElementById('mapFrame').textContent = mapData.frame;
+  const ids = Object.keys(mapData.nodes);
+  if (!ids.length) return;
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+  for (const id of ids) {
+    const n=mapData.nodes[id];
+    if(n.x<minX)minX=n.x; if(n.x>maxX)maxX=n.x;
+    if(n.y<minY)minY=n.y; if(n.y>maxY)maxY=n.y;
+  }
+  const mg=0.3; minX-=mg; minY-=mg; maxX+=mg; maxY+=mg;
+  const W=maxX-minX, H=maxY-minY;
+  const SVG_W=1000, SVG_H=1000*H/W;
+  const tx=x=>((x-minX)/W)*SVG_W;
+  const ty=y=>SVG_H-((y-minY)/H)*SVG_H;
+  svgViewBox={tx,ty,SVG_W,SVG_H};
+  svg.setAttribute('viewBox',`0 0 ${SVG_W} ${SVG_H}`);
+  const deg={};
+  for(const e of mapData.edges){deg[e.from]=(deg[e.from]||0)+1;deg[e.to]=(deg[e.to]||0)+1;}
+  let html='';
+  for(const e of mapData.edges){
+    const a=mapData.nodes[e.from],b=mapData.nodes[e.to];
+    if(!a||!b) continue;
+    html+=`<line class="edge" data-from="${e.from}" data-to="${e.to}" x1="${tx(a.x)}" y1="${ty(a.y)}" x2="${tx(b.x)}" y2="${ty(b.y)}"/>`;
+  }
+  for(const id of ids){
+    const n=mapData.nodes[id], isJ=(deg[id]||0)>4;
+    html+=`<circle class="node ${isJ?'junction':''}" data-id="${id}" cx="${tx(n.x)}" cy="${ty(n.y)}" r="4"><title>Node ${id} (${n.x.toFixed(2)}, ${n.y.toFixed(2)})</title></circle>`;
+    html+=`<text class="node-label" x="${tx(n.x)+5}" y="${ty(n.y)-5}">${id}</text>`;
+  }
+  html+=`<circle id="robotMarker" class="robot" cx="0" cy="0" r="6" style="display:none"/>`;
+  svg.innerHTML=html;
+
+  svg.querySelectorAll('.node').forEach(el=>{
+    el.addEventListener('mousedown', ev => {
+      // preventDefault evita che il blur sull'input si propaghi prima del click
+      ev.preventDefault();
+    });
+    el.addEventListener('click', ev => {
+      const id = el.getAttribute('data-id');
+      if (activeField) {
+        // Picking mode: assegna al campo attivo
+        document.getElementById(activeField+'Input').value = id;
+        setActiveField(null);
+      } else if (ev.shiftKey) {
+        document.getElementById('endInput').value = id;
+      } else {
+        document.getElementById('startInput').value = id;
+      }
+      previewPath();
+    });
+  });
+}
+
+// ─── Calibrazione posizione robot ─────────────────────────────────────────────
+// odomOffset: offset da sottrarre alla posizione raw per avere il robot
+// visualizzato sul nodo 0. Viene settato al click su "Calibra".
+let odomOffset = { x: 0, y: 0 };
+let lastRawOdom = { x: 0, y: 0 };   // ultima posizione raw ricevuta da /odom
+
+function highlightPath(pathArr) {
+  const edgeSet=new Set();
+  for(let i=0;i<pathArr.length-1;i++){
+    edgeSet.add(`${pathArr[i]}-${pathArr[i+1]}`);
+    edgeSet.add(`${pathArr[i+1]}-${pathArr[i]}`);
+  }
+  document.querySelectorAll('#mapSvg .edge').forEach(l=>{
+    l.classList.toggle('path',edgeSet.has(`${l.dataset.from}-${l.dataset.to}`));
+  });
+  document.querySelectorAll('#mapSvg .node').forEach(c=>{
+    const id=c.dataset.id;
+    c.classList.remove('start','end');
+    if(pathArr.length>0&&id===String(pathArr[0]))                   c.classList.add('start');
+    if(pathArr.length>0&&id===String(pathArr[pathArr.length-1]))    c.classList.add('end');
+  });
+  let len=0;
+  for(let i=0;i<pathArr.length-1;i++){
+    const a=mapData.nodes[pathArr[i]],b=mapData.nodes[pathArr[i+1]];
+    if(a&&b) len+=Math.hypot(a.x-b.x,a.y-b.y);
+  }
+  document.getElementById('pathLen').textContent  = len.toFixed(2)+' m';
+  document.getElementById('pathCount').textContent = pathArr.length;
+  const goalB=document.getElementById('goalBadge');
+  if(pathArr.length){ goalB.style.display=''; goalB.textContent=`GOAL: ${pathArr[0]} → ${pathArr[pathArr.length-1]}`; }
+}
+
+function previewPath(){
+  if(!mapData) return;
+  const path=dijkstra(mapData,+document.getElementById('startInput').value,+document.getElementById('endInput').value);
+  if(path) highlightPath(path);
+}
+
+function dijkstra(mp,src,dst){
+  if(!(src in mp.nodes)||!(dst in mp.nodes)) return null;
+  const adj={};
+  for(const id of Object.keys(mp.nodes)) adj[id]=[];
+  for(const e of mp.edges){ adj[e.from].push([e.to,e.length]); adj[e.to].push([e.from,e.length]); }
+  const dist={},prev={},vis=new Set();
+  for(const id of Object.keys(mp.nodes)) dist[id]=Infinity;
+  dist[src]=0;
+  const pq=[[0,String(src)]];
+  while(pq.length){
+    pq.sort((a,b)=>a[0]-b[0]);
+    const[d,u]=pq.shift();
+    if(vis.has(u)) continue; vis.add(u);
+    if(u==dst) break;
+    for(const[v,w] of(adj[u]||[])){const nd=d+w; if(nd<dist[v]){dist[v]=nd;prev[v]=u;pq.push([nd,String(v)]);}}
+  }
+  if(dist[dst]===Infinity) return null;
+  const out=[];let u=String(dst);
+  while(u!==undefined){out.unshift(+u);u=prev[u];}
+  return out;
+}
+
+function updateRobot(x,y){
+  if(!svgViewBox) return;
+  const m=document.getElementById('robotMarker');
+  if(!m) return;
+  m.setAttribute('cx',svgViewBox.tx(x));
+  m.setAttribute('cy',svgViewBox.ty(y));
+  m.style.display='';
+}
+
+// ─── Button handlers ──────────────────────────────────────────────────────────
+document.getElementById('previewBtn').onclick = previewPath;
+
+document.getElementById('startBtn').onclick = () => {
+  if(!goalPub){ alert('ROS non connesso'); return; }
+  goalPub.publish(new ROSLIB.Message({ data: [
+    +document.getElementById('startInput').value,
+    +document.getElementById('endInput').value
+  ]}));
+};
+
+document.getElementById('stopBtn').onclick = () => {
+  if(!goalPub) return;
+  goalPub.publish(new ROSLIB.Message({ data: [] })); // goal vuoto → waypoint_manager si ferma
+};
+
+document.getElementById('calibBtn').onclick = () => {
+  // Nodo 0 della mappa
+  const node0 = mapData && mapData.nodes[0];
+  if (!node0) { alert('Mappa non caricata'); return; }
+
+  // L'offset fa coincidere la posizione raw attuale con le coordinate del nodo 0
+  odomOffset.x = lastRawOdom.x - node0.x;
+  odomOffset.y = lastRawOdom.y - node0.y;
+
+  const btn = document.getElementById('calibBtn');
+  const orig = btn.textContent;
+  btn.textContent = '✓ Calibrato';
+  btn.style.color = 'var(--green)';
+  btn.style.borderColor = 'var(--green)';
+  setTimeout(() => {
+    btn.textContent = orig;
+    btn.style.color = '';
+    btn.style.borderColor = '';
+  }, 2000);
+};
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+loadMap();
+</script>
+</body>
+</html>

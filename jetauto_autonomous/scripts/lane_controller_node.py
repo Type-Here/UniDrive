@@ -215,7 +215,7 @@ class LaneControllerNode(object):
         self.lock = threading.Lock()
         self.latest_mask = None
         self.latest_rgb  = None
-        self.enabled     = False
+        self.enabled     = False   # attende AVVIA dalla dashboard
         self.smoothed_err = 0.0
         self.last_state   = "STOP"
         self.last_twist   = Twist()       # ultimo comando valido (per grace period)
@@ -229,7 +229,7 @@ class LaneControllerNode(object):
 
         rospy.Subscriber(self.mask_topic, Image, self._mask_cb,
                          queue_size=1, buff_size=2**20)
-        if self.input_mode == "camera" and self.publish_debug:
+        if self.publish_debug:
             rospy.Subscriber(self.rgb_topic, Image, self._rgb_cb,
                              queue_size=1, buff_size=2**22)
         rospy.Subscriber(self.enable_topic, Bool, self._enable_cb, queue_size=1)
@@ -432,8 +432,9 @@ class LaneControllerNode(object):
                        target_x, state, twist, extras):
         H, W = mask.shape[:2]
 
-        if self.input_mode == "camera" and rgb is not None and rgb.shape[:2] == (H, W):
-            base = rgb.copy()
+        if rgb is not None:
+            rgb_resized = cv2.resize(rgb, (W, H)) if rgb.shape[:2] != (H, W) else rgb.copy()
+            base = rgb_resized
         else:
             base = cv2.cvtColor((mask * 50).astype(np.uint8), cv2.COLOR_GRAY2BGR)
 

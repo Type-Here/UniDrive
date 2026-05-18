@@ -240,36 +240,41 @@ class TensorRTBackend:
         if result != 0:
             raise RuntimeError(f"CUDA runtime error code: {result}")
 
-    def infer(self, img_chw: np.ndarray) -> np.ndarray:
+    def infer(self, img_chw: np.ndarray,
+              out_buf: np.ndarray = None) -> np.ndarray:
         ii = self.in_idx[0]
         oi = self.out_idx[0]
 
-        # Input e' sempre float32
         inp = img_chw[np.newaxis].astype(np.float32).ravel()
         np.copyto(self.host_bufs[ii][1][:inp.size], inp)
         self._rt(self.rt.cudaMemcpyAsync(
             self.dev_bufs[ii],
             self.host_bufs[ii][0],
-            inp.size * 4,  # input sempre float32 = 4 bytes
+            inp.size * 4,  # input always float32 = 4 bytes
             ctypes.c_int(1), self.stream))
 
         self.context.execute_async_v2(
             bindings=self.bindings,
             stream_handle=self.stream.value)
 
-        # Output -- usa item_size corretto (4 per int32)
+        # Output -- use correct item_size (4 for int32)
         n_out = int(np.prod(self.out_shapes[0]))
         item_size = self.host_bufs[oi][2]
         self._rt(self.rt.cudaMemcpyAsync(
             self.host_bufs[oi][0],
             self.dev_bufs[oi],
-            n_out * item_size,  # item_size dal dtype rilevato
+            n_out * item_size,  # item_size from dtype
             ctypes.c_int(2), self.stream))
         self._rt(self.rt.cudaStreamSynchronize(self.stream))
 
-        out = self.host_bufs[oi][1][:n_out].reshape(self.out_shapes[0])
-        return out[0].astype(np.int64)  # (H, W)
+        raw = self.host_bufs[oi][1][:n_out].reshape(self.out_shapes[0])[0]
 
+        if out_buf is not None:
+            # Write in pre-allocated buffer
+            np.copyto(out_buf, raw.astype(np.int64))
+            return out_buf
+        else:
+            return raw.astype(np.int64)
 
 class TensorRTBackendTorch:
     """
@@ -366,6 +371,26 @@ def preprocess(img_rgb: np.ndarray, crop_top_frac: float) -> np.ndarray:
     normalised = (resized.astype(np.float32) / 255.0
                   - IMAGENET_MEAN) / IMAGENET_STD
     return normalised.transpose(2, 0, 1)  # HWC -> CHW               # (3, H, W)
+
+def preprocess_inplace(img_rgb: np.ndarray, crop_top_frac: float,
+                        out_buf: np.ndarray):
+    """
+    Crop top, resize to model input, normalize with ImageNet stats.
+    Writes the result in out_buf (1,3,H,W) float32.
+    No allocation -- out_buf must be already allocated.
+    """
+    h       = img_rgb.shape[0]
+    crop_px = int(h * crop_top_frac)
+    resized = cv2.resize(img_rgb[crop_px:], (MODEL_W, MODEL_H),
+                         interpolation=cv2.INTER_LINEAR)
+    # Normalize and write directly inside the pre-allocated buffer
+    # out_buf shape: (1, 3, H, W)
+    tmp = resized.astype(np.float32)
+    tmp /= 255.0
+    tmp -= IMAGENET_MEAN
+    tmp /= IMAGENET_STD
+    # HWC -> CHW and write out_buf[0]
+    np.copyto(out_buf[0], tmp.transpose(2, 0, 1))
 
 
 # -- BEV + lateral error -------------------------------------------------------
@@ -607,6 +632,10 @@ class LaneFollowerNode:
         # Load BEV processor
         self.bev = BEVProcessor(args.bev)
 
+        # Input and Mask Buffers
+        self._inp_buf = np.empty((1, 3, MODEL_H, MODEL_W), dtype=np.float32)
+        self._mask_buf = np.empty((MODEL_H, MODEL_W), dtype=np.int64)
+
         # PID controller
         self.pid = PIDController(
             kp=args.kp, ki=args.ki, kd=args.kd,
@@ -695,11 +724,13 @@ class LaneFollowerNode:
             return
 
         # Preprocess
-        img_chw = preprocess(img_bgr, self.bev.crop_top_frac)
+        # img_chw = preprocess(img_bgr, self.bev.crop_top_frac)
+        preprocess_inplace(img_bgr, self.bev.crop_top_frac, self._inp_buf) # Uses buffer
 
         # Inference
         try:
-            mask = self.model.infer(img_chw)   # (MODEL_H, MODEL_W) int
+            #mask = self.model.infer(img_chw)   # (MODEL_H, MODEL_W) int
+            mask = self.model.infer(self._inp_buf[0])
             unique, counts = np.unique(mask, return_counts=True)
             rospy.loginfo_throttle(1, "[lane_follower] mask classes: %s counts: %s",
                                    unique.tolist(), counts.tolist())

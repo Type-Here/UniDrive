@@ -189,8 +189,7 @@
       <!-- Topic selector -->
       <div class="topic-selector">
         <button class="topic-btn" id="btnCamera" onclick="switchTopic('camera')">📷 Camera raw</button>
-        <button class="topic-btn" id="btnMask"   onclick="switchTopic('mask')">🎭 Maschera</button>
-        <button class="topic-btn active" id="btnDebug" onclick="switchTopic('debug')">🔍 Debug</button>
+        <button class="topic-btn active" id="btnDebug" onclick="switchTopic('debug')">🔍 Controller (mask+linea)</button>
       </div>
 
       <!-- Drive enable/disable -->
@@ -251,18 +250,14 @@
 <script>
 // ─── Config ───────────────────────────────────────────────────────────────────
 const CONFIG = {
-  rosbridge_url:    `ws://${location.hostname || 'localhost'}:9090`,
-  video_server_url: `http://${location.hostname || 'localhost'}:8080`,
+  rosbridge_url:    `ws://__VIDEO_SERVER_IP__:9090`,
+  video_server_url: `http://__VIDEO_SERVER_IP__:8080`,
   map_yaml_url:     'map.yaml',
   topic_camera:     '/depth_cam/rgb/image_raw',
-  topic_mask_bev:   '/lane_mask_bev',
-  topic_mask_raw:   '/lane_mask',
   topic_debug:      '/lane_debug/image',
 };
 
-// Quale topic maschera è disponibile (rilevato via rosapi, default = bev)
-let resolvedMaskTopic = CONFIG.topic_mask_bev;
-let currentTopicMode  = 'debug';
+let currentTopicMode = 'debug';
 
 // ─── ROS ──────────────────────────────────────────────────────────────────────
 const ros    = new ROSLIB.Ros({ url: CONFIG.rosbridge_url });
@@ -272,7 +267,6 @@ ros.on('connection', () => {
   connEl.classList.add('ok');
   connEl.children[1].textContent = 'Connected';
   setupTopics();
-  probeMaskTopic();          // scopre quale topic maschera è attivo
   switchTopic(currentTopicMode);
 });
 ros.on('error', () => { connEl.classList.remove('ok'); connEl.children[1].textContent = 'Error'; });
@@ -281,19 +275,17 @@ ros.on('close', () => { connEl.classList.remove('ok'); connEl.children[1].textCo
 // ─── Video feed ───────────────────────────────────────────────────────────────
 function topicForMode(mode) {
   if (mode === 'camera') return CONFIG.topic_camera;
-  if (mode === 'mask')   return resolvedMaskTopic;
   return CONFIG.topic_debug;
 }
 
 function labelForMode(mode) {
   if (mode === 'camera') return CONFIG.topic_camera;
-  if (mode === 'mask')   return resolvedMaskTopic;
   return CONFIG.topic_debug;
 }
 
 function switchTopic(mode) {
   currentTopicMode = mode;
-  ['camera','mask','debug'].forEach(m => {
+  ['camera','debug'].forEach(m => {
     const id = 'btn' + m.charAt(0).toUpperCase() + m.slice(1);
     document.getElementById(id).classList.toggle('active', m === mode);
   });
@@ -304,7 +296,7 @@ function switchTopic(mode) {
 function renderVideo(topic) {
   const wrap  = document.getElementById('videoWrap');
   const label = document.getElementById('videoSourceLabel');
-  const url   = `${CONFIG.video_server_url}/stream?topic=${encodeURIComponent(topic)}&type=mjpeg&quality=60`;
+  const url   = `${CONFIG.video_server_url}/stream?topic=${topic}&type=mjpeg&quality=60`;
   wrap.innerHTML = '';
   wrap.appendChild(label);                 // rimette il label overlay
   const img = document.createElement('img');
@@ -319,23 +311,6 @@ function renderVideo(topic) {
   };
   img.src = url;
   wrap.appendChild(img);
-}
-
-// Interroga rosapi per capire se /lane_mask_bev o /lane_mask è disponibile
-function probeMaskTopic() {
-  const svc = new ROSLIB.Service({ ros, name: '/rosapi/topics', serviceType: 'rosapi/Topics' });
-  svc.callService(new ROSLIB.ServiceRequest(), (res) => {
-    const list = res.topics || [];
-    if (list.includes(CONFIG.topic_mask_bev)) {
-      resolvedMaskTopic = CONFIG.topic_mask_bev;
-    } else if (list.includes(CONFIG.topic_mask_raw)) {
-      resolvedMaskTopic = CONFIG.topic_mask_raw;
-    }
-    // Aggiorna label bottone maschera
-    document.getElementById('btnMask').textContent = '🎭 Maschera';
-    document.getElementById('videoSourceLabel').textContent = labelForMode(currentTopicMode);
-    if (currentTopicMode === 'mask') switchTopic('mask');
-  }, () => { /* rosapi non disponibile – mantieni default */ });
 }
 
 // ─── Drive enable / disable ───────────────────────────────────────────────────

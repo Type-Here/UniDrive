@@ -28,6 +28,7 @@ from __future__ import print_function
 import argparse
 import os
 import sys
+import socket
 
 try:
     # Python 3
@@ -38,9 +39,27 @@ except ImportError:
     from BaseHTTPServer import HTTPServer
 
 
+def get_local_ip():
+    """Rileva l'IP locale usato per raggiungere la rete (stesso che usa ROS)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "localhost"
+
+
 class DashboardHandler(SimpleHTTPRequestHandler):
     web_dir = "."
     map_file = ""
+    video_server_ip = "localhost"
+
+    def guess_type(self, path):
+        if path.endswith('.yaml') or path.endswith('.yml'):
+            return 'text/plain; charset=utf-8'
+        return SimpleHTTPRequestHandler.guess_type(self, path)
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[dashboard_http] " + (fmt % args) + "\n")
@@ -55,6 +74,28 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         clean = path.lstrip("/").split("?", 1)[0]
         return os.path.join(self.web_dir, clean)
 
+    def do_GET(self):
+        # Intercetta dashboard.html e inietta l'IP del video server
+        clean_path = self.path.split("?", 1)[0]
+        if clean_path in ("", "/", "/dashboard.html"):
+            try:
+                fpath = os.path.join(self.web_dir, "dashboard.html")
+                with open(fpath, "rb") as f:
+                    content = f.read().decode("utf-8")
+                # Sostituisce il placeholder con l'IP rilevato automaticamente
+                content = content.replace(
+                    "__VIDEO_SERVER_IP__", self.video_server_ip)
+                encoded = content.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+            except Exception as e:
+                self.send_error(500, str(e))
+        else:
+            SimpleHTTPRequestHandler.do_GET(self)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -65,8 +106,9 @@ def main():
                     help="Path al file YAML della mappa")
     args = ap.parse_args()
 
-    DashboardHandler.web_dir = os.path.abspath(args.web_dir)
-    DashboardHandler.map_file = os.path.abspath(args.map)
+    DashboardHandler.web_dir      = os.path.abspath(args.web_dir)
+    DashboardHandler.map_file     = os.path.abspath(args.map)
+    DashboardHandler.video_server_ip = get_local_ip()
 
     if not os.path.isdir(DashboardHandler.web_dir):
         print("ERRORE: web-dir non esiste: %s" % DashboardHandler.web_dir)
@@ -77,8 +119,9 @@ def main():
 
     srv = HTTPServer(("0.0.0.0", args.port), DashboardHandler)
     print("[dashboard_http] http://0.0.0.0:%d" % args.port)
-    print("[dashboard_http] web_dir = %s" % DashboardHandler.web_dir)
-    print("[dashboard_http] map     = %s" % DashboardHandler.map_file)
+    print("[dashboard_http] web_dir          = %s" % DashboardHandler.web_dir)
+    print("[dashboard_http] map              = %s" % DashboardHandler.map_file)
+    print("[dashboard_http] video_server_ip  = %s" % DashboardHandler.video_server_ip)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

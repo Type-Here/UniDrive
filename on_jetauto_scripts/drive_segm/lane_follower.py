@@ -87,6 +87,12 @@ LANE_MASK_BEV_TOPIC  = "/lane_mask_bev"    # maschera in BEV, mono8
 MODEL_H = 256
 MODEL_W = 640
 
+BEV_COVER_FRAC = 0.99  # use 90% of the source image
+
+# Camera WxH
+SRC_IMAGE_WIDTH = 640
+SRC_IMAGE_HEIGHT = 480
+
 # ImageNet normalization (same as training pipeline)
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -374,16 +380,69 @@ class BEVProcessor:
         with open(config_path) as f:
             cfg = json.load(f)
 
-        self.H              = np.array(cfg["homography"], dtype=np.float64)
-        self.bev_w          = cfg["bev_width"]
-        self.bev_h          = cfg["bev_height"]
-        self.crop_top_frac  = cfg["crop_top_frac"]
-        self.px_per_m       = cfg["pixels_per_metre"]
+        self.bev_w = cfg["bev_width"]
+        self.bev_h = cfg["bev_height"]
+        self.crop_top_frac = cfg["crop_top_frac"]
+        self.px_per_m = cfg["pixels_per_metre"]
 
-        self.bev_cx = self.bev_w / 2.0   # BEV image centre x
+        H = np.array(cfg["homography"], dtype=np.float64)
+
+        # The homography was calibrated on a small rectangle in the image.
+        # The destination rectangle is centred in a 400x400 BEV image.
+        # Pixels outside the calibration rectangle map outside the 400x400 area.
+        #
+        # Operation: apply a scale+translate transform T on top of H so that the
+        # full model output (640x256) maps into the BEV canvas.
+        # We want the BEV to cover bev_cover_frac of the source image width.
+        src_w = MODEL_W  # 640 -- full width of segmentation mask
+        src_h = MODEL_H  # 256
+
+        # Map the four corners of the covered source region through H
+        # to find where they land in the current BEV, then compute
+        # a corrective scale+translate so they fill the BEV canvas.
+        margin_x = int(src_w * (1.0 - BEV_COVER_FRAC) / 2)
+        # Find corner pixels based on the % of length to take base on BEV_COVER_FRAC
+        src_corners = np.float32([
+            [margin_x, 0],  # TL
+            [src_w - margin_x, 0],  # TR
+            [src_w - margin_x, src_h],  # BR
+            [margin_x, src_h],  # BL
+        ])
+
+        # Project source corners through H into current BEV space
+        src_h3 = np.ones((4, 3), dtype=np.float64)
+        src_h3[:, :2] = src_corners
+        dst_pts = (H @ src_h3.T).T
+        dst_pts = dst_pts[:, :2] / dst_pts[:, 2:3]
+
+        # Bounding box of projected corners in BEV space
+        x_min, y_min = dst_pts.min(axis=0)
+        x_max, y_max = dst_pts.max(axis=0)
+
+        # Scale to fit inside BEV canvas with small padding
+        pad = 10
+        scale = min((self.bev_w - 2 * pad) / (x_max - x_min),
+                    (self.bev_h - 2 * pad) / (y_max - y_min))
+        tx = pad - x_min * scale
+        ty = pad - y_min * scale
+
+        # Corrective transform T: scale + translate in BEV space
+        T = np.array([
+            [scale, 0, tx],
+            [0, scale, ty],
+            [0, 0, 1],
+        ], dtype=np.float64)
+
+        # Final: first apply H (homography), then T (scale and translate)
+        # T @ H combines the 2 matrix transform in 1 passage
+        self.H = T @ H
+        self.bev_cx = self.bev_w / 2.0
+
         rospy.loginfo("[lane_follower] BEV config loaded: %s", config_path)
-        rospy.loginfo("[lane_follower] BEV size: %dx%d  scale: %.1f px/m",
-                      self.bev_w, self.bev_h, self.px_per_m)
+        rospy.loginfo("[lane_follower] BEV size: %dx%d  scale: %.1f px/m  "
+                      "coverage: %.0f%%",
+                      self.bev_w, self.bev_h, self.px_per_m,
+                      BEV_COVER_FRAC * 100)
 
     def mask_to_bev(self, mask: np.ndarray) -> np.ndarray:
         """
@@ -655,12 +714,10 @@ class LaneFollowerNode:
         # Publish masks for external lane_controller (opt-in).
         if self.publish_masks:
             try:
-                if self.lane_mask_pub.get_num_connections() > 0:
-                    self.lane_mask_pub.publish(
-                        self._make_mono8_msg(mask, msg.header))
-                if self.lane_mask_bev_pub.get_num_connections() > 0:
-                    self.lane_mask_bev_pub.publish(
-                        self._make_mono8_msg(bev_mask, msg.header))
+                self.lane_mask_pub.publish(
+                    self._make_mono8_msg(mask, msg.header))
+                self.lane_mask_bev_pub.publish(
+                    self._make_mono8_msg(bev_mask, msg.header))
             except Exception as e:
                 rospy.logwarn_throttle(
                     5, "[lane_follower] mask publish err: %s", e)

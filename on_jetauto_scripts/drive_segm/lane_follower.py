@@ -617,18 +617,19 @@ class LaneFollowerNode:
                 return False
 
     @staticmethod
-    def check_calibration(path) -> Union[(np.float32, np.float32), (None, None)]:
-        import os
+    def check_calibration(path):
+        import os, json
         if os.path.exists(path):
-            rospy.loginfo_once("[lane_follower] Calibration found: %s", path)
-
-            with open(path, "rb") as f:
-                data = np.load(f)
-                points = data.get("calib_points", None)
-                angles = data.get("calib_angles", None)
-                return points, angles
-        #Else return None,  None
-        return     None, None
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                points = np.array(data["src_points"], dtype=np.float32)
+                angle  = float(data["calibration_angle"])
+                rospy.loginfo("[lane_follower] Calibration loaded from: %s", path)
+                return points, angle
+            except Exception as e:
+                rospy.logwarn("[lane_follower] Failed to load calibration %s: %s", path, e)
+        return None, None
 
 
 

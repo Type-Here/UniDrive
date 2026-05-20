@@ -49,6 +49,7 @@ Options:
                        Default: off. Can be combined with --dry-run.
 """
 import argparse
+import threading
 import time
 from typing import Union
 
@@ -580,7 +581,15 @@ class LaneFollowerNode:
                 "[lane_follower] publish_masks ON: %s, %s",
                 LANE_MASK_TOPIC, LANE_MASK_BEV_TOPIC)
 
-        # Subscriber -- process every frame (queue_size=1 drops old frames)
+        # Shared frame buffer: inference thread reads, camera callback writes
+        self._frame_lock  = threading.Lock()
+        self._frame_event = threading.Event()
+        self._latest_frame  = None   # (img_rgb, header) tuple
+        self._inference_thread = threading.Thread(
+            target=self._inference_loop, daemon=True, name="lane_inference")
+        self._inference_thread.start()
+
+        # Subscriber -- just converts and stores latest frame, never blocks
         self.sub = rospy.Subscriber(
             CAMERA_TOPIC, Image, self.image_cb,
             queue_size=1, buff_size=2**24)
@@ -623,131 +632,137 @@ class LaneFollowerNode:
 
 
 
-    # -- Camera callback -------------------------------------------------------
+    # -- Camera callback (lightweight) ----------------------------------------
 
     def image_cb(self, msg: Image):
-        t0 = time.time()
-
-        # Convert ROS Image message to BGR numpy array without cv_bridge.
-        # Works with Python 3 on ROS Melodic where cv_bridge is Python 2 only.
+        """Convert the ROS image and store it; inference runs in a separate thread."""
         try:
-            dtype = np.uint8
             n_ch = {"rgb8": 3, "bgr8": 3, "mono8": 1,
                     "rgba8": 4, "bgra8": 4}.get(msg.encoding, 3)
-            img_raw = np.frombuffer(msg.data, dtype=dtype)
+            img_raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+                msg.height, msg.width, n_ch)
             rospy.loginfo_once("[lane_follower] Camera encoding: %s  shape=%s",
                                msg.encoding, img_raw.shape)
-            img_raw = img_raw.reshape(msg.height, msg.width, n_ch)
 
             if msg.encoding == "rgb8":
-                # Already RGB -- no conversion needed, preprocess expects RGB
-                img_bgr = img_raw[:, :, :3].copy()
+                img_rgb = img_raw[:, :, :3].copy()
             elif msg.encoding == "bgr8":
-                # Convert BGR->RGB for preprocess
-                img_bgr = img_raw[:, :, ::-1].copy()
-            elif msg.encoding in ("rgba8",):
-                img_bgr = img_raw[:, :, :3].copy()  # RGB, drop alpha
-            elif msg.encoding in ("bgra8",):
-                img_bgr = img_raw[:, :, 2::-1].copy()  # BGR->RGB, drop alpha
+                img_rgb = img_raw[:, :, ::-1].copy()
+            elif msg.encoding == "rgba8":
+                img_rgb = img_raw[:, :, :3].copy()
+            elif msg.encoding == "bgra8":
+                img_rgb = img_raw[:, :, 2::-1].copy()
             elif msg.encoding == "mono8":
-                img_bgr = np.stack([img_raw[:, :, 0]] * 3, axis=-1)
+                img_rgb = np.stack([img_raw[:, :, 0]] * 3, axis=-1)
             else:
-                img_bgr = img_raw[:, :, :3].copy()
+                img_rgb = img_raw[:, :, :3].copy()
         except Exception as e:
             rospy.logwarn_throttle(5, "[lane_follower] image conversion failed: %s", e)
             return
 
-        # Preprocess
-        preprocess_inplace(img_bgr, self.crop_top_frac, self._inp_buf) # Uses buffer
+        with self._frame_lock:
+            self._latest_frame = (img_rgb, msg.header)
+        self._frame_event.set()
 
-        # Inference
-        try:
-            mask = self.model.infer(self._inp_buf[0])
-        except Exception as e:
-            rospy.logerr("[lane_follower] Inference failed: %s", e)
-            self._publish_stop()
-            return
+    # -- Inference loop (runs in background thread) ----------------------------
 
-        # Calibration on first valid frame
-        if self.pending_calibration:
-            self.angle = self.auto_calib.calibrate(mask, self.calib_lane_label)
-            self.pending_calibration = False
+    def _inference_loop(self):
+        while not rospy.is_shutdown():
+            if not self._frame_event.wait(timeout=0.1):
+                continue
+            self._frame_event.clear()
 
-        # BEV transform
-        bev_mask = self.auto_calib.make_bev(mask)
-        bev_mask_u8 = np.clip(bev_mask, 0, 255).astype(np.uint8, copy=False)
+            with self._frame_lock:
+                payload = self._latest_frame
+            if payload is None:
+                continue
+            img_rgb, header = payload
 
-        if self.log_calibration_once:
-            self.auto_calib.save_debug(mask, prefix="lane_calibration")
-            rospy.loginfo("[lane_follower] Saved calibration debug images: lane_calibration_points.jpg, lane_calibration_warp.jpg, lane_calibration_points_rgb.jpg, lane_calibration_warp_rgb.jpg")
-            self.log_calibration_once = False
+            t0 = time.time()
 
-        # Publish masks for external lane_controller (opt-in).
-        if self.publish_masks:
+            # Preprocess
+            preprocess_inplace(img_rgb, self.crop_top_frac, self._inp_buf)
+
+            # Inference
             try:
-                self.lane_mask_pub.publish(
-                    self._make_mono8_msg(mask, msg.header))
-                self.lane_mask_bev_pub.publish(
-                    self._make_mono8_msg(bev_mask_u8, msg.header))
+                mask = self.model.infer(self._inp_buf[0])
             except Exception as e:
+                rospy.logerr("[lane_follower] Inference failed: %s", e)
+                self._publish_stop()
+                continue
+
+            # Calibration on first valid frame
+            if self.pending_calibration:
+                self.angle = self.auto_calib.calibrate(mask, self.calib_lane_label)
+                self.pending_calibration = False
+
+            # BEV transform
+            bev_mask = self.auto_calib.make_bev(mask)
+            bev_mask_u8 = np.clip(bev_mask, 0, 255).astype(np.uint8, copy=False)
+
+            if self.log_calibration_once:
+                self.auto_calib.save_debug(mask, prefix="lane_calibration")
+                rospy.loginfo("[lane_follower] Saved calibration debug images")
+                self.log_calibration_once = False
+
+            # Publish masks for external lane_controller (opt-in)
+            if self.publish_masks:
+                try:
+                    self.lane_mask_pub.publish(
+                        self._make_mono8_msg(mask, header))
+                    self.lane_mask_bev_pub.publish(
+                        self._make_mono8_msg(bev_mask_u8, header))
+                except Exception as e:
+                    rospy.logwarn_throttle(
+                        5, "[lane_follower] mask publish err: %s", e)
+
+            # Lateral error
+            error_norm, n_pixels = self._lateral_error(bev_mask_u8)
+
+            self.frames_total += 1
+
+            if n_pixels < MIN_LANE_PIXELS:
+                self.frames_no_lane += 1
                 rospy.logwarn_throttle(
-                    5, "[lane_follower] mask publish err: %s", e)
+                    2, "[lane_follower] Few lane pixels (%d) -- holding last error", n_pixels)
+                error_norm = self.last_error * 0.5
+            else:
+                self.last_error = error_norm
 
-        # Lateral error
-        error_norm, n_pixels = self._lateral_error(bev_mask_u8)
+            # PID
+            angular_z = self.pid.compute(error_norm)
 
-        self.frames_total += 1
+            # Publish cmd_vel
+            if not self.dry_run:
+                twist = Twist()
+                twist.linear.x  = self.speed
+                twist.angular.z = angular_z
+                self.cmd_pub.publish(twist)
 
-        if n_pixels < MIN_LANE_PIXELS:
-            self.frames_no_lane += 1
-            rospy.logwarn_throttle(
-                2, "[lane_follower] Few lane pixels (%d) -- holding last error", n_pixels)
-            # Hold last known error but reduce speed
-            error_norm = self.last_error * 0.5
-        else:
-            self.last_error = error_norm
+            elapsed_ms = (time.time() - t0) * 1000
+            rospy.loginfo_throttle(
+                1, "[lane_follower] err=%+.3f ang=%+.3f px=%d fps=%.1f no_lane=%d/%d",
+                error_norm, angular_z, n_pixels,
+                1000.0 / max(elapsed_ms, 1),
+                self.frames_no_lane, self.frames_total)
 
-        # PID
-        angular_z = self.pid.compute(error_norm)
-
-        # Publish cmd_vel
-        if not self.dry_run:
-            twist = Twist()
-            twist.linear.x  = self.speed
-            twist.angular.z = angular_z
-            self.cmd_pub.publish(twist)
-
-        # Timing
-        elapsed_ms = (time.time() - t0) * 1000
-
-        rospy.logdebug("[lane_follower] err=%.3f  ang=%.3f  px=%d  t=%.1fms",
-                       error_norm, angular_z, n_pixels, elapsed_ms)
-        rospy.loginfo_throttle(
-            1, "[lane_follower] err=%+.3f ang=%+.3f px=%d fps=%.1f no_lane=%d/%d",
-            error_norm, angular_z, n_pixels,
-            1000.0 / max(elapsed_ms, 1),
-            self.frames_no_lane, self.frames_total)
-
-        # Debug image
-        if self.debug and self.debug_pub.get_num_connections() > 0:
-            # Resize mask to match img_bgr for display
-            h_orig, w_orig = img_bgr.shape[:2]
-            crop_px  = int(h_orig * self.crop_top_frac)
-            img_crop = img_bgr[crop_px:, :]
-            img_disp = cv2.resize(img_crop, (MODEL_W, MODEL_H))
-            dbg = make_debug_image(img_disp, mask, bev_mask_u8,
-                                   error_norm, n_pixels, angular_z)
-            try:
-                dbg_msg          = Image()
-                dbg_msg.header   = msg.header
-                dbg_msg.height   = dbg.shape[0]
-                dbg_msg.width    = dbg.shape[1]
-                dbg_msg.encoding = "bgr8"
-                dbg_msg.step     = dbg.shape[1] * 3
-                dbg_msg.data     = dbg.tobytes()
-                self.debug_pub.publish(dbg_msg)
-            except Exception:
-                pass
+            # Debug image
+            if self.debug and self.debug_pub.get_num_connections() > 0:
+                crop_px  = int(img_rgb.shape[0] * self.crop_top_frac)
+                img_disp = cv2.resize(img_rgb[crop_px:], (MODEL_W, MODEL_H))
+                dbg = make_debug_image(img_disp, mask, bev_mask_u8,
+                                       error_norm, n_pixels, angular_z)
+                try:
+                    dbg_msg          = Image()
+                    dbg_msg.header   = header
+                    dbg_msg.height   = dbg.shape[0]
+                    dbg_msg.width    = dbg.shape[1]
+                    dbg_msg.encoding = "bgr8"
+                    dbg_msg.step     = dbg.shape[1] * 3
+                    dbg_msg.data     = dbg.tobytes()
+                    self.debug_pub.publish(dbg_msg)
+                except Exception:
+                    pass
 
     def _lateral_error(self, bev_mask: np.ndarray) -> tuple:
         h, w = bev_mask.shape[:2]

@@ -96,6 +96,9 @@ CROP_TOP_FRAC = 0.45
 # ImageNet normalization (same as training pipeline)
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# Fused constants: out = pixel * NORM_SCALE + NORM_SHIFT  (single pass)
+NORM_SCALE = (1.0 / (255.0 * IMAGENET_STD)).reshape(1, 1, 3).astype(np.float32)
+NORM_SHIFT = (-IMAGENET_MEAN / IMAGENET_STD).reshape(1, 1, 3).astype(np.float32)
 
 # Segmentation class ids (from config.yaml)
 CLASS_ROAD         = 1
@@ -390,14 +393,12 @@ def preprocess_inplace(img_rgb: np.ndarray, crop_top_frac: float,
     crop_px = int(h * crop_top_frac)
     # Normalize and write directly inside the pre-allocated buffer
     # out_buf shape: (3, H, W)
-    dst_hwc = out_buf[0].transpose(1, 2, 0)   # view, no copy
     resized = cv2.resize(img_rgb[crop_px:], (MODEL_W, MODEL_H),
                          interpolation=cv2.INTER_LINEAR)
-    # Convert and normalize directly in out_buf
-    np.copyto(dst_hwc, resized, casting='unsafe')   # uint8 -> float32 in-place
-    out_buf[0] /= 255.0
-    out_buf[0] -= IMAGENET_MEAN[:, np.newaxis, np.newaxis]   # broadcast on CHW
-    out_buf[0] /= IMAGENET_STD[:, np.newaxis, np.newaxis]
+    # Single fused pass: out = pixel * scale + shift  (avoids 3 separate traversals)
+    dst_hwc = out_buf[0].transpose(1, 2, 0)   # view, no copy
+    np.multiply(resized, NORM_SCALE, out=dst_hwc, casting='unsafe')
+    dst_hwc += NORM_SHIFT
 
 # -- BEV + lateral error -------------------------------------------------------
 
@@ -634,11 +635,8 @@ class LaneFollowerNode:
             n_ch = {"rgb8": 3, "bgr8": 3, "mono8": 1,
                     "rgba8": 4, "bgra8": 4}.get(msg.encoding, 3)
             img_raw = np.frombuffer(msg.data, dtype=dtype)
-            rospy.loginfo_once("[lane_follower] Camera encoding: %s", msg.encoding)
-            rospy.loginfo_throttle(2, "[lane_follower] encoding=%s shape=%s dtype=%s "
-                                      "min=%.1f max=%.1f",
-                                   msg.encoding, img_raw.shape, img_raw.dtype,
-                                   float(img_raw.min()), float(img_raw.max()))
+            rospy.loginfo_once("[lane_follower] Camera encoding: %s  shape=%s",
+                               msg.encoding, img_raw.shape)
             img_raw = img_raw.reshape(msg.height, msg.width, n_ch)
 
             if msg.encoding == "rgb8":
@@ -665,9 +663,6 @@ class LaneFollowerNode:
         # Inference
         try:
             mask = self.model.infer(self._inp_buf[0])
-            unique, counts = np.unique(mask, return_counts=True)
-            rospy.loginfo_throttle(1, "[lane_follower] mask classes: %s counts: %s",
-                                   unique.tolist(), counts.tolist())
         except Exception as e:
             rospy.logerr("[lane_follower] Inference failed: %s", e)
             self._publish_stop()

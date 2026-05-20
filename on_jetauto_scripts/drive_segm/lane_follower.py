@@ -19,7 +19,7 @@ Architecture:
     segmentation mask (5 classes: bg, road, lane_marking, lane_dashed, zebra)
         |
         v
-    BEV warpPerspective (homography from bev_config.json)
+    BEV warpPerspective (auto-calibration from two horizontal mask lines)
         |
         v
     lateral error computation (centroid of lane markings vs BEV center)
@@ -31,14 +31,13 @@ Architecture:
     /jetauto_controller/cmd_vel  (geometry_msgs/Twist)
 
 Usage (on the robot):
-    python3 lane_follower.py --model model.onnx --bev bev_config.json
+    python3 lane_follower.py --model model.onnx
 
     # When TensorRT engine is ready:
-    python3 lane_follower.py --model model.engine --bev bev_config.json --tensorrt
+    python3 lane_follower.py --model model.engine --tensorrt
 
 Options:
     --model PATH       Path to .onnx or .engine model file
-    --bev   PATH       Path to bev_config.json from calibrate_bev.py
     --speed FLOAT      Forward speed in m/s (default: 0.15)
     --kp    FLOAT      PID proportional gain (default: 1.2)
     --ki    FLOAT      PID integral gain     (default: 0.0)
@@ -49,9 +48,7 @@ Options:
     --publish-masks    Publish /lane_mask and /lane_mask_bev (mono8) for external lane_controller.
                        Default: off. Can be combined with --dry-run.
 """
-
 import argparse
-import json
 import time
 
 import cv2
@@ -60,6 +57,8 @@ import rospy
 # cv_bridge is not used -- raw numpy conversion avoids Python 2/3 issues
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Image
+
+from auto_calibration import AutoCalibration
 
 import ctypes
 import ctypes.util
@@ -87,11 +86,11 @@ LANE_MASK_BEV_TOPIC  = "/lane_mask_bev"    # maschera in BEV, mono8
 MODEL_H = 256
 MODEL_W = 640
 
-BEV_COVER_FRAC = 0.99  # use 90% of the source image
-
 # Camera WxH
 SRC_IMAGE_WIDTH = 640
 SRC_IMAGE_HEIGHT = 480
+
+CROP_TOP_FRAC = 0.45
 
 # ImageNet normalization (same as training pipeline)
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -102,6 +101,14 @@ CLASS_ROAD         = 1
 CLASS_LANE_MARKING = 2
 CLASS_LANE_DASHED  = 3
 CLASS_ZEBRA        = 4
+
+CLASS_COLORS = np.array([
+        [0,   0,   0],    # 0 background
+        [180, 130, 70],   # 1 road
+        [0,   255, 255],  # 2 lane_marking
+        [255, 255,   0],  # 3 lane_dashed
+        [0,   0,   255],  # 4 zebra
+    ], dtype=np.uint8)
 
 # Classes used for lateral error computation
 # We use lane markings + dashed lines as the primary cue
@@ -245,33 +252,32 @@ class TensorRTBackend:
         ii = self.in_idx[0]
         oi = self.out_idx[0]
 
-        inp = img_chw[np.newaxis].astype(np.float32).ravel()
-        np.copyto(self.host_bufs[ii][1][:inp.size], inp)
+        # Copy directly in pinned buffer w/o astype/ravel
+        h_in = self.host_bufs[ii][1]
+        n_in = img_chw.size
+        np.copyto(h_in[:n_in], img_chw.ravel())  # img_chw is already float32
+
         self._rt(self.rt.cudaMemcpyAsync(
-            self.dev_bufs[ii],
-            self.host_bufs[ii][0],
-            inp.size * 4,  # input always float32 = 4 bytes
-            ctypes.c_int(1), self.stream))
+            self.dev_bufs[ii], self.host_bufs[ii][0],
+            n_in * 4, ctypes.c_int(1), self.stream))
 
         self.context.execute_async_v2(
             bindings=self.bindings,
             stream_handle=self.stream.value)
 
-        # Output -- use correct item_size (4 for int32)
         n_out = int(np.prod(self.out_shapes[0]))
         item_size = self.host_bufs[oi][2]
         self._rt(self.rt.cudaMemcpyAsync(
-            self.host_bufs[oi][0],
-            self.dev_bufs[oi],
-            n_out * item_size,  # item_size from dtype
-            ctypes.c_int(2), self.stream))
+            self.host_bufs[oi][0], self.dev_bufs[oi],
+            n_out * item_size, ctypes.c_int(2), self.stream))
         self._rt(self.rt.cudaStreamSynchronize(self.stream))
 
+        # raw is already int32 inside pinned buffer -- no copy
         raw = self.host_bufs[oi][1][:n_out].reshape(self.out_shapes[0])[0]
 
         if out_buf is not None:
-            # Write in pre-allocated buffer
-            np.copyto(out_buf, raw.astype(np.int64))
+            # Cast int32->int64 in-place
+            np.copyto(out_buf, raw, casting='unsafe')
             return out_buf
         else:
             return raw.astype(np.int64)
@@ -381,137 +387,20 @@ def preprocess_inplace(img_rgb: np.ndarray, crop_top_frac: float,
     """
     h       = img_rgb.shape[0]
     crop_px = int(h * crop_top_frac)
+    # Normalize and write directly inside the pre-allocated buffer
+    # out_buf shape: (3, H, W)
+    dst_hwc = out_buf[0].transpose(1, 2, 0)   # view, no copy
     resized = cv2.resize(img_rgb[crop_px:], (MODEL_W, MODEL_H),
                          interpolation=cv2.INTER_LINEAR)
-    # Normalize and write directly inside the pre-allocated buffer
-    # out_buf shape: (1, 3, H, W)
-    tmp = resized.astype(np.float32)
-    tmp /= 255.0
-    tmp -= IMAGENET_MEAN
-    tmp /= IMAGENET_STD
-    # HWC -> CHW and write out_buf[0]
-    np.copyto(out_buf[0], tmp.transpose(2, 0, 1))
-
+    # Convert and normalize directly in out_buf
+    np.copyto(dst_hwc, resized, casting='unsafe')   # uint8 -> float32 in-place
+    out_buf[0] /= 255.0
+    out_buf[0] -= IMAGENET_MEAN[:, np.newaxis, np.newaxis]   # broadcast on CHW
+    out_buf[0] /= IMAGENET_STD[:, np.newaxis, np.newaxis]
 
 # -- BEV + lateral error -------------------------------------------------------
 
-class BEVProcessor:
-    """
-    Applies the homography from bev_config.json to the segmentation mask
-    and computes the lateral error for the PID controller.
-    """
-
-    def __init__(self, config_path: str):
-        with open(config_path) as f:
-            cfg = json.load(f)
-
-        self.bev_w = cfg["bev_width"]
-        self.bev_h = cfg["bev_height"]
-        self.crop_top_frac = cfg["crop_top_frac"]
-        self.px_per_m = cfg["pixels_per_metre"]
-
-        H = np.array(cfg["homography"], dtype=np.float64)
-
-        # The homography was calibrated on a small rectangle in the image.
-        # The destination rectangle is centred in a 400x400 BEV image.
-        # Pixels outside the calibration rectangle map outside the 400x400 area.
-        #
-        # Operation: apply a scale+translate transform T on top of H so that the
-        # full model output (640x256) maps into the BEV canvas.
-        # We want the BEV to cover bev_cover_frac of the source image width.
-        src_w = MODEL_W  # 640 -- full width of segmentation mask
-        src_h = MODEL_H  # 256
-
-        # Map the four corners of the covered source region through H
-        # to find where they land in the current BEV, then compute
-        # a corrective scale+translate so they fill the BEV canvas.
-        margin_x = int(src_w * (1.0 - BEV_COVER_FRAC) / 2)
-        # Find corner pixels based on the % of length to take base on BEV_COVER_FRAC
-        src_corners = np.float32([
-            [margin_x, 0],  # TL
-            [src_w - margin_x, 0],  # TR
-            [src_w - margin_x, src_h],  # BR
-            [margin_x, src_h],  # BL
-        ])
-
-        # Project source corners through H into current BEV space
-        src_h3 = np.ones((4, 3), dtype=np.float64)
-        src_h3[:, :2] = src_corners
-        dst_pts = (H @ src_h3.T).T
-        dst_pts = dst_pts[:, :2] / dst_pts[:, 2:3]
-
-        # Bounding box of projected corners in BEV space
-        x_min, y_min = dst_pts.min(axis=0)
-        x_max, y_max = dst_pts.max(axis=0)
-
-        # Scale to fit inside BEV canvas with small padding
-        pad = 10
-        scale = min((self.bev_w - 2 * pad) / (x_max - x_min),
-                    (self.bev_h - 2 * pad) / (y_max - y_min))
-        tx = pad - x_min * scale
-        ty = pad - y_min * scale
-
-        # Corrective transform T: scale + translate in BEV space
-        T = np.array([
-            [scale, 0, tx],
-            [0, scale, ty],
-            [0, 0, 1],
-        ], dtype=np.float64)
-
-        # Final: first apply H (homography), then T (scale and translate)
-        # T @ H combines the 2 matrix transform in 1 passage
-        self.H = T @ H
-        self.bev_cx = self.bev_w / 2.0
-
-        rospy.loginfo("[lane_follower] BEV config loaded: %s", config_path)
-        rospy.loginfo("[lane_follower] BEV size: %dx%d  scale: %.1f px/m  "
-                      "coverage: %.0f%%",
-                      self.bev_w, self.bev_h, self.px_per_m,
-                      BEV_COVER_FRAC * 100)
-
-    def mask_to_bev(self, mask: np.ndarray) -> np.ndarray:
-        """
-        Warp the segmentation mask (MODEL_H x MODEL_W) to BEV.
-        Uses INTER_NEAREST to preserve integer class labels.
-        """
-        return cv2.warpPerspective(
-            mask.astype(np.uint8), self.H,
-            (self.bev_w, self.bev_h),
-            flags=cv2.INTER_NEAREST)
-
-    def lateral_error(self, bev_mask: np.ndarray) -> tuple:
-        """
-        Compute the lateral error from the BEV mask.
-
-        Strategy:
-            1. Extract pixels belonging to lane marking classes
-               in the lower half of the BEV (the near region -- more reliable)
-            2. Compute the x-centroid of those pixels
-            3. Error = centroid_x - bev_cx  (positive = robot is left of center)
-            4. Normalize to [-1, 1] by dividing by half BEV width
-
-        Returns:
-            error_norm  -- float in [-1, 1], positive means steer right
-            n_pixels    -- number of lane pixels found (used for confidence check)
-        """
-        # Focus on lower half of BEV (near road, more reliable)
-        roi = bev_mask[self.bev_h // 2:, :]
-
-        lane_mask = np.zeros_like(roi, dtype=bool)
-        for cls in LANE_CLASSES:
-            lane_mask |= (roi == cls)
-
-        n_pixels = int(lane_mask.sum())
-        if n_pixels < MIN_LANE_PIXELS:
-            return 0.0, n_pixels
-
-        # x-coordinates of all lane pixels
-        xs          = np.where(lane_mask)[1].astype(np.float32)
-        centroid_x  = float(xs.mean())
-        error_px    = centroid_x - self.bev_cx
-        error_norm  = error_px / (self.bev_w / 2.0)   # normalize to [-1, 1]
-
-        return float(np.clip(error_norm, -1.0, 1.0)), n_pixels
+# bev_config-based BEV logic moved to bev_from_config.py (legacy).
 
 
 # -- PID controller ------------------------------------------------------------
@@ -629,12 +518,19 @@ class LaneFollowerNode:
         else:
             self.model = ONNXBackend(args.model)
 
-        # Load BEV processor
-        self.bev = BEVProcessor(args.bev)
+        self.crop_top_frac = CROP_TOP_FRAC
 
-        # Input and Mask Buffers
-        self._inp_buf = np.empty((1, 3, MODEL_H, MODEL_W), dtype=np.float32)
-        self._mask_buf = np.empty((MODEL_H, MODEL_W), dtype=np.int64)
+        # Auto-calibration (top half to near-bottom)
+        top_line = MODEL_H - (MODEL_H // 4)
+        bottom_line = MODEL_H - 10
+        self.angle = 0 # Placeholder
+        self.log_calibration_once = True
+        self.auto_calib = AutoCalibration(top_line, bottom_line)
+        self.calib_lane_label = CLASS_LANE_MARKING
+        self.pending_calibration = self._prompt_calibration()
+        if not self.pending_calibration:
+            rospy.signal_shutdown("Calibration declined")
+            raise SystemExit(0)
 
         # PID controller
         self.pid = PIDController(
@@ -650,6 +546,10 @@ class LaneFollowerNode:
         self.last_error    = 0.0
         self.frames_total  = 0
         self.frames_no_lane = 0
+
+        # Input and Mask Buffers
+        self._inp_buf = np.empty((1, 3, MODEL_H, MODEL_W), dtype=np.float32)
+        self._mask_buf = np.empty((MODEL_H, MODEL_W), dtype=np.int64)
 
         # Publishers
         if not self.dry_run:
@@ -685,6 +585,17 @@ class LaneFollowerNode:
 
         rospy.on_shutdown(self._on_shutdown)
 
+    def _prompt_calibration(self) -> bool:
+        while True:
+            try:
+                resp = input("Start calibration? [y/n]: ").strip().lower()
+            except EOFError:
+                return False
+            if resp in ("y", "yes"):
+                return True
+            if resp in ("n", "no"):
+                return False
+
     # -- Camera callback -------------------------------------------------------
 
     def image_cb(self, msg: Image):
@@ -692,7 +603,6 @@ class LaneFollowerNode:
 
         # Convert ROS Image message to BGR numpy array without cv_bridge.
         # Works with Python 3 on ROS Melodic where cv_bridge is Python 2 only.
-        # Sostituisci il blocco di conversione in image_cb con questo:
         try:
             dtype = np.uint8
             n_ch = {"rgb8": 3, "bgr8": 3, "mono8": 1,
@@ -724,12 +634,10 @@ class LaneFollowerNode:
             return
 
         # Preprocess
-        # img_chw = preprocess(img_bgr, self.bev.crop_top_frac)
-        preprocess_inplace(img_bgr, self.bev.crop_top_frac, self._inp_buf) # Uses buffer
+        preprocess_inplace(img_bgr, self.crop_top_frac, self._inp_buf) # Uses buffer
 
         # Inference
         try:
-            #mask = self.model.infer(img_chw)   # (MODEL_H, MODEL_W) int
             mask = self.model.infer(self._inp_buf[0])
             unique, counts = np.unique(mask, return_counts=True)
             rospy.loginfo_throttle(1, "[lane_follower] mask classes: %s counts: %s",
@@ -739,8 +647,19 @@ class LaneFollowerNode:
             self._publish_stop()
             return
 
+        # Calibration on first valid frame
+        if self.pending_calibration:
+            self.angle = self.auto_calib.calibrate(mask, self.calib_lane_label)
+            self.pending_calibration = False
+
         # BEV transform
-        bev_mask = self.bev.mask_to_bev(mask)
+        bev_mask = self.auto_calib.make_bev(mask)
+        bev_mask_u8 = np.clip(bev_mask, 0, 255).astype(np.uint8, copy=False)
+
+        if self.log_calibration_once:
+            self.auto_calib.save_debug(mask, prefix="lane_calibration")
+            rospy.loginfo("[lane_follower] Saved calibration debug images: lane_calibration_points.jpg, lane_calibration_warp.jpg, lane_calibration_points_rgb.jpg, lane_calibration_warp_rgb.jpg")
+            self.log_calibration_once = False
 
         # Publish masks for external lane_controller (opt-in).
         if self.publish_masks:
@@ -748,13 +667,13 @@ class LaneFollowerNode:
                 self.lane_mask_pub.publish(
                     self._make_mono8_msg(mask, msg.header))
                 self.lane_mask_bev_pub.publish(
-                    self._make_mono8_msg(bev_mask, msg.header))
+                    self._make_mono8_msg(bev_mask_u8, msg.header))
             except Exception as e:
                 rospy.logwarn_throttle(
                     5, "[lane_follower] mask publish err: %s", e)
 
         # Lateral error
-        error_norm, n_pixels = self.bev.lateral_error(bev_mask)
+        error_norm, n_pixels = self._lateral_error(bev_mask_u8)
 
         self.frames_total += 1
 
@@ -792,10 +711,10 @@ class LaneFollowerNode:
         if self.debug and self.debug_pub.get_num_connections() > 0:
             # Resize mask to match img_bgr for display
             h_orig, w_orig = img_bgr.shape[:2]
-            crop_px  = int(h_orig * self.bev.crop_top_frac)
+            crop_px  = int(h_orig * self.crop_top_frac)
             img_crop = img_bgr[crop_px:, :]
             img_disp = cv2.resize(img_crop, (MODEL_W, MODEL_H))
-            dbg = make_debug_image(img_disp, mask, bev_mask,
+            dbg = make_debug_image(img_disp, mask, bev_mask_u8,
                                    error_norm, n_pixels, angular_z)
             try:
                 dbg_msg          = Image()
@@ -808,6 +727,25 @@ class LaneFollowerNode:
                 self.debug_pub.publish(dbg_msg)
             except Exception:
                 pass
+
+    def _lateral_error(self, bev_mask: np.ndarray) -> tuple:
+        h, w = bev_mask.shape[:2]
+        roi = bev_mask[h // 2:, :]
+
+        lane_mask = np.zeros_like(roi, dtype=bool)
+        for cls in LANE_CLASSES:
+            lane_mask |= (roi == cls)
+
+        n_pixels = int(lane_mask.sum())
+        if n_pixels < MIN_LANE_PIXELS:
+            return 0.0, n_pixels
+
+        xs = np.where(lane_mask)[1].astype(np.float32)
+        centroid_x = float(xs.mean())
+        error_px = centroid_x - (w * 0.5)
+        error_norm = error_px / (w * 0.5)
+
+        return float(np.clip(error_norm, -1.0, 1.0)), n_pixels
 
     # -- Helpers ---------------------------------------------------------------
 
@@ -845,8 +783,6 @@ def main():
         description="Lane following node for JetAuto (ROS1 Melodic)")
     parser.add_argument("--model",    required=True,
                         help="Path to .onnx or .engine model file")
-    parser.add_argument("--bev",      required=True,
-                        help="Path to bev_config.json")
     parser.add_argument("--speed",    type=float, default=0.15,
                         help="Forward speed m/s (default: 0.15)")
     parser.add_argument("--kp",       type=float, default=1.2)

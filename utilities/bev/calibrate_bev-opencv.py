@@ -72,17 +72,28 @@ class PointPicker:
         self.canvas = image.copy()
         self.points = []
         self.done   = False
+        self.win_name = None
 
     def _mouse_cb(self, event, x, y, flags, param):
+        if self.win_name is None:
+            return
+
         if event == cv2.EVENT_LBUTTONDOWN and len(self.points) < 4:
-            self.points.append((x, y))
+            # Map window coords -> image coords (window can be resized).
+            _, _, win_w, win_h = cv2.getWindowImageRect(self.win_name)
+            img_h, img_w = self.image.shape[:2]
+            if win_w <= 0 or win_h <= 0:
+                return
+            x_img = int(np.clip(x * img_w / float(win_w), 0, img_w - 1))
+            y_img = int(np.clip(y * img_h / float(win_h), 0, img_h - 1))
+            self.points.append((x_img, y_img))
             idx   = len(self.points) - 1
             color = self.COLORS[idx]
             # Draw circle and label
-            cv2.circle(self.canvas, (x, y), 8, color, -1)
-            cv2.circle(self.canvas, (x, y), 8, (255, 255, 255), 2)
+            cv2.circle(self.canvas, (x_img, y_img), 8, color, -1)
+            cv2.circle(self.canvas, (x_img, y_img), 8, (255, 255, 255), 2)
             cv2.putText(self.canvas, self.LABELS[idx],
-                        (x + 12, y - 8),
+                        (x_img + 12, y_img - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         color, 2, cv2.LINE_AA)
             # Draw connecting lines once we have >1 point
@@ -134,6 +145,7 @@ class PointPicker:
 
     def run(self) -> list:
         win = "BEV Calibration -- click 4 corners (right-click to undo, ENTER to confirm)"
+        self.win_name = win
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win, 900, 600)
         cv2.setMouseCallback(win, self._mouse_cb)
@@ -258,6 +270,7 @@ def save_preview(original: np.ndarray, bev: np.ndarray,
 def save_config(H: np.ndarray, scale: float,
                 src_pts: list, real_w: float, real_h: float,
                 bev_w: int, bev_h: int, crop_top_frac: float,
+                src_w: int, src_h: int, crop_w: int, crop_h: int,
                 out_path: Path):
     """
     Save BEV calibration config as JSON.
@@ -272,12 +285,17 @@ def save_config(H: np.ndarray, scale: float,
         "bev_width":        bev_w,
         "bev_height":       bev_h,
         "crop_top_frac":    crop_top_frac,
+        "src_image_width":  int(src_w),
+        "src_image_height": int(src_h),
+        "cropped_width":    int(crop_w),
+        "cropped_height":   int(crop_h),
         "src_points_px":    src_pts,
         "real_rect_m":      {"width": real_w, "height": real_h},
         "notes": (
             "H maps from cropped image pixels to BEV pixels. "
             "Apply the same crop_top_frac before warpPerspective. "
-            "pixels_per_metre is the BEV scale factor."
+            "pixels_per_metre is the BEV scale factor. "
+            "cropped_width/height describe the crop used for calibration."
         )
     }
     with open(out_path, "w") as f:
@@ -318,9 +336,9 @@ def main():
     parser.add_argument("--crop-top",   type=float, default=0.45,
                         dest="crop_top",
                         help="Same crop fraction used in training (default: 0.45)")
-    parser.add_argument("--bev-width",  type=int, default=400,
+    parser.add_argument("--bev-width",  type=int, default=640,
                         dest="bev_width")
-    parser.add_argument("--bev-height", type=int, default=400,
+    parser.add_argument("--bev-height", type=int, default=640,
                         dest="bev_height")
     args = parser.parse_args()
 
@@ -345,6 +363,7 @@ def main():
     # Apply the same crop used during training
     crop_top_px = int(h_full * args.crop_top)
     img_cropped = img_full[crop_top_px:, :]
+    crop_h, crop_w = img_cropped.shape[:2]
 
     print(f"\n  Image      : {img_path}  ({w_full}x{h_full})")
     print(f"  Crop top   : {crop_top_px}px  ({args.crop_top*100:.0f}%)")
@@ -411,7 +430,8 @@ def main():
     # Save config
     save_config(H, scale, src_pts, real_w, real_h,
                 args.bev_width, args.bev_height,
-                args.crop_top, out_path)
+                args.crop_top, w_full, h_full, crop_w, crop_h,
+                out_path)
 
     print()
     print("  Next steps:")

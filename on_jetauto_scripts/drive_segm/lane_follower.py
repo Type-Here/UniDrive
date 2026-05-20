@@ -50,6 +50,7 @@ Options:
 """
 import argparse
 import time
+from typing import Union
 
 import cv2
 import numpy as np
@@ -525,12 +526,21 @@ class LaneFollowerNode:
         bottom_line = MODEL_H - 10
         self.angle = 0 # Placeholder
         self.log_calibration_once = True
-        self.auto_calib = AutoCalibration(top_line, bottom_line)
+
         self.calib_lane_label = CLASS_LANE_MARKING
-        self.pending_calibration = self._prompt_calibration()
-        if not self.pending_calibration:
-            rospy.signal_shutdown("Calibration declined")
-            raise SystemExit(0)
+        calib_path = args.calibration
+
+        points, angle = self.check_calibration(calib_path)
+        if points is None:
+            self.auto_calib = AutoCalibration(top_line, bottom_line)
+            self.pending_calibration = self._prompt_calibration()
+            if not self.pending_calibration:
+                rospy.signal_shutdown("Calibration declined")
+                raise SystemExit(0)
+        else:
+            rospy.loginfo("[lane_follower] Loaded calibration points and angle from: %s", calib_path)
+            self.auto_calib = AutoCalibration(top_line, bottom_line, last_src_pts=points, calib_angle=angle)
+            self.pending_calibration = False
 
         # PID controller
         self.pid = PIDController(
@@ -595,6 +605,22 @@ class LaneFollowerNode:
                 return True
             if resp in ("n", "no"):
                 return False
+
+    @staticmethod
+    def check_calibration(path) -> Union[(np.float32, np.float32), (None, None)]:
+        import os
+        if os.path.exists(path):
+            rospy.loginfo_once("[lane_follower] Calibration found: %s", path)
+
+            with open(path, "rb") as f:
+                data = np.load(f)
+                points = data.get("calib_points", None)
+                angles = data.get("calib_angles", None)
+                return points, angles
+        #Else return None,  None
+        return     None, None
+
+
 
     # -- Camera callback -------------------------------------------------------
 
@@ -799,6 +825,7 @@ def main():
                              "Can be combined with --dry-run.")
     parser.add_argument("--dry-run",  action="store_true", dest="dry_run",
                         help="Run inference without publishing cmd_vel")
+    parser.add_argument("--calibration", help="Path to calibration json file", default="calibration.json")
 
     # ROS passes extra args -- filter them out
     import rospy

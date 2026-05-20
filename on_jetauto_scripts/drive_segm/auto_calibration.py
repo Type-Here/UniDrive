@@ -4,12 +4,16 @@ import numpy as np
 import cv2
 
 class AutoCalibration:
-    def __init__(self, top_line:int, bottom_line:Union[int, None]):
+    def __init__(self, top_line:int, bottom_line:Union[int, None],
+                 last_src_pts: np.float32 = None,
+                 calib_angle:float = 0.0,
+                 save_path="calibration.json"):
         self.top_line = int(top_line)
         self.bottom_line = int(bottom_line) if bottom_line is not None else None
-        self.calibration_angle = 0.0
-        self.max_angle = np.deg2rad(40.0)
-        self._last_src_pts = None
+        self.calibration_angle = calib_angle
+        self.max_angle = np.deg2rad(70.0)
+        self._last_src_pts = last_src_pts
+        self.save_path = save_path
 
     def calibrate(self, segm_output:np.ndarray, lane_label:int) -> float:
         """
@@ -71,6 +75,17 @@ class AutoCalibration:
         angle = (angle_tl_bl + angle_tr_br) / 2
         angle = float(np.clip(angle, -self.max_angle, self.max_angle))
         self.calibration_angle = angle
+
+        # Save src points and angle in json file as
+        # points and angle names
+        with open(self.save_path, "w") as f:
+            import json
+            json.dump({
+                "src_points": self._last_src_pts.tolist(),
+                "calibration_angle": self.calibration_angle,
+            }, f, indent=2)
+
+
         return angle
 
 

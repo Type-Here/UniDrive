@@ -255,19 +255,26 @@ def save_preview(original_bgr: np.ndarray, bev_bgr: np.ndarray,
 def save_config(H: np.ndarray, scale: float, src_pts: list,
                 real_w: float, real_h: float,
                 bev_w: int, bev_h: int,
-                crop_top_frac: float, out_path: Path):
+                crop_top_frac: float,
+                src_w: int, src_h: int, crop_w: int, crop_h: int,
+                out_path: Path):
     config = {
         "homography":       H.tolist(),
         "pixels_per_metre": scale,
         "bev_width":        bev_w,
         "bev_height":       bev_h,
         "crop_top_frac":    crop_top_frac,
+        "src_image_width":  int(src_w),
+        "src_image_height": int(src_h),
+        "cropped_width":    int(crop_w),
+        "cropped_height":   int(crop_h),
         "src_points_px":    src_pts,
         "real_rect_m":      {"width": real_w, "height": real_h},
         "notes": (
             "H maps from cropped-image pixels to BEV pixels. "
             "Apply crop_top_frac before cv2.warpPerspective. "
-            "pixels_per_metre gives the BEV scale."
+            "pixels_per_metre gives the BEV scale. "
+            "cropped_width/height describe the crop used for calibration."
         )
     }
     with open(out_path, "w") as f:
@@ -292,8 +299,8 @@ def main():
                         help="Input frame (omit to use artifacts/bev/reference.*)")
     parser.add_argument("--out",        default="bev_config.json")
     parser.add_argument("--crop-top",   type=float, default=0.45, dest="crop_top")
-    parser.add_argument("--bev-width",  type=int,   default=400,  dest="bev_width")
-    parser.add_argument("--bev-height", type=int,   default=400,  dest="bev_height")
+    parser.add_argument("--bev-width",  type=int,   default=640,  dest="bev_width")
+    parser.add_argument("--bev-height", type=int,   default=640,  dest="bev_height")
     args = parser.parse_args()
 
     img_path = Path(args.image) if args.image else default_ref
@@ -314,6 +321,7 @@ def main():
     h_full, w_full = img_full.shape[:2]
     crop_px        = int(h_full * args.crop_top)
     img_cropped    = img_full[crop_px:, :]
+    crop_h, crop_w = img_cropped.shape[:2]
 
     print(f"\n  Image   : {img_path}  ({w_full}x{h_full})")
     print(f"  Crop    : top {crop_px}px removed  -> {img_cropped.shape[1]}x{img_cropped.shape[0]}")
@@ -360,7 +368,8 @@ def main():
     save_preview(img_cropped, bev, src_pts, preview_path)
     save_config(H, scale, src_pts, real_w, real_h,
                 args.bev_width, args.bev_height,
-                args.crop_top, out_path)
+                args.crop_top, w_full, h_full, crop_w, crop_h,
+                out_path)
 
     # Show BEV result
     try:

@@ -14,6 +14,8 @@ class AutoCalibration:
         self.max_angle = np.deg2rad(70.0)
         self._last_src_pts = last_src_pts
         self.save_path = save_path
+        self._cached_M = None        # cached perspective matrix, invalidated on recalibration
+        self._cached_mask_size = None
 
     def calibrate(self, segm_output:np.ndarray, lane_label:int) -> float:
         """
@@ -66,6 +68,7 @@ class AutoCalibration:
             [br, bottom],
             [bl, bottom],
         ])
+        self._cached_M = None  # invalidate cached matrix on recalibration
 
         # Calculate the angle to warp image based on tl, tr, bl, br point in order to get them aligned vertically
         # We can use the average of the angles between (tl, bl) and (tr, br)
@@ -97,15 +100,16 @@ class AutoCalibration:
             return None
         if self._last_src_pts is None:
             return None
-        span = bottom - self.top_line
         src_pts = self._last_src_pts
+        # dst_pts span the full output height so warpPerspective stretches directly
+        # to the final size -- no separate crop+resize needed
         dst_pts = np.float32([
             [0.0, 0.0],
             [mask_w - 1.0, 0.0],
-            [mask_w - 1.0, span],
-            [0.0, span],
+            [mask_w - 1.0, mask_h - 1.0],
+            [0.0, mask_h - 1.0],
         ])
-        return bottom, span, src_pts, dst_pts
+        return bottom, src_pts, dst_pts
 
     @staticmethod
     def _colorize_mask(mask_u8: np.ndarray) -> np.ndarray:
@@ -126,21 +130,16 @@ class AutoCalibration:
         if pts is None:
             cv2.imwrite(prefix + "_points.jpg", colored)
             return
-        bottom, span, src_pts, dst_pts = pts
-        # Draw points on the colored mask
+        bottom, src_pts, dst_pts = pts
         vis = colored.copy()
         for (x, y) in src_pts:
             cv2.circle(vis, (int(x), int(y)), 5, (255, 255, 255), -1)
         cv2.imwrite(prefix + "_points.jpg", vis)
-        # Warp the colored mask for inspection
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
         warped = cv2.warpPerspective(
             colored, M, (mask_w, mask_h),
             flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        # Stretch to original mask height (same as make_bev output)
-        stretched = cv2.resize(warped[self.top_line:bottom, :], (mask_w, mask_h),
-                               interpolation=cv2.INTER_NEAREST)
-        cv2.imwrite(prefix + "_warp.jpg", stretched)
+        cv2.imwrite(prefix + "_warp.jpg", warped)
 
     def make_bev(self, segm_output:np.ndarray) -> np.ndarray:
         """
@@ -159,23 +158,17 @@ class AutoCalibration:
             bottom = self.bottom_line if self.bottom_line is not None else mask_h - 1
             return segm_output[self.top_line:bottom, :]
 
-        bottom, span, src_pts, dst_pts = pts
+        bottom, src_pts, dst_pts = pts
 
-        # Compute perspective transform matrix
-        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        cur_size = (segm_output.shape[1], segm_output.shape[0])
+        if self._cached_M is None or self._cached_mask_size != cur_size:
+            self._cached_M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            self._cached_mask_size = cur_size
+        M = self._cached_M
 
-        # Warp the image using the perspective transform
         mask_u8 = segm_output.astype(np.uint8, copy=False)
 
-        warped = cv2.warpPerspective(
+        # Single warpPerspective fills the full output -- no crop or resize needed
+        return cv2.warpPerspective(
             mask_u8, M, (mask_w, mask_h),
             flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-        # Crop the warped image to the area between top_line and bottom_line
-        crop_height = self.bottom_line - self.top_line
-        mask_cropped = warped[:crop_height, :]
-
-        # Stretch image to original mask height
-        stretched = cv2.resize(mask_cropped, (mask_w, mask_h), interpolation=cv2.INTER_NEAREST)
-
-        return stretched

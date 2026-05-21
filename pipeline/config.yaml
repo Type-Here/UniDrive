@@ -41,9 +41,9 @@ image:
   crop_top_frac: 0.45          # pixels removed = floor(480 * 0.45) = 216
 
   # Final size fed to the model - must be multiples of 32 for SegFormer.
-  # After crop: 264h x 640w → resize to 256x640.
-  model_h: 256
-  model_w: 640
+  # After crop: 264h x 640w → resize to 128x320.
+  model_h: 128
+  model_w: 320
 
 # -- Dataset split -------------------------------------------------------------
 split:

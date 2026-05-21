@@ -85,8 +85,8 @@ LANE_MASK_TOPIC      = "/lane_mask"        # maschera in image space, mono8
 LANE_MASK_BEV_TOPIC  = "/lane_mask_bev"    # maschera in BEV, mono8
 
 # Model input size -- must match training config
-MODEL_H = 256
-MODEL_W = 640
+MODEL_H = 128
+MODEL_W = 320
 
 # Camera WxH
 SRC_IMAGE_WIDTH = 640
@@ -120,7 +120,8 @@ CLASS_COLORS = np.array([
 LANE_CLASSES = [CLASS_LANE_MARKING, CLASS_LANE_DASHED]
 
 # Safety: stop if fewer than this many lane pixels are visible in BEV
-MIN_LANE_PIXELS = 50
+# Scaled down from 50 proportionally with the 4x smaller mask area (128x320 vs 256x640)
+MIN_LANE_PIXELS = 15
 
 # Top Line cut of the BEV for error computation -- avoids far-away noisy pixels
 TOP_LINE = MODEL_H - (MODEL_H // 3)

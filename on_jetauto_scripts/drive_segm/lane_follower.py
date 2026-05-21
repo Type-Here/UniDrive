@@ -122,6 +122,11 @@ LANE_CLASSES = [CLASS_LANE_MARKING, CLASS_LANE_DASHED]
 # Safety: stop if fewer than this many lane pixels are visible in BEV
 MIN_LANE_PIXELS = 50
 
+# Top Line cut of the BEV for error computation -- avoids far-away noisy pixels
+TOP_LINE = MODEL_H - (MODEL_H // 3)
+# Bottom Line for BEV
+BOTTOM_LINE = MODEL_H - 20
+
 
 # -- Model backends ------------------------------------------------------------
 
@@ -524,8 +529,8 @@ class LaneFollowerNode:
         self.crop_top_frac = CROP_TOP_FRAC
 
         # Auto-calibration (top half to near-bottom)
-        top_line = MODEL_H - (MODEL_H // 4)
-        bottom_line = MODEL_H - 10
+        top_line = TOP_LINE
+        bottom_line = BOTTOM_LINE
         self.angle = 0 # Placeholder
         self.log_calibration_once = True
 

@@ -17,6 +17,13 @@ class AutoCalibration:
         self._cached_M = None        # cached perspective matrix, invalidated on recalibration
         self._cached_mask_size = None
 
+        # Pre-allocated GPU source buffer for BEV warp (reused every frame)
+        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            self._gpu_mask_src = cv2.cuda_GpuMat()
+            self._use_cuda = True
+        else:
+            self._use_cuda = False
+
     def calibrate(self, segm_output:np.ndarray, lane_label:int) -> float:
         """
         Given the segmentation output, compute the average x position of the lane pixels
@@ -168,7 +175,14 @@ class AutoCalibration:
 
         mask_u8 = segm_output.astype(np.uint8, copy=False)
 
-        # Single warpPerspective fills the full output -- no crop or resize needed
+        if self._use_cuda:
+            self._gpu_mask_src.upload(mask_u8)
+            return cv2.cuda.warpPerspective(
+                self._gpu_mask_src, M, (mask_w, mask_h),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0).download()
+
         return cv2.warpPerspective(
             mask_u8, M, (mask_w, mask_h),
             flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)

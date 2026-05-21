@@ -389,19 +389,26 @@ def preprocess(img_rgb: np.ndarray, crop_top_frac: float) -> np.ndarray:
     return normalised.transpose(2, 0, 1)  # HWC -> CHW               # (3, H, W)
 
 def preprocess_inplace(img_rgb: np.ndarray, crop_top_frac: float,
-                        out_buf: np.ndarray):
+                        out_buf: np.ndarray,
+                        gpu_src=None):
     """
     Crop top, resize to model input, normalize with ImageNet stats.
     Writes the result in out_buf (1,3,H,W) float32.
-    No allocation -- out_buf must be already allocated.
+    If gpu_src/gpu_dst (pre-allocated cv2.cuda_GpuMat) are provided, the
+    resize runs on GPU; otherwise falls back to CPU cv2.resize.
     """
     h       = img_rgb.shape[0]
     crop_px = int(h * crop_top_frac)
-    # Normalize and write directly inside the pre-allocated buffer
-    # out_buf shape: (3, H, W)
-    resized = cv2.resize(img_rgb[crop_px:], (MODEL_W, MODEL_H),
-                         interpolation=cv2.INTER_LINEAR)
-    # Single fused pass: out = pixel * scale + shift  (avoids 3 separate traversals)
+    cropped = img_rgb[crop_px:]
+
+    if gpu_src is not None:
+        gpu_src.upload(cropped)
+        resized = cv2.cuda.resize(gpu_src, (MODEL_W, MODEL_H),
+                                  interpolation=cv2.INTER_LINEAR).download()
+    else:
+        resized = cv2.resize(cropped, (MODEL_W, MODEL_H),
+                             interpolation=cv2.INTER_LINEAR)
+
     dst_hwc = out_buf[0].transpose(1, 2, 0)   # view, no copy
     np.multiply(resized, NORM_SCALE, out=dst_hwc, casting='unsafe')
     dst_hwc += NORM_SHIFT
@@ -568,6 +575,14 @@ class LaneFollowerNode:
         self._inp_buf = np.empty((1, 3, MODEL_H, MODEL_W), dtype=np.float32)
         self._mask_buf = np.empty((MODEL_H, MODEL_W), dtype=np.int64)
 
+        # Pre-allocated GPU source buffer for preprocessing (reused every frame)
+        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            self._gpu_crop_src = cv2.cuda_GpuMat()
+            rospy.loginfo("[lane_follower] CUDA resize enabled")
+        else:
+            self._gpu_crop_src = None
+            rospy.logwarn("[lane_follower] CUDA not available -- resize on CPU")
+
         # Publishers
         if not self.dry_run:
             self.cmd_pub = rospy.Publisher(
@@ -687,7 +702,8 @@ class LaneFollowerNode:
             t0 = time.time()
 
             # Preprocess
-            preprocess_inplace(img_rgb, self.crop_top_frac, self._inp_buf)
+            preprocess_inplace(img_rgb, self.crop_top_frac, self._inp_buf,
+                               self._gpu_crop_src)
 
             # Inference
             try:

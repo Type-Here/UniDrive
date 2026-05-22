@@ -55,6 +55,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     web_dir = "."
     map_file = ""
     video_server_ip = "localhost"
+    _cached_html = None  # dashboard.html pre-elaborato in memoria all'avvio
+
+    @classmethod
+    def preload(cls):
+        """Legge dashboard.html una volta e sostituisce il placeholder IP."""
+        fpath = os.path.join(cls.web_dir, "dashboard.html")
+        with open(fpath, "rb") as f:
+            content = f.read().decode("utf-8")
+        content = content.replace("__VIDEO_SERVER_IP__", cls.video_server_ip)
+        cls._cached_html = content.encode("utf-8")
+        sys.stderr.write("[dashboard_http] dashboard.html caricato in cache (%d bytes)\n" % len(cls._cached_html))
 
     def guess_type(self, path):
         if path.endswith('.yaml') or path.endswith('.yml'):
@@ -62,7 +73,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         return SimpleHTTPRequestHandler.guess_type(self, path)
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("[dashboard_http] " + (fmt % args) + "\n")
+        pass  # sopprimi log per-richiesta: riduce I/O su Jetson
+
+    def end_headers(self):
+        # Cache lunga per asset vendor statici (non cambiano mai)
+        p = self.path.split("?", 1)[0]
+        if p.endswith('.js') or p.endswith('.css'):
+            self.send_header("Cache-Control", "public, max-age=86400, immutable")
+        SimpleHTTPRequestHandler.end_headers(self)
 
     def translate_path(self, path):
         # /map.yaml -> file mappa configurato
@@ -75,24 +93,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         return os.path.join(self.web_dir, clean)
 
     def do_GET(self):
-        # Intercetta dashboard.html e inietta l'IP del video server
         clean_path = self.path.split("?", 1)[0]
         if clean_path in ("", "/", "/dashboard.html"):
-            try:
-                fpath = os.path.join(self.web_dir, "dashboard.html")
-                with open(fpath, "rb") as f:
-                    content = f.read().decode("utf-8")
-                # Sostituisce il placeholder con l'IP rilevato automaticamente
-                content = content.replace(
-                    "__VIDEO_SERVER_IP__", self.video_server_ip)
-                encoded = content.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(encoded)))
-                self.end_headers()
-                self.wfile.write(encoded)
-            except Exception as e:
-                self.send_error(500, str(e))
+            # Serve dalla cache in memoria: nessuna lettura disco
+            content = self._cached_html
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(content)
         else:
             SimpleHTTPRequestHandler.do_GET(self)
 
@@ -117,6 +127,7 @@ def main():
         print("ERRORE: map non esiste: %s" % DashboardHandler.map_file)
         sys.exit(1)
 
+    DashboardHandler.preload()  # cache HTML in RAM una volta sola
     srv = HTTPServer(("0.0.0.0", args.port), DashboardHandler)
     print("[dashboard_http] http://0.0.0.0:%d" % args.port)
     print("[dashboard_http] web_dir          = %s" % DashboardHandler.web_dir)

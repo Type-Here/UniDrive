@@ -104,6 +104,7 @@
   .badge.nav           { background: rgba(78,161,255,.18);   color: var(--accent); }
   .badge.junction      { background: rgba(246,196,83,.18);   color: var(--yellow); }
   .badge.done          { background: rgba(54,211,153,.18);   color: var(--green); }
+  .badge.map-follower  { background: rgba(255,159,67,.35);   color: var(--orange); font-weight: 700; }
 
   .info-row { display: flex; gap: 20px; font-size: 12px; color: var(--muted); margin-top: 6px; }
   .info-row b { color: var(--text); }
@@ -143,6 +144,12 @@
     border: 1px solid var(--teal);
   }
   .btn.calib:hover { background: rgba(45,212,191,.12); }
+  /* Bottone remap */
+  .btn.remap {
+    background: #0a0c10; color: var(--yellow);
+    border: 1px solid var(--yellow);
+  }
+  .btn.remap:hover { background: rgba(246,196,83,.12); }
 
   /* Buttons */
   .btn { border: none; padding: 7px 16px; border-radius: 4px; font-weight: 600; font-size: 13px; cursor: pointer; transition: opacity .15s; }
@@ -205,6 +212,7 @@
       <div class="status-bar">
         <span class="badge" id="laneState">LANE: --</span>
         <span class="badge" id="navState">NAV: IDLE</span>
+        <span class="badge" id="mapFollowerBadge" style="display:none">MAP GUIDE</span>
         <span class="badge" id="goalBadge" style="display:none">GOAL: --</span>
       </div>
       <div class="info-row">
@@ -241,7 +249,8 @@
       <button class="btn ghost" id="previewBtn">Preview</button>
       <button class="btn start" id="startBtn">▶ NAVIGA</button>
       <button class="btn stop"  id="stopBtn" title="Annulla navigazione corrente">■ STOP NAV</button>
-      <button class="btn calib" id="calibBtn" title="Imposta la posizione attuale del robot come origine (nodo 0)">⊕ Calibra</button>
+      <button class="btn calib" id="calibBtn" title="Imposta posizione attuale come origine del nodo Start selezionato">⊕ Calibra</button>
+      <button class="btn remap" id="remapBtn" title="1° click: registra A — guida ~5 nodi — 2° click: registra B e rimappa">🔄 Remap</button>
     </div>
   </section>
 </main>
@@ -324,8 +333,9 @@ function renderVideo(topic) {
 }
 
 // ─── Drive enable / disable ───────────────────────────────────────────────────
-let laneEnablePub = null;
-let driveEnabled  = false;
+let laneEnablePub  = null;
+let odomOriginPub  = null;
+let driveEnabled   = false;
 
 function setDriveEnabled(val) {
   if (!laneEnablePub) { alert('ROS non connesso'); return; }
@@ -350,6 +360,9 @@ function setupTopics() {
   laneEnablePub = new ROSLIB.Topic({
     ros, name: '/lane_controller/enable', messageType: 'std_msgs/Bool'
   });
+  odomOriginPub = new ROSLIB.Topic({
+    ros, name: '/map_follower/odom_origin', messageType: 'geometry_msgs/Point'
+  });
 
   new ROSLIB.Topic({ ros, name: '/waypoint_manager/status', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => updateNavBadge(m.data));
@@ -370,6 +383,18 @@ function setupTopics() {
 
   new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 200, queue_length: 1 })
     .subscribe(m => updateOdom(m));
+
+  new ROSLIB.Topic({ ros, name: '/map_follower/active', messageType: 'std_msgs/Bool', throttle_rate: 500, queue_length: 1 })
+    .subscribe(m => {
+      const b = document.getElementById('mapFollowerBadge');
+      if (m.data) {
+        b.style.display = '';
+        b.className = 'badge map-follower';
+        b.textContent = '🗺 MAP GUIDE';
+      } else {
+        b.style.display = 'none';
+      }
+    });
 }
 
 // ─── Lane / Nav badges ────────────────────────────────────────────────────────
@@ -456,6 +481,18 @@ function updateOdom(msg) {
 let mapData = null, svgViewBox = null;
 
 async function loadMap() {
+  // Prova prima remap.json (persistenza del workflow Remap)
+  try {
+    const r = await fetch('remap.json');
+    if (r.ok) {
+      const d = await r.json();
+      mapData = { frame: d.frame || 'odom', nodes: d.nodes, edges: d.edges };
+      renderMap();
+      document.getElementById('mapFrame').textContent = (mapData.frame || 'odom') + ' ✓remapped';
+      return;
+    }
+  } catch(e) { /* nessun remap.json disponibile */ }
+  // Fallback: carica map.yaml
   try {
     const txt = await (await fetch(CONFIG.map_yaml_url)).text();
     mapData = parseMapYaml(txt);
@@ -701,13 +738,21 @@ document.getElementById('stopBtn').onclick = () => {
 };
 
 document.getElementById('calibBtn').onclick = () => {
-  // Nodo 0 della mappa
-  const node0 = mapData && mapData.nodes[0];
-  if (!node0) { alert('Mappa non caricata'); return; }
+  const startId = +document.getElementById('startInput').value;
+  const refNode = mapData && mapData.nodes[startId];
+  if (!refNode) { alert('Mappa non caricata o nodo Start non valido'); return; }
 
-  // L'offset fa coincidere la posizione raw attuale con le coordinate del nodo 0
-  odomOffset.x = lastRawOdom.x - node0.x;
-  odomOffset.y = lastRawOdom.y - node0.y;
+  // Allinea la posizione raw al nodo Start selezionato
+  odomOffset.x = lastRawOdom.x - refNode.x;
+  odomOffset.y = lastRawOdom.y - refNode.y;
+
+  // Aggiorna map_follower_node live via topic ROS
+  if (odomOriginPub) {
+    odomOriginPub.publish(new ROSLIB.Message({ x: odomOffset.x, y: odomOffset.y, z: 0 }));
+  }
+  // Persistenza su rosparam (sopravvive al riavvio del nodo)
+  new ROSLIB.Param({ ros, name: '/map_follower/odom_origin_x' }).set(odomOffset.x);
+  new ROSLIB.Param({ ros, name: '/map_follower/odom_origin_y' }).set(odomOffset.y);
 
   const btn = document.getElementById('calibBtn');
   const orig = btn.textContent;
@@ -720,6 +765,115 @@ document.getElementById('calibBtn').onclick = () => {
     btn.style.borderColor = '';
   }, 2000);
 };
+
+// ─── Remap (2-click similarity transform) ─────────────────────────────────────
+// 1° click: registra (odomA, nodeA) — il robot è sul nodo Start selezionato.
+// Guidare manualmente ~5 nodi, aggiornare Start al nodo corrente.
+// 2° click: registra (odomB, nodeB), calcola roto-scala, applica a tutti i nodi.
+// Salva remap.json (dashboard al ricaricamento) e _remapped.yaml (nodi Python).
+let remapState = 0;     // 0 = idle, 1 = in attesa di B
+let remapRefA  = null;  // { odom:{x,y}, node:{x,y}, nodeId:N }
+
+document.getElementById('remapBtn').onclick = () => {
+  if (!mapData) { alert('Mappa non caricata'); return; }
+  const btn = document.getElementById('remapBtn');
+  const startId = +document.getElementById('startInput').value;
+
+  if (remapState === 0) {
+    const nodeA = mapData.nodes[startId];
+    if (!nodeA) { alert('Nodo Start non valido'); return; }
+    remapRefA  = { odom: { x: lastRawOdom.x, y: lastRawOdom.y },
+                   node: { x: nodeA.x, y: nodeA.y }, nodeId: startId };
+    remapState = 1;
+    btn.textContent       = '📍 Registra B';
+    btn.style.background  = 'rgba(246,196,83,.25)';
+    btn.style.color       = 'var(--yellow)';
+    btn.style.borderColor = 'var(--yellow)';
+
+  } else {
+    const nodeB = mapData.nodes[startId];
+    if (!nodeB) { alert('Nodo Start non valido'); return; }
+
+    const ok = applyRemap(
+      remapRefA,
+      { odom: { x: lastRawOdom.x, y: lastRawOdom.y },
+        node: { x: nodeB.x, y: nodeB.y }, nodeId: startId }
+    );
+    if (ok) {
+      remapState = 0; remapRefA = null;
+      btn.textContent       = '✓ Remappato';
+      btn.style.background  = 'rgba(54,211,153,.18)';
+      btn.style.color       = 'var(--green)';
+      btn.style.borderColor = 'var(--green)';
+      setTimeout(() => {
+        btn.textContent       = '🔄 Remap';
+        btn.style.background  = '';
+        btn.style.color       = '';
+        btn.style.borderColor = '';
+      }, 3000);
+    }
+    // On error: applyRemap ha già mostrato l'alert — resta in stato 1 per retry.
+  }
+};
+
+function applyRemap(refA, refB) {
+  // Vettore nello spazio mappa (u) e nello spazio odom (v)
+  const ux = refB.node.x - refA.node.x, uy = refB.node.y - refA.node.y;
+  const vx = refB.odom.x - refA.odom.x, vy = refB.odom.y - refA.odom.y;
+  const lenU = Math.hypot(ux, uy), lenV = Math.hypot(vx, vy);
+
+  if (lenU < 0.01) {
+    alert('I nodi A e B sono troppo vicini sulla mappa. Seleziona nodi più distanti.');
+    return false;
+  }
+  if (lenV < 0.05) {
+    alert('Il robot non si è mosso abbastanza. Guida più lontano prima di registrare B.');
+    return false;
+  }
+
+  // Trasformazione di similarità 2-D: odom = scale * R(θ) * map + t
+  const scale = lenV / lenU;
+  const theta = Math.atan2(vy, vx) - Math.atan2(uy, ux);
+  const cosT  = Math.cos(theta), sinT = Math.sin(theta);
+  const tx = refA.odom.x - scale * (cosT * refA.node.x - sinT * refA.node.y);
+  const ty = refA.odom.y - scale * (sinT * refA.node.x + cosT * refA.node.y);
+
+  // Applica a tutti i nodi
+  const newNodes = {};
+  for (const id in mapData.nodes) {
+    const n = mapData.nodes[id];
+    newNodes[id] = {
+      x: scale * (cosT * n.x - sinT * n.y) + tx,
+      y: scale * (sinT * n.x + cosT * n.y) + ty
+    };
+  }
+  // Le lunghezze degli archi scalano uniformemente
+  const newEdges = mapData.edges.map(e => ({
+    from: e.from, to: e.to, length: (e.length || 0) * scale
+  }));
+
+  mapData.nodes = newNodes;
+  mapData.edges = newEdges;
+  // La mappa è ora nel frame odom: reset offset calibrazione
+  odomOffset.x = 0;
+  odomOffset.y = 0;
+  renderMap();
+  document.getElementById('mapFrame').textContent = (mapData.frame || 'odom') + ' ✓remapped';
+
+  // Salva: remap.json (JS al reload) + _remapped.yaml (nodi Python)
+  fetch('/save_remap', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      nodes: mapData.nodes,
+      edges: mapData.edges,
+      frame: mapData.frame,
+      transform: { theta, scale, tx, ty }
+    })
+  }).catch(e => console.error('[remap] save_remap failed:', e));
+
+  return true;
+}
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 loadMap();

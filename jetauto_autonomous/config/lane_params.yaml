@@ -35,7 +35,7 @@ lane_controller:
   hough_roi_top_frac: 0.3  # [0-1]; linea arancione nel debug
 
   # ---- HoughLinesP ----
-  hough_threshold:    50   # voti minimi
+  hough_threshold:    30   # voti minimi Più bassa = più linee (anche false positive)
   hough_min_line_px:  20   # px min segmento Hough
   hough_max_gap_px:   40   # px gap max per unire segmenti
   hough_min_length_px: 20  # px min linea mediata per validazione

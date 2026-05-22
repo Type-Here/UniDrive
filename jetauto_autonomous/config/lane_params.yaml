@@ -1,10 +1,10 @@
 # =============================================================================
-# Parametri lane_controller_node + waypoint_manager_node
-# Pipeline: /lane_mask_bev → ROI crop → HoughLinesP → fit polinomiale → sterzata adattiva
+# Parameters for lane_controller_node + waypoint_manager_node
+# Pipeline: /lane_mask_bev -> ROI crop -> HoughLinesP -> polynomial fit -> adaptive steering
 #
-# NOTA SCALA: tutti i parametri in pixel (lane_width_*, hough_*_px) sono espressi
-# a bev_scale=1.0 (maschera nativa 320×128). Il codice li moltiplica automaticamente
-# per bev_scale → non serve aggiornarli manualmente quando si cambia bev_scale.
+# SCALE NOTE: all pixel parameters (lane_width_*, hough_*_px) are expressed
+# at bev_scale=1.0 (native mask 320×128). The code automatically multiplies them
+# by bev_scale -> no manual update needed when changing bev_scale.
 # =============================================================================
 
 lane_controller:
@@ -15,66 +15,66 @@ lane_controller:
   state_topic:  "/lane_controller/state"
   enable_topic: "/lane_controller/enable"
 
-  # ---- Velocità ----
-  linear_x_speed: 0.10   # m/s avanti
+  # ---- Velocity ---- Validated Velocity linear_x_speed 0.10/0.15 m/s, max_angular_z 0.80/1.20 rad/s
+  linear_x_speed: 0.10   # m/s forward
   max_linear_y:   0.08   # m/s strafe (mecanum)
   max_angular_z:  0.80   # rad/s (classic)
 
-  # ---- Modalità di guida ----
-  drive_mode: "classic"  # "mecanum" → linear.y | "classic" → angular.z
+  # ---- Drive mode ----
+  drive_mode: "classic"  # "mecanum" -> linear.y | "classic" -> angular.z
 
-  # ---- Modalità BEV ----
-  use_bev: true     # false = usa maschera raw in prospettiva (no calibrazione BEV richiesta)
-  bev_scale: 2.0    # upscaling maschera BEV (1.0=320×128, 2.0=640×256, 2.5=800×320)
-                    # tutti i param in px si adattano automaticamente
+  # ---- BEV mode ----
+  use_bev: true     # false = use raw perspective mask (no BEV calibration required)
+  bev_scale: 2.0    # BEV mask upscaling (1.0=320×128, 2.0=640×256, 2.5=800×320)
+                    # all pixel params are scaled automatically
 
-  # ---- Parametri no-BEV (usati solo se use_bev: false) ----
-  # Usare anche: mask_topic: "/lane_mask"  e  lane_fit_mode: "quadratic"
-  lane_width_bottom_frac: 0.55  # larghezza corsia come fraz. di dst_w (no-BEV)
-  no_bev_roi_top_frac: 0.10     # ignora top X% della maschera (no-BEV)
+  # ---- no-BEV parameters (used only if use_bev: false) ----
+  # Also set: mask_topic: "/lane_mask"  and  lane_fit_mode: "quadratic"
+  lane_width_bottom_frac: 0.55  # lane width as fraction of dst_w (no-BEV)
+  no_bev_roi_top_frac: 0.10     # ignore top X% of the mask (no-BEV)
 
   # ---- ROI Hough ----
-  # BEV mode:    ignora il top della maschera BEV (lontano dal robot). Deve essere < center_y_ratio.
-  # no-BEV mode: sostituito da no_bev_roi_top_frac (sopra).
-  hough_roi_top_frac: 0.3  # [0-1]; linea arancione nel debug
+  # BEV mode:    ignores the top portion of the BEV mask (far from robot). Must be < center_y_ratio.
+  # no-BEV mode: overridden by no_bev_roi_top_frac (above).
+  hough_roi_top_frac: 0.3  # [0-1]; orange line in the debug image
 
-  # ---- HoughLinesP — valori a bev_scale=1.0, auto-scalati dal codice ----
-  hough_threshold:     30  # voti minimi (NON scala con bev_scale)
-  hough_min_line_px:    5  # px min segmento Hough  [@ 1.0x]
-  hough_max_gap_px:    20  # px gap max per unire segmenti  [@ 1.0x]
-  hough_min_length_px:  8  # px min linea mediata per validazione  [@ 1.0x]
-  line_height_ratio:  1.0  # estensione verticale linea (1.0 = tutta l'altezza)
+  # ---- HoughLinesP - values at bev_scale=1.0, auto-scaled by the code ----
+  hough_threshold:     30  # minimum votes (does NOT scale with bev_scale)
+  hough_min_line_px:    5  # min Hough segment length in px  [@ 1.0x]
+  hough_max_gap_px:    20  # max gap in px to join segments  [@ 1.0x]
+  hough_min_length_px:  8  # min averaged line length in px for validation  [@ 1.0x]
+  line_height_ratio:  1.0  # vertical extent of the fitted line (1.0 = full height)
 
-  # ---- Geometria corsia — valori a bev_scale=1.0, auto-scalati dal codice ----
-  lane_width_px:      252   # px larghezza corsia  [@ 1.0x] (Wm≈504 misurato a 2.0x)
-  center_y_ratio:     0.50  # [0=top, 1=bot] punto di misura; >= hough_roi_top_frac
-  max_steering_angle: 48.0  # gradi massimi di sterzata
-  single_line_offset:  0.0  # px offset aggiuntivo stima centro (singola linea)  [@ 1.0x]
-  min_distance_from_center: 0.0  # px distanza min dal centro  [@ 1.0x]
+  # ---- Lane geometry - values at bev_scale=1.0, auto-scaled by the code ----
+  lane_width_px:      252   # lane width in px  [@ 1.0x] (Wm≈504 measured at 2.0x)
+  center_y_ratio:     0.50  # [0=top, 1=bot] measurement point; >= hough_roi_top_frac
+  max_steering_angle: 48.0  # maximum steering angle in degrees
+  single_line_offset:  0.0  # extra px offset for center estimation (single line)  [@ 1.0x]
+  min_distance_from_center: 0.0  # min distance from center in px  [@ 1.0x]
   min_right_margin_px: 0.0
   min_left_margin_px:  0.0
 
-  # ---- Calibrazione dinamica larghezza corsia (solo use_bev=true) ----
-  # Quando vediamo entrambe le linee, |rx-lx| a center_y aggiorna via EMA
-  # la stima corrente. Usata per single-line estimation.
-  # Valori a bev_scale=1.0, auto-scalati dal codice.
+  # ---- Dynamic lane width calibration (only with use_bev=true) ----
+  # When both lines are visible, |rx-lx| at center_y updates the current estimate via EMA.
+  # Used for single-line estimation.
+  # Values at bev_scale=1.0, auto-scaled by the code.
   lane_width_dynamic_enable: true
-  lane_width_ema_alpha:      0.10   # 0=mai aggiorna, 1=segue solo l'ultima misura
-  lane_width_min_px:         190    # bound inferiore  [@ 1.0x]  → 380px @ 2.0x
-  lane_width_max_px:         315    # bound superiore  [@ 1.0x]  → 630px @ 2.0x
-  lane_width_sanity_band:    0.25   # misura accettata se |meas-dyn|/dyn <= band
-  lane_width_reset_after:    0      # frame senza 2-lines prima di azzerare dyn (0=mai)
+  lane_width_ema_alpha:      0.10   # 0=never updates, 1=follows only the latest measurement
+  lane_width_min_px:         190    # lower bound  [@ 1.0x]  -> 380px @ 2.0x
+  lane_width_max_px:         315    # upper bound  [@ 1.0x]  -> 630px @ 2.0x
+  lane_width_sanity_band:    0.25   # measurement accepted if |meas-dyn|/dyn <= band
+  lane_width_reset_after:    0      # frames without 2 lines before resetting dyn estimate (0=never)
 
-  # ---- Modalità fit linee ----
-  lane_fit_mode: "linear"   # "linear" retta | "quadratic" parabola | "auto" parabola se >=6 pt
+  # ---- Line fit mode ----
+  lane_fit_mode: "linear"   # "linear" = line | "quadratic" = parabola | "auto" = parabola if >=6 pts
 
-  # ---- Validazione linee ----
-  min_valid_points: 0  # check-y da superare (0 = accetta tutto)
+  # ---- Line validation ----
+  min_valid_points: 0  # check-y threshold to pass (0 = accept all)
 
-  # ---- Smoothing EMA adattivo ----
+  # ---- Adaptive EMA smoothing ----
   # α = clip(alpha_base + 0.35*(1-exp(-|Δangle|/delta_scale)), base, 0.95)
-  angle_smooth_alpha_base:  0.50  # base α (più basso = più smooth; range consigliato 0.40-0.65)
-  angle_smooth_delta_scale: 10.0  # scala adattiva EMA (deg; più alto = meno reattivo)
+  angle_smooth_alpha_base:  0.50  # base α (lower = smoother; recommended range 0.40-0.65)
+  angle_smooth_delta_scale: 10.0  # adaptive EMA scale (deg; higher = less responsive)
 
   # ---- Class IDs ----
   class_lane_marking: 2
@@ -83,11 +83,11 @@ lane_controller:
   # ---- Debug ----
   publish_debug: true
   debug_scale:   0.5
-  control_rate_hz: 25  # Hz loop controllo — allineare al FPS del modello (25-30)
+  control_rate_hz: 25  # control loop rate in Hz - align with model FPS (25-30)
 
 # =============================================================================
 waypoint_manager:
-  map_file: "/tmp/UNSET_MAP_FILE"  # sovrascritto a runtime da start_all.sh
+  map_file: "/tmp/UNSET_MAP_FILE"  # overridden at runtime by start_all.sh
   odom_topic: "/odom"
   goal_topic: "/waypoint_manager/goal"
   status_topic: "/waypoint_manager/status"
@@ -105,8 +105,8 @@ waypoint_manager:
 # =============================================================================
 map_follower:
   # ---- Master switch ----
-  # false → node stays INACTIVE forever (pure segmentation, no map fallback)
-  # true  → activates pure-pursuit fallback when lane is lost
+  # false -> node stays INACTIVE forever (pure segmentation, no map fallback)
+  # true  -> activates pure-pursuit fallback when lane is lost
   enable: false
 
   # ---- Trigger / recovery timing ----

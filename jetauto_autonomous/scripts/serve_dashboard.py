@@ -3,25 +3,25 @@
 """
 serve_dashboard.py
 ------------------
-Mini server HTTP per la dashboard web. Standalone, NON è un nodo ROS.
+Minimal HTTP server for the web dashboard. Standalone, NOT a ROS node.
 
-Espone:
+Exposes:
   /                -> dashboard.html
   /dashboard.html  -> dashboard.html
-  /map.yaml        -> file mappa configurato
+  /map.yaml        -> configured map file
 
-Argomenti CLI:
-  --port    porta HTTP (default 8000)
-  --web-dir directory dei file web (default ./web rispetto allo script)
-  --map     path al file YAML della mappa
+CLI arguments:
+  --port    HTTP port (default 8000)
+  --web-dir web files directory (default ./web relative to the script)
+  --map     path to the map YAML file
 
-Esempio:
+Example:
   python2 serve_dashboard.py \
         --port 8000 \
         --web-dir /home/jetauto/jetauto_autonomous/web \
         --map /home/jetauto/jetauto_autonomous/maps/map_clean-edited_smooth.yaml
 
-Compatibile Python 2.7 / Python 3.x.
+Compatible with Python 2.7 / Python 3.6.9
 """
 
 from __future__ import print_function
@@ -43,7 +43,7 @@ except ImportError:
 
 
 def get_local_ip():
-    """Rileva l'IP locale usato per raggiungere la rete (stesso che usa ROS)."""
+    """Detect the local IP used to reach the network (same as ROS)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -58,17 +58,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     web_dir = "."
     map_file = ""
     video_server_ip = "localhost"
-    _cached_html = None  # dashboard.html pre-elaborato in memoria all'avvio
+    _cached_html = None  # dashboard.html pre-loaded into memory at startup
 
     @classmethod
     def preload(cls):
-        """Legge dashboard.html una volta e sostituisce il placeholder IP."""
+        """Read dashboard.html once and substitute the IP placeholder."""
         fpath = os.path.join(cls.web_dir, "dashboard.html")
         with open(fpath, "rb") as f:
             content = f.read().decode("utf-8")
         content = content.replace("__VIDEO_SERVER_IP__", cls.video_server_ip)
         cls._cached_html = content.encode("utf-8")
-        sys.stderr.write("[dashboard_http] dashboard.html caricato in cache (%d bytes)\n" % len(cls._cached_html))
+        sys.stderr.write("[dashboard_http] dashboard.html loaded into cache (%d bytes)\n" % len(cls._cached_html))
 
     def guess_type(self, path):
         if path.endswith('.yaml') or path.endswith('.yml'):
@@ -76,17 +76,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         return SimpleHTTPRequestHandler.guess_type(self, path)
 
     def log_message(self, fmt, *args):
-        pass  # sopprimi log per-richiesta: riduce I/O su Jetson
+        pass  # suppress per-request logs: reduces I/O on Jetson
 
     def end_headers(self):
-        # Cache lunga per asset vendor statici (non cambiano mai)
+        # Long cache for static vendor assets (they never change)
         p = self.path.split("?", 1)[0]
         if p.endswith('.js') or p.endswith('.css'):
             self.send_header("Cache-Control", "public, max-age=86400, immutable")
         SimpleHTTPRequestHandler.end_headers(self)
 
     def translate_path(self, path):
-        # /map.yaml -> file mappa configurato
+        # /map.yaml -> configured map file
         if path.split("?", 1)[0] in ("/map.yaml", "/maps/map.yaml"):
             return self.map_file
         # / -> dashboard.html
@@ -168,7 +168,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         clean_path = self.path.split("?", 1)[0]
         if clean_path in ("", "/", "/dashboard.html"):
-            # Serve dalla cache in memoria: nessuna lettura disco
+            # Serve from in-memory cache: no disk read
             content = self._cached_html
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -186,7 +186,7 @@ def main():
     ap.add_argument("--web-dir",  default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "..", "web"))
     ap.add_argument("--map",      default="", required=True,
-                    help="Path al file YAML della mappa")
+                    help="Path to the map YAML file")
     args = ap.parse_args()
 
     DashboardHandler.web_dir         = os.path.abspath(args.web_dir)
@@ -199,18 +199,18 @@ def main():
     remapped = os.path.join(map_dir, map_stem + "_remapped.yaml")
     if os.path.isfile(remapped):
         DashboardHandler.map_file = remapped
-        print("[dashboard_http] Usando mappa remappata: %s" % remapped)
+        print("[dashboard_http] Using remapped map: %s" % remapped)
     else:
         DashboardHandler.map_file = abs_map
 
     if not os.path.isdir(DashboardHandler.web_dir):
-        print("ERRORE: web-dir non esiste: %s" % DashboardHandler.web_dir)
+        print("ERROR: web-dir does not exist: %s" % DashboardHandler.web_dir)
         sys.exit(1)
     if not os.path.isfile(DashboardHandler.map_file):
-        print("ERRORE: map non esiste: %s" % DashboardHandler.map_file)
+        print("ERROR: map does not exist: %s" % DashboardHandler.map_file)
         sys.exit(1)
 
-    DashboardHandler.preload()  # cache HTML in RAM una volta sola
+    DashboardHandler.preload()  # load HTML into RAM once
     srv = HTTPServer(("0.0.0.0", args.port), DashboardHandler)
     print("[dashboard_http] http://0.0.0.0:%d" % args.port)
     print("[dashboard_http] web_dir          = %s" % DashboardHandler.web_dir)
@@ -219,7 +219,7 @@ def main():
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\n[dashboard_http] stop")
+        print("\n[dashboard_http] stopped")
         srv.server_close()
 
 

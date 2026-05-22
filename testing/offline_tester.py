@@ -1,42 +1,52 @@
 #!/usr/bin/env python3
 """
-offline_tester.py — Test offline della pipeline di guida su video registrato.
+offline_tester.py - Offline test of the driving pipeline on a recorded video.
 
-Legge un video MP4 della macchinina, esegue la stessa pipeline del robot
-senza ROS e produce un video annotato per validare gli script di guida.
+Reads an MP4 video from the robot, runs the same pipeline as the robot
+without ROS, and produces an annotated video to validate the driving scripts.
 
 Pipeline:
-    video frame  →  preprocess (crop+resize+normalize)
-                 →  ONNX inference (CoreML EP su Mac M3)
-                 →  BEV warp (AutoCalibration)
-                 →  LaneControllerCore (HoughLinesP + steering)
-                 →  visualizzazione: [originale | maschera | BEV+overlay]
+    video frame  ->  preprocess (crop+resize+normalize)
+                 ->  ONNX inference (CoreML EP on Mac)
+                 ->  BEV warp (AutoCalibration)
+                 ->  LaneControllerCore (HoughLinesP + steering)
+                 ->  visualization: [original | mask | BEV+overlay]
 
 Usage:
-    # Con file in ../Video/ e ../model/ (cartelle standard):
+    # With files in video/ and model/ (standard folders):
     python3 offline_tester.py
 
-    # Con path espliciti:
-    python3 offline_tester.py --video ../Video/driving.mp4 --model ../model/model.onnx \\
-        --calibration ../Calibration/calibration.json --output ../Output/annotated.mp4
+    # With explicit paths:
+    python3 offline_tester.py --video video/driving.mp4 --model model/model.onnx \
+        --calibration calibration.json --output output/annotated.mp4
 
-Cartelle standard (dentro Testing/):
-    Video/         → default --video  (cerca unico .mp4)
-    model/         → default --model  (cerca unico .onnx/.mlpackage)
-    Calibration/   → default --calibration
-    Output/        → default --output e calib_debug_*.jpg
+    # Live stream from the robot + send BEV mask back for closed-loop driving:
+    python3 offline_tester.py \
+        --video "http://ROBOT_IP:8080/stream?topic=/depth_cam/rgb/image_raw" \
+        --model model/segformer_b0.mlpackage \
+        --calibration calibration.json \
+        --robot-ip ROBOT_IP
+
+Standard folders (inside testing/):
+    video/              -> default --video  (looks for a single .mp4)
+    model/              -> default --model  (looks for a single .onnx/.mlpackage)
+    calibration.json    -> default --calibration (single JSON file, not a subdirectory)
+    output/             -> default --output and calib_debug_*.jpg
 
 Options:
-    --video       PATH   Video di input (.mp4 o altro formato cv2)
-    --model       PATH   Modello ONNX (.onnx) o CoreML (.mlpackage)
-    --calibration PATH   File JSON di calibrazione BEV (da auto_calibration.py).
-                         Se assente, calibra automaticamente sul primo frame valido.
-    --output      PATH   Video di output annotato (default: ../Output/<nome_video>_output.mp4)
+    --video       PATH   Input video (.mp4 or any cv2-supported format).
+                         Also accepts a URL - use this to stream directly from the robot:
+                         http://<robot_ip>:8080/stream?topic=/depth_cam/rgb/image_raw
+                         (web_video_server must be running on the robot, started by start_all.sh)
+    --model       PATH   ONNX model (.onnx) or CoreML (.mlpackage)
+    --calibration PATH   BEV calibration JSON (from auto_calibration.py).
+                         If absent, calibrates automatically on the first valid frame.
+    --output      PATH   Annotated output video (default: output/<video_name>_output.mp4)
     --params      PATH   lane_params.yaml (default: ../jetauto_autonomous/config/lane_params.yaml)
-    --crop-top    FLOAT  Frazione top da croppare (default: 0.45)
-    --no-display         Non aprire finestra OpenCV (utile headless / server)
-    --max-fps     FLOAT  Limita l'elaborazione a N fps (0 = nessun limite)
-    --start-frame INT    Inizia dall'indice di frame specificato
+    --crop-top    FLOAT  Top fraction to crop (default: 0.45)
+    --no-display         Do not open an OpenCV window (useful headless / on a server)
+    --max-fps     FLOAT  Limit processing to N fps (0 = no limit)
+    --start-frame INT    Start from the given frame index
 """
 
 import argparse
@@ -58,7 +68,7 @@ if _IS_MACOS:
         _COREML_AVAILABLE = True
     except ImportError:
         _COREML_AVAILABLE = False
-        print("[offline_tester] WARN: coremltools non installato — backend .mlpackage non disponibile "
+        print("[offline_tester] WARN: coremltools not installed - .mlpackage backend unavailable "
               "(pip install coremltools)")
 else:
     ct = None
@@ -66,7 +76,7 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Costanti (devono corrispondere a quelle di lane_follower.py)
+# Constants (must match those in lane_follower.py)
 # ---------------------------------------------------------------------------
 
 MODEL_H = 256
@@ -79,7 +89,7 @@ IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 CLASS_LANE_MARKING = 2
 CLASS_LANE_DASHED  = 3
 
-# Colori RGB per classe (stessa palette di lane_follower.py)
+# RGB colors per class (same palette as lane_follower.py)
 CLASS_COLORS_RGB = np.array([
     [0,   0,   0],    # 0 background
     [180, 130,  70],  # 1 road
@@ -90,12 +100,12 @@ CLASS_COLORS_RGB = np.array([
 
 
 # ---------------------------------------------------------------------------
-# Backend ONNX (Mac M3: preferisce CoreML EP → Neural Engine)
+# ONNX backend (Mac Apple Silicon: prefers CoreML EP -> Neural Engine)
 # ---------------------------------------------------------------------------
 
 class ONNXBackend:
-    # Sequenza di fallback: CPU first (più veloce per modelli con molti nodi non-CoreML),
-    # poi CoreML GPU se esplicitamente richiesto con --coreml.
+    # Fallback chain: CPU first (faster for models with many non-CoreML nodes),
+    # then CoreML GPU if explicitly requested with --coreml.
     def __init__(self, model_path: str, use_coreml: bool = False):
         import onnxruntime as ort
         self._ort        = ort
@@ -113,11 +123,11 @@ class ONNXBackend:
         self._chain_idx = 0
         if use_coreml:
             if not _IS_MACOS:
-                print("[offline_tester] WARN: --coreml ignorato (solo macOS)")
+                print("[offline_tester] WARN: --coreml ignored (macOS only)")
             elif not has_coreml:
-                print("[offline_tester] WARN: CoreMLExecutionProvider non disponibile, uso CPU")
+                print("[offline_tester] WARN: CoreMLExecutionProvider not available, falling back to CPU")
             else:
-                self._chain_idx = 1   # parte da CoreML GPU
+                self._chain_idx = 1   # start from CoreML GPU
 
         self._create_session()
 
@@ -125,18 +135,18 @@ class ONNXBackend:
         label, providers = self._provider_chain[self._chain_idx]
         self.sess       = self._ort.InferenceSession(self._model_path, providers=providers)
         self.input_name = self.sess.get_inputs()[0].name
-        print(f"[offline_tester] Provider: {label}  →  {self.sess.get_providers()}")
+        print(f"[offline_tester] Provider: {label}  ->  {self.sess.get_providers()}")
 
     def _next_fallback(self):
         self._chain_idx += 1
         if self._chain_idx >= len(self._provider_chain):
-            raise RuntimeError("Tutti i provider ONNX hanno fallito")
+            raise RuntimeError("All ONNX providers failed")
         label = self._provider_chain[self._chain_idx][0]
-        print(f"[offline_tester] Fallback → {label}")
+        print(f"[offline_tester] Fallback -> {label}")
         self._create_session()
 
     def infer(self, img_chw: np.ndarray) -> np.ndarray:
-        """img_chw: float32 (3, H, W)  →  int array (H, W) con class IDs"""
+        """img_chw: float32 (3, H, W)  ->  int array (H, W) with class IDs"""
         inp = img_chw[np.newaxis]
         try:
             return self.sess.run(None, {self.input_name: inp})[0][0]
@@ -152,20 +162,20 @@ class ONNXBackend:
 
 
 # ---------------------------------------------------------------------------
-# Backend CoreML nativo (.mlpackage) — Neural Engine su Apple Silicon
+# Native CoreML backend (.mlpackage) - Neural Engine on Apple Silicon
 # ---------------------------------------------------------------------------
 
 class CoreMLBackend:
     def __init__(self, model_path: str):
         if not _IS_MACOS:
-            raise RuntimeError("Backend CoreML disponibile solo su macOS")
+            raise RuntimeError("CoreML backend is only available on macOS")
         if not _COREML_AVAILABLE:
-            raise RuntimeError("coremltools non installato: pip install coremltools")
+            raise RuntimeError("coremltools not installed: pip install coremltools")
         self._model = ct.models.MLModel(model_path, compute_units=ct.ComputeUnit.ALL)
-        print(f"[offline_tester] [ANE] CoreML model caricato: {model_path}")
+        print(f"[offline_tester] [ANE] CoreML model loaded: {model_path}")
 
     def infer(self, img_chw: np.ndarray) -> np.ndarray:
-        """img_chw: float32 (3, H, W)  →  int array (H, W) con class IDs"""
+        """img_chw: float32 (3, H, W)  ->  int array (H, W) with class IDs"""
         inp = img_chw[np.newaxis]   # (1, 3, H, W)
         result = self._model.predict({"pixel_values": inp})
         return list(result.values())[0][0]  # (H, W)
@@ -176,28 +186,28 @@ class CoreMLBackend:
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing (identico a preprocess() in lane_follower.py)
+# Preprocessing (identical to preprocess() in lane_follower.py)
 # ---------------------------------------------------------------------------
 
 def preprocess(img_rgb: np.ndarray, crop_top_frac: float) -> np.ndarray:
-    """Ritorna float32 (3, MODEL_H, MODEL_W) normalizzato ImageNet."""
+    """Returns float32 (3, MODEL_H, MODEL_W) normalized with ImageNet stats."""
     h       = img_rgb.shape[0]
     crop_px = int(h * crop_top_frac)
     cropped = img_rgb[crop_px:, :]
     resized = cv2.resize(cropped, (MODEL_W, MODEL_H), interpolation=cv2.INTER_LINEAR)
     normalised = (resized.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
-    return normalised.transpose(2, 0, 1)   # HWC → CHW
+    return normalised.transpose(2, 0, 1)   # HWC -> CHW
 
 
 # ---------------------------------------------------------------------------
-# Calibrazione BEV
+# BEV calibration
 # ---------------------------------------------------------------------------
 
 def load_auto_calibration(calib_path: str, top_line: int, bottom_line: int):
     """
-    Carica AutoCalibration dal JSON prodotto da auto_calibration.py.
-    Se il file non esiste, restituisce un'istanza non calibrata
-    (calibrazione automatica sul primo frame).
+    Load AutoCalibration from the JSON produced by auto_calibration.py.
+    If the file does not exist, returns an uncalibrated instance
+    (automatic calibration on the first valid frame).
     """
     import json
     from auto_calibration import AutoCalibration
@@ -207,22 +217,22 @@ def load_auto_calibration(calib_path: str, top_line: int, bottom_line: int):
             data = json.load(f)
         src_pts = np.float32(data["src_points"])
         angle   = float(data["calibration_angle"])
-        print(f"[offline_tester] Calibrazione caricata: {calib_path}")
+        print(f"[offline_tester] Calibration loaded: {calib_path}")
         return AutoCalibration(top_line, bottom_line,
                                last_src_pts=src_pts, calib_angle=angle), False
     else:
-        print(f"[offline_tester] {calib_path} non trovato — calibrazione automatica al primo frame")
+        print(f"[offline_tester] {calib_path} not found - automatic calibration on first frame")
         return AutoCalibration(top_line, bottom_line), True
 
 
 # ---------------------------------------------------------------------------
-# Lane controller — logica in jetauto_autonomous/scripts/lane_core.py
-# LaneControllerCore viene importato in main() dopo aver aggiunto il path.
+# Lane controller - logic in jetauto_autonomous/scripts/lane_core.py
+# LaneControllerCore is imported in main() after adding the path.
 # ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
-# Visualizzazione debug
+# Debug visualization
 # ---------------------------------------------------------------------------
 
 def make_debug_frame(orig_crop_bgr: np.ndarray,
@@ -235,20 +245,20 @@ def make_debug_frame(orig_crop_bgr: np.ndarray,
                      frame_idx: int,
                      fps: float) -> np.ndarray:
     """
-    Produce un frame affiancato [originale | maschera+overlay | BEV+Hough].
-    Tutti i pannelli sono MODEL_W × MODEL_H.
+    Produce a side-by-side frame [original | mask+overlay | BEV+Hough].
+    All panels are MODEL_W × MODEL_H.
     """
     h, w = MODEL_H, MODEL_W
 
-    # Pannello 1: frame originale (crop del top, resizato al modello)
+    # Panel 1: original frame (top cropped, resized to model size)
     p1 = cv2.resize(orig_crop_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    # Pannello 2: maschera colorata sovrapposta all'originale
+    # Panel 2: colored mask overlaid on the original
     colored    = CLASS_COLORS_RGB[mask.clip(0, 4)]
     colored_bgr = cv2.cvtColor(colored, cv2.COLOR_RGB2BGR)
     p2 = cv2.addWeighted(p1, 0.55, colored_bgr, 0.45, 0)
 
-    # Pannello 3: BEV colorata con overlay HoughLinesP + freccia
+    # Panel 3: colored BEV with HoughLinesP overlay + steering arrow
     bev_colored = CLASS_COLORS_RGB[bev_mask.clip(0, 4)]
     p3 = cv2.cvtColor(bev_colored, cv2.COLOR_RGB2BGR)
 
@@ -260,7 +270,7 @@ def make_debug_frame(orig_crop_bgr: np.ndarray,
     center_y    = info["center_y"]
     roi_top_px  = info["roi_top_px"]
 
-    # Linee Hough
+    # Hough lines
     if valid_l and left_line:
         x1, y1, x2, y2 = left_line
         cv2.line(p3, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -272,21 +282,21 @@ def make_debug_frame(orig_crop_bgr: np.ndarray,
         cv2.putText(p3, "R", (x1+5, y1+15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    # Linea verticale rossa: centro immagine (divide SX e DX)
+    # Red vertical line: image center (splits left and right)
     cx = w // 2
     cv2.line(p3, (cx, 0), (cx, h), (0, 0, 255), 1)
 
-    # Linea arancione: limite superiore ROI Hough
+    # Orange line: Hough ROI upper limit
     if roi_top_px > 0:
         cv2.line(p3, (0, roi_top_px), (w-1, roi_top_px), (0, 165, 255), 1)
 
-    # Linea magenta + cerchio: punto di misura e centro corsia
+    # Magenta line + circle: measurement point and lane center
     if center_y is not None:
         cv2.line(p3, (0, center_y), (w-1, center_y), (255, 0, 255), 1)
     if lane_center is not None and center_y is not None:
         cv2.circle(p3, (int(lane_center), center_y), 6, (255, 0, 255), -1)
 
-    # Freccia di sterzata (verde <15°, giallo <30°, rosso >=30°)
+    # Steering arrow (green <15°, yellow <30°, red >=30°)
     arr_cx, arr_by = w // 2, h - 8
     angle_rad = math.radians(steering)
     arr_tx = int(arr_cx + 40 * math.sin(angle_rad))
@@ -294,7 +304,7 @@ def make_debug_frame(orig_crop_bgr: np.ndarray,
     arr_color = (0, 255, 0) if abs(steering) < 15 else ((0, 255, 255) if abs(steering) < 30 else (0, 0, 255))
     cv2.arrowedLine(p3, (arr_cx, arr_by), (arr_tx, arr_ty), arr_color, 2, tipLength=0.3)
 
-    # Testo overlay pannello 3
+    # Panel 3 overlay text
     cv2.putText(p3, f"{steering:+.1f}deg  {state}",
                 (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, arr_color, 1, cv2.LINE_AA)
     cv2.putText(p3, f"wz={angular_z:+.3f} rad/s",
@@ -302,12 +312,12 @@ def make_debug_frame(orig_crop_bgr: np.ndarray,
     cv2.putText(p3, f"f={frame_idx}  fps={fps:.1f}",
                 (5, 47), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1, cv2.LINE_AA)
 
-    # Etichette colonna in basso su ogni pannello
+    # Column labels at the bottom of each panel
     for panel, label in [(p1, "ORIGINALE"), (p2, "MASCHERA"), (p3, "BEV+HOUGH")]:
         cv2.putText(panel, label, (5, panel.shape[0] - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
-    # Normalizza altezza pannello 3 (può differire da MODEL_H con bev_scale>1)
+    # Normalize panel 3 height (may differ from MODEL_H when bev_scale>1)
     if p3.shape[0] != h or p3.shape[1] != w:
         p3 = cv2.resize(p3, (w, h), interpolation=cv2.INTER_AREA)
 
@@ -315,30 +325,30 @@ def make_debug_frame(orig_crop_bgr: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Selezione interattiva del frame di calibrazione
+# Interactive calibration frame selection
 # ---------------------------------------------------------------------------
 
 def _interactive_calib_select(cap, model, args):
     """
-    Mostra i frame uno alla volta.
-      n / → / SPAZIO  →  avanza di un frame
-      y / INVIO       →  calibra su questo frame
-      q / ESC         →  esci dal programma
+    Shows frames one at a time.
+      n / -> / SPACE  ->  advance one frame
+      y / ENTER      ->  calibrate on this frame
+      q / ESC        ->  exit the program
 
-    Ritorna (frame_idx, frame_bgr, mask) del frame scelto,
-    oppure None se l'utente ha premuto q.
+    Returns (frame_idx, frame_bgr, frame_rgb, mask) for the chosen frame,
+    or None if the user pressed q.
     """
     frame_idx   = args.start_frame
     WIN         = "offline_tester  [q=esci]"
     FONT        = cv2.FONT_HERSHEY_SIMPLEX
 
-    print("[offline_tester] Selezione frame di calibrazione: "
-          "n=avanza  y=calibra qui  q=esci")
+    print("[offline_tester] Calibration frame selection: "
+          "n=advance  y=calibrate here  q=exit")
 
     while True:
         ret, frame_bgr = cap.read()
         if not ret:
-            print("[offline_tester] Fine video raggiunta durante la selezione calibrazione")
+            print("[offline_tester] End of video reached during calibration selection")
             return None
 
         frame_idx += 1
@@ -346,7 +356,7 @@ def _interactive_calib_select(cap, model, args):
         img_chw   = preprocess(frame_rgb, args.crop_top)
         mask      = model.infer(img_chw).astype(np.int64)
 
-        # Mostra: originale | maschera colorata
+        # Display: original | colored mask
         crop_px  = int(frame_rgb.shape[0] * args.crop_top)
         orig_dis = cv2.resize(frame_bgr[crop_px:, :], (MODEL_W, MODEL_H))
         colored  = CLASS_COLORS_RGB[mask.clip(0, 4).astype(np.uint8)]
@@ -357,38 +367,38 @@ def _interactive_calib_select(cap, model, args):
         n_lane = int(((mask == CLASS_LANE_MARKING) | (mask == CLASS_LANE_DASHED)).sum())
         color_hint = (0, 255, 0) if n_lane >= 50 else (0, 100, 255)
         cv2.putText(panel, f"frame {frame_idx}   lane_px={n_lane}   "
-                           f"[n=avanza  y=calibra  q=esci]",
+                           f"[n=advance  y=calibrate  q=exit]",
                     (8, 18), FONT, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(panel, "OK: abbastanza pixel" if n_lane >= 50 else "WARN: pochi pixel di corsia",
+        cv2.putText(panel, "OK: enough pixels" if n_lane >= 50 else "WARN: too few lane pixels",
                     (8, 34), FONT, 0.42, color_hint, 1, cv2.LINE_AA)
 
         cv2.imshow(WIN, panel)
         k = cv2.waitKey(0)
 
-        if k in (ord('n'), ord(' '), 83, 0xFF & ord('n')):   # n / spazio / →
+        if k in (ord('n'), ord(' '), 83, 0xFF & ord('n')):   # n / space / ->
             continue
-        if k in (ord('y'), 13):    # y / INVIO → calibra
+        if k in (ord('y'), 13):    # y / ENTER -> calibrate
             return frame_idx, frame_bgr, frame_rgb, mask
-        if k in (ord('q'), 27):    # q / ESC → esci
+        if k in (ord('q'), 27):    # q / ESC -> exit
             return None
 
 
 # ---------------------------------------------------------------------------
-# Visualizzazione calibrazione BEV (come il robot quando premi 'y')
+# BEV calibration visualization (like the robot when you press 'y')
 # ---------------------------------------------------------------------------
 
 def _show_calib_debug(auto_calib, mask: np.ndarray, frame_bgr: np.ndarray,
                       frame_rgb: np.ndarray, args, calib_prefix: str,
                       cap, writer) -> bool:
     """
-    Salva i debug JPG della calibrazione e mostra la finestra di conferma.
-    Ritorna False se l'utente ha premuto q/ESC (segnale di uscita), True altrimenti.
+    Saves calibration debug JPGs and shows the confirmation window.
+    Returns False if the user pressed q/ESC (exit signal), True otherwise.
     """
     mask_u8 = np.clip(mask, 0, 255).astype(np.uint8)
 
-    # Salva _points.jpg e _warp.jpg nella stessa cartella dell'output
+    # Save _points.jpg and _warp.jpg in the same folder as the output
     auto_calib.save_debug(mask_u8, prefix=calib_prefix)
-    print(f"[offline_tester] Debug calibrazione → {calib_prefix}_points.jpg  "
+    print(f"[offline_tester] Calibration debug -> {calib_prefix}_points.jpg  "
           f"{calib_prefix}_warp.jpg")
 
     if args.no_display:
@@ -401,19 +411,19 @@ def _show_calib_debug(auto_calib, mask: np.ndarray, frame_bgr: np.ndarray,
     _, src_pts, _ = pts_data
     crop_px = int(frame_rgb.shape[0] * args.crop_top)
 
-    # Pannello sinistra: frame originale con i 4 punti in verde
+    # Left panel: original frame with the 4 points in green
     orig_vis = cv2.resize(frame_bgr[crop_px:, :], (MODEL_W, MODEL_H))
     for x, y in src_pts:
         cv2.circle(orig_vis, (int(x), int(y)), 8, (0, 255, 0), 2)
         cv2.circle(orig_vis, (int(x), int(y)), 2, (0, 255, 0), -1)
 
-    # Pannello centro: maschera colorata con i 4 punti in bianco
+    # Center panel: colored mask with the 4 points in white
     vis_bgr = cv2.cvtColor(CLASS_COLORS_RGB[mask_u8.clip(0, 4)], cv2.COLOR_RGB2BGR)
     vis_bgr = cv2.resize(vis_bgr, (MODEL_W, MODEL_H))
     for x, y in src_pts:
         cv2.circle(vis_bgr, (int(x), int(y)), 8, (255, 255, 255), -1)
 
-    # Pannello destra: BEV risultante
+    # Right panel: resulting BEV
     bev_now = auto_calib.make_bev(mask)
     bev_bgr = cv2.resize(
         cv2.cvtColor(CLASS_COLORS_RGB[np.clip(bev_now, 0, 4).astype(np.uint8)],
@@ -421,47 +431,47 @@ def _show_calib_debug(auto_calib, mask: np.ndarray, frame_bgr: np.ndarray,
         (MODEL_W, MODEL_H))
 
     calib_frame = np.hstack([orig_vis, vis_bgr, bev_bgr])
-    cv2.putText(calib_frame, "CALIBRAZIONE BEV  [INVIO/SPAZIO=continua  q=esci]",
+    cv2.putText(calib_frame, "BEV CALIBRATION  [ENTER/SPACE=continue  q=exit]",
                 (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(calib_frame,
-                f"Salvato: {calib_prefix}_points.jpg   |   {calib_prefix}_warp.jpg",
+                f"Saved: {calib_prefix}_points.jpg   |   {calib_prefix}_warp.jpg",
                 (8, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
 
     cv2.imshow("offline_tester  [q=esci]", calib_frame)
     while True:
         k = cv2.waitKey(0)
-        if k in (13, ord(' ')):   # INVIO o SPAZIO → continua
+        if k in (13, ord(' ')):   # ENTER or SPACE -> continue
             return True
-        if k in (ord('q'), 27):   # q o ESC → esci
+        if k in (ord('q'), 27):   # q or ESC -> exit
             cap.release()
             if writer:
                 writer.release()
             cv2.destroyAllWindows()
-            print("[offline_tester] Uscita dopo calibrazione.")
+            print("[offline_tester] Exiting after calibration.")
             return False
 
 
 # ---------------------------------------------------------------------------
-# Publisher rosbridge → /lane_mask_bev  (sensor_msgs/Image mono8)
+# Publisher rosbridge -> /lane_mask_bev  (sensor_msgs/Image mono8)
 # ---------------------------------------------------------------------------
 
 class RosBridgePublisher:
     """
-    Pubblica la BEV mask su /lane_mask_bev via rosbridge_websocket (roslibpy).
-    Non richiede ROS installato sul Mac — usa solo WebSocket JSON.
-    Il lane_controller_node.py sul robot riceve la maschera e calcola cmd_vel.
+    Publishes the BEV mask on /lane_mask_bev via rosbridge_websocket (roslibpy).
+    Does not require ROS on the PC - uses only WebSocket JSON.
+    lane_controller_node.py on the robot receives the mask and computes cmd_vel.
     """
 
     def __init__(self, host: str, port: int = 9090, topic: str = "/lane_mask_bev"):
         try:
             import roslibpy
         except ImportError:
-            raise ImportError("roslibpy non trovato: pip install roslibpy")
+            raise ImportError("roslibpy not found: pip install roslibpy")
         self._ros = roslibpy.Ros(host=host, port=port)
         self._ros.run()
         self._pub = roslibpy.Topic(self._ros, topic, "sensor_msgs/Image")
         self._topic = topic
-        print(f"[offline_tester] rosbridge connesso: {host}:{port}  →  {topic}")
+        print(f"[offline_tester] rosbridge connected: {host}:{port}  ->  {topic}")
 
     def publish(self, mask_u8: np.ndarray):
         h, w = mask_u8.shape[:2]
@@ -483,17 +493,17 @@ class RosBridgePublisher:
 
 
 # ---------------------------------------------------------------------------
-# Caricamento parametri YAML
+# YAML parameter loading
 # ---------------------------------------------------------------------------
 
 def load_params(yaml_path: str) -> dict:
     if not os.path.exists(yaml_path):
-        print(f"[offline_tester] WARN: params non trovato ({yaml_path}), uso default")
+        print(f"[offline_tester] WARN: params not found ({yaml_path}), using defaults")
         return {}
     try:
         import yaml
     except ImportError:
-        print("[offline_tester] WARN: pyyaml non installato, uso default (pip install pyyaml)")
+        print("[offline_tester] WARN: pyyaml not installed, using defaults (pip install pyyaml)")
         return {}
     with open(yaml_path, "r") as f:
         data = yaml.safe_load(f)
@@ -512,79 +522,79 @@ def main():
         os.path.join(script_dir, "..", "jetauto_autonomous", "config", "lane_params.yaml"))
 
     parser = argparse.ArgumentParser(
-        description="Test offline pipeline guida su video registrato (senza ROS)")
+        description="Offline driving pipeline test on a recorded video (no ROS)")
     parser.add_argument("--video",       default=None,
-                        help="Video di input (es. driving.mp4); se omesso cerca in Video/")
+                        help="Input video (e.g. driving.mp4); if omitted, looks in Video/")
     parser.add_argument("--model",       default=None,
-                        help="Modello ONNX (.onnx) o CoreML (.mlpackage); se omesso cerca in model/")
+                        help="ONNX model (.onnx) or CoreML (.mlpackage); if omitted, looks in model/")
     parser.add_argument("--calibration", default=os.path.normpath(
                             os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "calibration", "calibration.json")),
-                        help="JSON calibrazione BEV (default: calibration/calibration.json)")
+                                         "calibration.json")),
+                        help="BEV calibration JSON (default: calibration.json)")
     parser.add_argument("--output",      default=None,
-                        help="Video annotato di output (es. annotated.mp4)")
+                        help="Annotated output video (e.g. annotated.mp4)")
     parser.add_argument("--params",      default=default_params,
-                        help="lane_params.yaml (default: cerca nel repo)")
+                        help="lane_params.yaml (default: looks in the repo)")
     parser.add_argument("--crop-top",    type=float, default=CROP_TOP_FRAC, dest="crop_top",
-                        help=f"Frazione top da croppare (default: {CROP_TOP_FRAC})")
+                        help=f"Top fraction to crop (default: {CROP_TOP_FRAC})")
     parser.add_argument("--no-display",  action="store_true", dest="no_display",
-                        help="Non aprire finestra OpenCV")
+                        help="Do not open an OpenCV window")
     parser.add_argument("--max-fps",     type=float, default=0.0, dest="max_fps",
-                        help="Limita FPS elaborazione (0=nessun limite)")
+                        help="Limit processing FPS (0=no limit)")
     parser.add_argument("--start-frame", type=int, default=0, dest="start_frame",
-                        help="Inizia dall'indice di frame specificato")
+                        help="Start from the given frame index")
     parser.add_argument("--calib-frame", type=int, default=1, dest="calib_frame",
-                        help="Frame su cui calibrare la BEV (default: 1 = primo frame). "
-                             "Usa un numero più alto per saltare frame iniziali poco rappresentativi.")
+                        help="Frame on which to calibrate the BEV (default: 1 = first frame). "
+                             "Use a higher number to skip unrepresentative initial frames.")
     parser.add_argument("--coreml", action="store_true",
-                        help="Usa CoreML GPU (Metal) invece di CPU (solo macOS) — più lento se "
-                             "il modello ha molti nodi non supportati da CoreML")
+                        help="Use CoreML GPU (Metal) instead of CPU (macOS only) - may be slower if "
+                             "the model has many nodes unsupported by CoreML")
     parser.add_argument("--seg-only", action="store_true", dest="seg_only",
-                        help="Mostra solo segmentazione + BEV senza HoughLinesP/steering. "
-                             "Utile per valutare la qualità del modello in isolamento.")
+                        help="Show segmentation + BEV only, without HoughLinesP/steering. "
+                             "Useful for evaluating model quality in isolation.")
     parser.add_argument("--robot-ip", default=None, dest="robot_ip",
-                        help="IP del robot: abilita la pubblicazione di /lane_mask_bev "
-                             "via rosbridge (es. 192.168.4.89). "
-                             "Il lane_controller_node.py sul robot guiderà sulla maschera ricevuta.")
+                        help="Robot IP: enables /lane_mask_bev publishing via rosbridge "
+                             "(e.g. 192.168.x.x). "
+                             "lane_controller_node.py on the robot will drive on the received mask.")
     parser.add_argument("--robot-port", type=int, default=9090, dest="robot_port",
-                        help="Porta rosbridge_websocket sul robot (default: 9090)")
+                        help="rosbridge_websocket port on the robot (default: 9090)")
     args = parser.parse_args()
 
-    # Smart default per --video: cerca in ../Video/ se non specificato
+    # Smart default for --video: look in Video/ if not specified
     if args.video is None:
         video_dir = os.path.normpath(os.path.join(script_dir, "video"))
         candidates = glob.glob(os.path.join(video_dir, "*.mp4"))
         if len(candidates) == 1:
             args.video = candidates[0]
-            print(f"[offline_tester] Video auto-rilevato: {args.video}")
+            print(f"[offline_tester] Video auto-detected: {args.video}")
         elif len(candidates) == 0:
-            parser.error(f"Nessun .mp4 trovato in {video_dir}. Usa --video.")
+            parser.error(f"No .mp4 found in {video_dir}. Use --video.")
         else:
             names = ", ".join(os.path.basename(c) for c in candidates)
-            parser.error(f"Più video in {video_dir} ({names}): specifica --video.")
+            parser.error(f"Multiple videos in {video_dir} ({names}): specify --video.")
 
-    # Smart default per --model: cerca in ../model/ se non specificato
+    # Smart default for --model: look in model/ if not specified
     if args.model is None:
         model_dir = os.path.normpath(os.path.join(script_dir, "model"))
         candidates = (glob.glob(os.path.join(model_dir, "*.onnx")) +
                       glob.glob(os.path.join(model_dir, "*.mlpackage")))
         if len(candidates) == 1:
             args.model = candidates[0]
-            print(f"[offline_tester] Modello auto-rilevato: {args.model}")
+            print(f"[offline_tester] Model auto-detected: {args.model}")
         elif len(candidates) == 0:
-            parser.error(f"Nessun modello trovato in {model_dir}. Usa --model.")
+            parser.error(f"No model found in {model_dir}. Use --model.")
         else:
             names = ", ".join(os.path.basename(c) for c in candidates)
-            parser.error(f"Più modelli in {model_dir} ({names}): specifica --model.")
+            parser.error(f"Multiple models in {model_dir} ({names}): specify --model.")
 
-    # Default output: ../Output/<nome_video>_output.mp4
+    # Default output: ../Output/<video_name>_output.mp4
     if args.output is None:
         out_dir = os.path.normpath(os.path.join(script_dir, "output"))
         stem = os.path.splitext(os.path.basename(args.video))[0]
         args.output = os.path.join(out_dir, f"{stem}_output.mp4")
-        print(f"[offline_tester] Output di default: {args.output}")
+        print(f"[offline_tester] Default output: {args.output}")
 
-    # Assicura che auto_calibration.py sia importabile (rimane in drive_segm/)
+    # Ensure auto_calibration.py is importable (lives in drive_segm/)
     sys.path.insert(0, os.path.normpath(
         os.path.join(script_dir, "..", "on_jetauto_scripts", "drive_segm")))
 
@@ -593,52 +603,52 @@ def main():
         os.path.join(script_dir, "..", "jetauto_autonomous", "scripts")))
     from lane_core import LaneControllerCore  # noqa: E402
 
-    # Carica modello (selezione automatica per estensione)
+    # Load model (automatic selection by file extension)
     if os.path.splitext(args.model)[1].lower() == ".mlpackage":
         model = CoreMLBackend(args.model)
     else:
         model = ONNXBackend(args.model, use_coreml=args.coreml)
 
-    # Carica parametri lane controller
+    # Load lane controller parameters
     params     = load_params(args.params)
     controller = LaneControllerCore(params)
 
-    # Publisher rosbridge (opzionale)
+    # rosbridge publisher (optional)
     ros_pub = None
     if args.robot_ip:
         ros_pub = RosBridgePublisher(args.robot_ip, args.robot_port)
-        print(f"[offline_tester] Pubblicazione /lane_mask_bev verso {args.robot_ip}:{args.robot_port}")
+        print(f"[offline_tester] Publishing /lane_mask_bev to {args.robot_ip}:{args.robot_port}")
 
-    # Calibrazione BEV
+    # BEV calibration
     top_line    = MODEL_H - (MODEL_H // 2)   # 192
     bottom_line = MODEL_H - 10               # 246
     auto_calib, pending_calib = load_auto_calibration(
         args.calibration, top_line, bottom_line)
 
-    # Cartella per i debug della calibrazione (accanto all'output se specificato)
+    # Folder for calibration debug images (next to the output file)
     calib_prefix = os.path.join(
         os.path.dirname(os.path.abspath(args.output)),
         "calib_debug")
 
-    # Apri video
+    # Open video
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
-        print(f"[offline_tester] ERRORE: impossibile aprire {args.video}")
+        print(f"[offline_tester] ERROR: cannot open {args.video}")
         sys.exit(1)
 
-    vid_fps      = cap.get(cv2.CAP_PROP_FPS) or 15.0   # 0 su stream live → default 15
+    vid_fps      = cap.get(cv2.CAP_PROP_FPS) or 15.0   # 0 on live stream -> default 15
     vid_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     vid_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))   # 0 su stream live
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))   # 0 on live stream
     is_live      = total_frames <= 0
     total_label  = "live" if is_live else str(total_frames)
-    print(f"[offline_tester] {'Stream live' if is_live else 'Video'}: "
+    print(f"[offline_tester] {'Live stream' if is_live else 'Video'}: "
           f"{vid_w}x{vid_h} @ {vid_fps:.1f}fps  "
-          f"{'(Ctrl+C o q per fermare)' if is_live else total_label + ' frame'}")
+          f"{'(Ctrl+C or q to stop)' if is_live else total_label + ' frames'}")
 
     if args.start_frame > 0 and not is_live:
         cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
-        print(f"[offline_tester] Inizio da frame {args.start_frame}")
+        print(f"[offline_tester] Starting from frame {args.start_frame}")
 
     # Writer output
     writer = None
@@ -649,9 +659,9 @@ def main():
         writer = cv2.VideoWriter(args.output, fourcc, vid_fps, (out_w, out_h))
         print(f"[offline_tester] Output: {args.output}  ({out_w}x{out_h} @ {vid_fps:.0f}fps)")
 
-    frame_idx = args.start_frame   # sempre inizializzato prima dei blocchi condizionali
+    frame_idx = args.start_frame   # always initialised before conditional blocks
 
-    # Calibrazione interattiva (solo se non caricata da file)
+    # Interactive calibration (only if not loaded from file)
     if pending_calib and not args.no_display:
         result = _interactive_calib_select(cap, model, args)
         if result is None:
@@ -661,7 +671,7 @@ def main():
         calib_frame_idx, calib_bgr, calib_rgb, calib_mask = result
         auto_calib.calibrate(calib_mask, CLASS_LANE_MARKING)
         pending_calib = False
-        print(f"[offline_tester] Calibrazione BEV su frame {calib_frame_idx}")
+        print(f"[offline_tester] BEV calibration on frame {calib_frame_idx}")
         if not _show_calib_debug(auto_calib, calib_mask, calib_bgr, calib_rgb, args,
                                  calib_prefix, cap, writer):
             cap.release()
@@ -669,19 +679,19 @@ def main():
                 writer.release()
             cv2.destroyAllWindows()
             return
-        frame_idx = calib_frame_idx   # il loop riparte dal frame successivo
+        frame_idx = calib_frame_idx   # loop resumes from the next frame
     elif pending_calib and args.no_display:
-        # Headless: calibra sul primo frame valido (comportamento precedente)
-        print("[offline_tester] Modalità headless: calibrazione automatica al primo frame valido")
+        # Headless: calibrate on the first valid frame (previous behaviour)
+        print("[offline_tester] Headless mode: automatic calibration on first valid frame")
 
-    # Mostra debug calibrazione caricata da file (al primo frame del loop)
+    # Show loaded-from-file calibration debug once (at the first loop iteration)
     show_loaded_calib = not pending_calib and not args.no_display
     calib_shown = False
 
     min_frame_time = 1.0 / args.max_fps if args.max_fps > 0 else 0.0
     t_start        = time.time()
 
-    print("[offline_tester] Elaborazione... (premi q nella finestra per uscire)")
+    print("[offline_tester] Processing... (press q in the window to quit)")
 
     while True:
         ret, frame_bgr = cap.read()
@@ -691,7 +701,7 @@ def main():
         t0 = time.time()
         frame_idx += 1
 
-        # BGR → RGB (stesso comportamento di lane_follower.py con encoding rgb8)
+        # BGR -> RGB (same behaviour as lane_follower.py with encoding rgb8)
         frame_rgb = frame_bgr[:, :, ::-1]
 
         # Preprocessing
@@ -700,15 +710,15 @@ def main():
         # Inference ONNX
         mask = model.infer(img_chw).astype(np.int64)
 
-        # Headless: calibrazione automatica al primo frame valido
+        # Headless: automatic calibration on the first valid frame
         if pending_calib:
             n_lane = int(((mask == CLASS_LANE_MARKING) | (mask == CLASS_LANE_DASHED)).sum())
             if n_lane >= 50:
                 auto_calib.calibrate(mask, CLASS_LANE_MARKING)
                 pending_calib = False
-                print(f"[offline_tester] Calibrazione BEV automatica (frame {frame_idx})")
+                print(f"[offline_tester] Automatic BEV calibration (frame {frame_idx})")
 
-        # Prima iterazione con calibrazione da file: mostra debug una volta sola
+        # First iteration with file-loaded calibration: show debug once
         if show_loaded_calib and not calib_shown and not pending_calib:
             calib_shown = True
             if not _show_calib_debug(auto_calib, mask, frame_bgr, frame_rgb, args,
@@ -719,14 +729,14 @@ def main():
         bev_mask   = auto_calib.make_bev(mask)
         bev_u8     = np.clip(bev_mask, 0, 255).astype(np.uint8, copy=False)
 
-        # Pubblica /lane_mask_bev al robot (se --robot-ip specificato)
+        # Publish /lane_mask_bev to the robot (if --robot-ip is set)
         if ros_pub is not None:
             try:
                 ros_pub.publish(bev_u8)
             except Exception as e:
                 print(f"[offline_tester] WARN rosbridge: {e}")
 
-        # FPS misurati
+        # Measured FPS
         elapsed = time.time() - t_start
         fps     = (frame_idx - args.start_frame) / max(elapsed, 1e-6)
 
@@ -735,7 +745,7 @@ def main():
         mask_u8   = np.clip(mask, 0, 255).astype(np.uint8)
 
         if args.seg_only:
-            # Solo segmentazione + BEV, niente Hough/steering
+            # Segmentation + BEV only, no Hough/steering
             p1 = cv2.resize(orig_crop, (MODEL_W, MODEL_H))
             colored_bgr = cv2.cvtColor(CLASS_COLORS_RGB[mask_u8.clip(0, 4)],
                                        cv2.COLOR_RGB2BGR)
@@ -752,12 +762,12 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
             dbg = np.hstack([p1, p2, bev_bgr])
         else:
-            # Pipeline completa con HoughLinesP + steering
-            # use_bev=False → passa la maschera raw; il pannello BEV mostra la prospettiva
+            # Full pipeline with HoughLinesP + steering
+            # use_bev=False -> pass raw mask; BEV panel shows the perspective view
             input_mask = bev_u8 if controller.use_bev else mask_u8
             steering, angular_z, state, debug_info = controller.step(input_mask)
             viz_bev = bev_u8 if controller.use_bev else mask_u8
-            # bev_scale>1: scala viz_bev per allineare le coordinate debug_info al pannello
+            # bev_scale>1: scale viz_bev to align debug_info coordinates to the panel
             if controller.bev_scale != 1.0:
                 viz_bev = cv2.resize(viz_bev, None,
                                      fx=controller.bev_scale, fy=controller.bev_scale,
@@ -795,10 +805,10 @@ def main():
 
     elapsed_total = time.time() - t_start
     n = frame_idx - args.start_frame
-    print(f"[offline_tester] Completato: {n} frame in {elapsed_total:.1f}s  "
-          f"({n/max(elapsed_total,1e-6):.1f} fps medio)")
+    print(f"[offline_tester] Done: {n} frames in {elapsed_total:.1f}s  "
+          f"({n/max(elapsed_total,1e-6):.1f} avg fps)")
     if args.output:
-        print(f"[offline_tester] Video salvato: {args.output}")
+        print(f"[offline_tester] Video saved: {args.output}")
 
 
 if __name__ == "__main__":

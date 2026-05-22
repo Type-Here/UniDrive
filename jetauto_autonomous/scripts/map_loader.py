@@ -3,10 +3,10 @@
 """
 map_loader.py
 -------------
-Caricamento mappa YAML -> grafo NetworkX, calcolo percorsi (Dijkstra),
-classificazione automatica di nodi come junction/endpoint/regular.
+YAML map loading -> NetworkX graph, path computation (Dijkstra),
+automatic node classification as junction/endpoint/regular.
 
-Compatibile Python 2.7 / 3.x (ROS Melodic/Noetic).
+Compatible with Python 2.7 / 3.6.9 (ROS Melodic/Noetic).
 """
 
 from __future__ import print_function
@@ -15,23 +15,23 @@ import yaml
 import networkx as nx
 
 
-# Tipi di nodo
-NODE_REGULAR  = "regular"   # degree == 2 (punto di passaggio)
-NODE_JUNCTION = "junction"  # degree  > 2 (incrocio)
-NODE_ENDPOINT = "endpoint"  # degree == 1 (estremità libera)
+# Node types
+NODE_REGULAR  = "regular"   # degree == 2 (intermediate waypoint)
+NODE_JUNCTION = "junction"  # degree  > 2 (intersection)
+NODE_ENDPOINT = "endpoint"  # degree == 1 (free endpoint)
 NODE_ISOLATED = "isolated"  # degree == 0
 
 
 class MapLoader(object):
     """
-    Carica una mappa YAML con la struttura:
+    Load a YAML map with the structure:
         frame_id: odom
         nodes: [ {id, x, y}, ... ]
-        edges: [ {from, to, length}, ... ]   # archi DIREZIONALI
+        edges: [ {from, to, length}, ... ]   # DIRECTIONAL edges
 
-    NB: nello YAML fornito molti archi sono presenti SOLO in una direzione,
-    ma in pratica il robot può percorrerli in entrambe. Il flag `bidirectional`
-    duplica gli archi mancanti per consentire la pianificazione completa.
+    NB: in the provided YAML many edges exist in ONE direction only,
+    but in practice the robot can traverse them in both directions. The `bidirectional`
+    flag duplicates missing reverse edges to allow full path planning.
     """
 
     def __init__(self, yaml_path, bidirectional=True):
@@ -42,19 +42,19 @@ class MapLoader(object):
         self.node_types = {}        # id -> NODE_*
         self._load()
 
-    # ------------------------------------------------------------------ load
+    # load ------------------------------------------------------------------
     def _load(self):
         with open(self.yaml_path, "r") as f:
             data = yaml.safe_load(f)
 
         self.frame_id = data.get("frame_id", "odom")
 
-        # Nodi
+        # Nodes
         for n in data.get("nodes", []):
             nid = int(n["id"])
             self.graph.add_node(nid, x=float(n["x"]), y=float(n["y"]))
 
-        # Archi
+        # Edges
         for e in data.get("edges", []):
             a = int(e["from"])
             b = int(e["to"])
@@ -71,7 +71,7 @@ class MapLoader(object):
         return math.hypot(ax - bx, ay - by)
 
     def _classify_nodes(self):
-        # Per la classificazione usiamo il grafo non orientato sottostante
+        # For classification we use the underlying undirected graph
         und = self.graph.to_undirected()
         for nid in self.graph.nodes():
             d = und.degree(nid)
@@ -84,16 +84,16 @@ class MapLoader(object):
             else:
                 self.node_types[nid] = NODE_JUNCTION
 
-    # ------------------------------------------------------------------ API
+    # API ------------------------------------------------------------------
     def get_path(self, start_id, end_id):
         """
-        Dijkstra sul peso 'length'. Ritorna lista di node_id [start, ..., end].
-        Lancia networkx.NetworkXNoPath se non c'è soluzione.
+        Dijkstra on weight 'length'. Returns a list of node_ids [start, ..., end].
+        Raises networkx.NetworkXNoPath if no path exists.
         """
         start_id = int(start_id)
         end_id   = int(end_id)
         if start_id not in self.graph or end_id not in self.graph:
-            raise ValueError("Nodo start o end non presente in mappa")
+            raise ValueError("Start or end node not found in map")
         return nx.dijkstra_path(self.graph, start_id, end_id, weight="length")
 
     def path_length(self, path):
@@ -119,7 +119,7 @@ class MapLoader(object):
         return list(self.graph.nodes())
 
     def all_edges(self):
-        # Per visualizzazione: ritorna tuple (a,b,length) di edge unici
+        # For visualization: returns (a,b,length) tuples of unique edges
         seen = set()
         out = []
         for a, b, d in self.graph.edges(data=True):
@@ -131,7 +131,7 @@ class MapLoader(object):
         return out
 
     def closest_node(self, x, y):
-        """Trova il nodo più vicino a una coordinata cartesiana (m)."""
+        """Find the node nearest to a Cartesian coordinate (m)."""
         best, best_d = None, float("inf")
         for nid, attr in self.graph.nodes(data=True):
             d = math.hypot(attr["x"] - x, attr["y"] - y)
@@ -139,7 +139,7 @@ class MapLoader(object):
                 best_d, best = d, nid
         return best, best_d
 
-    # ----------------------------------------------------------------- info
+    # info -----------------------------------------------------------------
     def stats(self):
         n_junc = sum(1 for t in self.node_types.values() if t == NODE_JUNCTION)
         n_end  = sum(1 for t in self.node_types.values() if t == NODE_ENDPOINT)
@@ -152,7 +152,7 @@ class MapLoader(object):
         }
 
 
-# ----------------------------------------------------------------------- main
+# main -----------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
     path = sys.argv[1] if len(sys.argv) > 1 else "map_clean-edited_smooth.yaml"

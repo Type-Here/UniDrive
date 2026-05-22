@@ -99,3 +99,50 @@ waypoint_manager:
   junction_radius: 0.20
   rate_hz: 25
   goal_completion_msg: "GOAL_REACHED"
+
+# =============================================================================
+# map_follower_node.py  --  map-assisted fallback when lane markings are lost
+# =============================================================================
+map_follower:
+  # ---- Trigger / recovery timing ----
+  # Number of control ticks (at rate_hz=10 -> 1 tick = 100ms) that lane_controller
+  # must stay in HOLD before map_follower takes over.
+  hold_fallback_frames: 15   # 1.5 s of no lane before activation
+
+  # Number of consecutive ticks where the lane is visible again before
+  # handing back control to the lane controller.
+  lane_recovery_frames: 5    # 0.5 s of stable lane before recovery
+
+  # ---- Pure-pursuit parameters ----
+  # Lookahead distance (metres). Map nodes are ~12cm apart after smoothing,
+  # so 0.50m ~ 4 nodes ahead. Increase for smoother curves; decrease for
+  # tighter turns.
+  lookahead_m: 0.50
+
+  # Forward speed while in map-follower mode. Keep slower than lane speed
+  # to compensate for reduced steering accuracy.
+  map_drive_speed: 0.04   # m/s
+
+  # Proportional gain: angular.z = Kp * heading_error
+  angular_kp: 1.2
+  max_angular_z: 0.80   # rad/s clamp
+
+  # ---- Coordinate frame ----
+  # Raw odom (x, y) that corresponds to map origin (node 0).
+  # Default 0,0 works when the robot boots with odom at origin.
+  # Override these if the robot starts with a non-zero odom reading.
+  odom_origin_x: 0.0
+  odom_origin_y: 0.0
+
+  # ---- Rate ----
+  rate_hz: 10.0
+
+  # ---- Topic overrides (leave as default unless needed) ----
+  cmd_topic:        "/jetauto_controller/cmd_vel"
+  lane_enable_topic: "/lane_controller/enable"
+  odom_topic:       "/odom"
+  path_topic:       "/waypoint_manager/path"
+  lane_state_topic: "/lane_controller/state"
+  nav_status_topic: "/waypoint_manager/status"
+  active_topic:     "/map_follower/active"
+  state_topic:      "/map_follower/state"

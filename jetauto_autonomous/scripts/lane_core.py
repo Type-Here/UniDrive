@@ -110,9 +110,12 @@ class LaneControllerCore(object):
         # ── GPU opzionale (cv2.cuda_GpuMat) — stesso pattern di lane_follower.py ─
         self._use_cuda = (hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0)
         if self._use_cuda:
-            self._gpu_mat      = cv2.cuda_GpuMat()
-            self._morph_filter = cv2.cuda.createMorphologyFilter(
-                cv2.MORPH_CLOSE, cv2.CV_8UC1, np.ones((3, 3), np.uint8))
+            self._gpu_mat            = cv2.cuda_GpuMat()
+            _k = np.ones((3, 3), np.uint8)
+            self._morph_open_filter  = cv2.cuda.createMorphologyFilter(
+                cv2.MORPH_OPEN,  cv2.CV_8UC1, _k)
+            self._morph_close_filter = cv2.cuda.createMorphologyFilter(
+                cv2.MORPH_CLOSE, cv2.CV_8UC1, _k)
 
     # ── Hook di logging (override nella sottoclasse ROS) ─────────────────────
 
@@ -137,11 +140,14 @@ class LaneControllerCore(object):
     def _detect_hough(self, bev_binary):
         if self._use_cuda:
             self._gpu_mat.upload(bev_binary)
-            closed = self._morph_filter.apply(self._gpu_mat).download()
+            opened     = self._morph_open_filter.apply(self._gpu_mat)
+            processed  = self._morph_close_filter.apply(opened).download()
         else:
-            closed = cv2.morphologyEx(bev_binary, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+            k         = np.ones((3, 3), np.uint8)
+            opened    = cv2.morphologyEx(bev_binary, cv2.MORPH_OPEN,  k)
+            processed = cv2.morphologyEx(opened,     cv2.MORPH_CLOSE, k)
         return cv2.HoughLinesP(
-            closed, 1, np.pi / 180,
+            processed, 1, np.pi / 180,
             threshold=self.hough_thresh,
             minLineLength=self.hough_min_line,
             maxLineGap=self.hough_max_gap,

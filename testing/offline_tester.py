@@ -519,8 +519,8 @@ def main():
                         help="Modello ONNX (.onnx) o CoreML (.mlpackage); se omesso cerca in model/")
     parser.add_argument("--calibration", default=os.path.normpath(
                             os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "Calibration", "calibration.json")),
-                        help="JSON calibrazione BEV (default: Calibration/calibration.json)")
+                                         "calibration", "calibration.json")),
+                        help="JSON calibrazione BEV (default: calibration/calibration.json)")
     parser.add_argument("--output",      default=None,
                         help="Video annotato di output (es. annotated.mp4)")
     parser.add_argument("--params",      default=default_params,
@@ -552,7 +552,7 @@ def main():
 
     # Smart default per --video: cerca in ../Video/ se non specificato
     if args.video is None:
-        video_dir = os.path.normpath(os.path.join(script_dir, "Video"))
+        video_dir = os.path.normpath(os.path.join(script_dir, "video"))
         candidates = glob.glob(os.path.join(video_dir, "*.mp4"))
         if len(candidates) == 1:
             args.video = candidates[0]
@@ -579,7 +579,7 @@ def main():
 
     # Default output: ../Output/<nome_video>_output.mp4
     if args.output is None:
-        out_dir = os.path.normpath(os.path.join(script_dir, "Output"))
+        out_dir = os.path.normpath(os.path.join(script_dir, "output"))
         stem = os.path.splitext(os.path.basename(args.video))[0]
         args.output = os.path.join(out_dir, f"{stem}_output.mp4")
         print(f"[offline_tester] Output di default: {args.output}")

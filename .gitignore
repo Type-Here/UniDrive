@@ -207,12 +207,12 @@ marimo/_lsp/
 __marimo__/
 
 # Testing
-Testing/Calibration/
-Testing/Output/
-Testing/Video/
-Testing/__pycache__/
-Testing/calibration.json
-Testing/model/
+testing/calibration/
+testing/output/
+testing/video/
+testing/__pycache__/
+testing/calibration.json
+testing/model/
 
 # LLMs
 .github

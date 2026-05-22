@@ -165,9 +165,10 @@
   .edge.path { stroke: var(--accent); stroke-width: 3.5; }
   .node { fill: #4a5263; stroke: #1b1f29; stroke-width: 1; cursor: pointer; }
   .node:hover { fill: var(--accent); }
-  .node.junction { fill: var(--yellow); }
-  .node.start { fill: var(--green); stroke: #fff; stroke-width: 2; }
-  .node.end   { fill: var(--red);   stroke: #fff; stroke-width: 2; }
+  .node.junction   { fill: var(--yellow); }
+  .node.start      { fill: var(--green);  stroke: #fff; stroke-width: 2; }
+  .node.end        { fill: var(--red);    stroke: #fff; stroke-width: 2; }
+  .node.remap-ref  { fill: var(--orange); stroke: #fff; stroke-width: 2; }
   .node-label { fill: #8a93a4; font-size: 7px; pointer-events: none; font-family: monospace; }
   .robot { fill: var(--accent); stroke: #fff; stroke-width: 1.5; }
 
@@ -709,13 +710,13 @@ function dijkstra(mp,src,dst){
 
 function updateRobot(x, y) {
   if (!svgViewBox) return;
-  // Durante la navigazione il marker è aggiornato da updateNavBadge (waypoint corrente).
-  // L'odom viene usato solo in IDLE/DISABLED per mostrare la posizione grezza.
-  if (robotFromWaypoint) return;
+  // During remap manual drive we always want the free odom position.
+  // Otherwise defer to the waypoint marker while navigating.
+  if (robotFromWaypoint && remapState === 0) return;
   const m = document.getElementById('robotMarker');
   if (!m) return;
-  // Fuori navigazione: snap al path se disponibile, altrimenti posizione grezza
-  const snapped = snapToPath(x, y);
+  // Skip path-snapping while driving for Remap so the marker moves freely.
+  const snapped = (remapState === 1) ? { x, y } : snapToPath(x, y);
   m.setAttribute('cx', svgViewBox.tx(snapped.x));
   m.setAttribute('cy', svgViewBox.ty(snapped.y));
   m.style.display = '';
@@ -785,6 +786,12 @@ document.getElementById('remapBtn').onclick = () => {
     remapRefA  = { odom: { x: lastRawOdom.x, y: lastRawOdom.y },
                    node: { x: nodeA.x, y: nodeA.y }, nodeId: startId };
     remapState = 1;
+    // Force odom-based robot marker (overrides any stale waypoint-navigation state)
+    robotFromWaypoint = false;
+    // Highlight reference node A so the user can judge distance while driving
+    document.querySelectorAll('#mapSvg .node').forEach(el => el.classList.remove('remap-ref'));
+    const refEl = document.querySelector('#mapSvg .node[data-id="' + startId + '"]');
+    if (refEl) refEl.classList.add('remap-ref');
     btn.textContent       = '📍 Registra B';
     btn.style.background  = 'rgba(246,196,83,.25)';
     btn.style.color       = 'var(--yellow)';
@@ -793,6 +800,9 @@ document.getElementById('remapBtn').onclick = () => {
   } else {
     const nodeB = mapData.nodes[startId];
     if (!nodeB) { alert('Nodo Start non valido'); return; }
+
+    // Clear the reference-node highlight regardless of outcome
+    document.querySelectorAll('#mapSvg .node').forEach(el => el.classList.remove('remap-ref'));
 
     const ok = applyRemap(
       remapRefA,

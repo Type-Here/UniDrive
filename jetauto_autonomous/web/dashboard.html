@@ -188,8 +188,9 @@
 
       <!-- Topic selector -->
       <div class="topic-selector">
-        <button class="topic-btn" id="btnCamera" onclick="switchTopic('camera')">📷 Camera raw</button>
-        <button class="topic-btn active" id="btnDebug" onclick="switchTopic('debug')">🔍 Controller (mask+linea)</button>
+        <button class="topic-btn" id="btnCamera"  onclick="switchTopic('camera')">📷 Camera raw</button>
+        <button class="topic-btn active" id="btnDebug"   onclick="switchTopic('debug')">🔍 Controller (mask+linea)</button>
+        <button class="topic-btn" id="btnLfDebug" onclick="switchTopic('lfDebug')">🛤 Follower (BEV+err)</button>
       </div>
 
       <!-- Drive enable/disable -->
@@ -255,6 +256,7 @@ const CONFIG = {
   map_yaml_url:     'map.yaml',
   topic_camera:     '/depth_cam/rgb/image_raw',
   topic_debug:      '/lane_debug/image',
+  topic_lfDebug:    '/lane_follower/debug_image',
 };
 
 let currentTopicMode = 'debug';
@@ -274,18 +276,20 @@ ros.on('close', () => { connEl.classList.remove('ok'); connEl.children[1].textCo
 
 // ─── Video feed ───────────────────────────────────────────────────────────────
 function topicForMode(mode) {
-  if (mode === 'camera') return CONFIG.topic_camera;
+  if (mode === 'camera')  return CONFIG.topic_camera;
+  if (mode === 'lfDebug') return CONFIG.topic_lfDebug;
   return CONFIG.topic_debug;
 }
 
 function labelForMode(mode) {
-  if (mode === 'camera') return CONFIG.topic_camera;
+  if (mode === 'camera')  return CONFIG.topic_camera;
+  if (mode === 'lfDebug') return CONFIG.topic_lfDebug;
   return CONFIG.topic_debug;
 }
 
 function switchTopic(mode) {
   currentTopicMode = mode;
-  ['camera','debug'].forEach(m => {
+  ['camera', 'debug', 'lfDebug'].forEach(m => {
     const id = 'btn' + m.charAt(0).toUpperCase() + m.slice(1);
     document.getElementById(id).classList.toggle('active', m === mode);
   });
@@ -296,7 +300,13 @@ function switchTopic(mode) {
 function renderVideo(topic) {
   const wrap  = document.getElementById('videoWrap');
   const label = document.getElementById('videoSourceLabel');
-  const url   = `${CONFIG.video_server_url}/stream?topic=${topic}&type=mjpeg&quality=60`;
+  // Qualità differenziata per risoluzione: camera 640x420 → 30, debug 320x128 → 65, bev 640x128 → 40
+  const QUALITY = {};
+  QUALITY[CONFIG.topic_camera]  = 30;
+  QUALITY[CONFIG.topic_debug]   = 65;
+  QUALITY[CONFIG.topic_lfDebug] = 40;
+  const quality = QUALITY[topic] !== undefined ? QUALITY[topic] : 40;
+  const url   = `${CONFIG.video_server_url}/stream?topic=${topic}&type=mjpeg&quality=${quality}`;
   wrap.innerHTML = '';
   wrap.appendChild(label);                 // rimette il label overlay
   const img = document.createElement('img');
@@ -341,13 +351,13 @@ function setupTopics() {
     ros, name: '/lane_controller/enable', messageType: 'std_msgs/Bool'
   });
 
-  new ROSLIB.Topic({ ros, name: '/waypoint_manager/status', messageType: 'std_msgs/String' })
+  new ROSLIB.Topic({ ros, name: '/waypoint_manager/status', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => updateNavBadge(m.data));
 
-  new ROSLIB.Topic({ ros, name: '/waypoint_manager/path', messageType: 'std_msgs/Int32MultiArray' })
+  new ROSLIB.Topic({ ros, name: '/waypoint_manager/path', messageType: 'std_msgs/Int32MultiArray', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => highlightPath(m.data));
 
-  new ROSLIB.Topic({ ros, name: '/lane_controller/state', messageType: 'std_msgs/String' })
+  new ROSLIB.Topic({ ros, name: '/lane_controller/state', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => {
       updateLaneBadge(m.data);
       // Sincronizza il pulsante drive con lo stato reale del controller
@@ -358,7 +368,7 @@ function setupTopics() {
       }
     });
 
-  new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 200 })
+  new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 200, queue_length: 1 })
     .subscribe(m => updateOdom(m));
 }
 
@@ -380,6 +390,9 @@ function updateLaneBadge(s) {
   b.className   = 'badge ' + (LANE_CLASS[s] || '');
 }
 
+// Ultima posizione del marker impostata dal waypoint manager (null = usa odom)
+let robotFromWaypoint = false;
+
 function updateNavBadge(s) {
   const b = document.getElementById('navState');
   b.textContent = 'NAV: ' + s;
@@ -388,6 +401,32 @@ function updateNavBadge(s) {
   else if (s.startsWith('GOAL'))       b.className = 'badge done';
   else if (s.startsWith('ERROR'))      b.className = 'badge stop';
   else                                  b.className = 'badge';
+
+  if (!svgViewBox || !mapData) return;
+
+  // Estratta posizione dal waypoint corrente — fonte di verità per il marker.
+  // Formato status: "NAVIGATING | wp=5 (regular) d=0.12m idx=6/11"
+  //                 "JUNCTION | rot to 2 err=12.3deg"
+  //                 "GOAL_REACHED | last=10"
+  const wpMatch   = s.match(/wp=(\d+)/);
+  const lastMatch = s.match(/last=(\d+)/);
+  const nodeId    = wpMatch   ? +wpMatch[1]   :
+                    lastMatch ? +lastMatch[1] : null;
+
+  if (nodeId !== null) {
+    const node = mapData.nodes[nodeId];
+    if (node) {
+      robotFromWaypoint = true;
+      const m = document.getElementById('robotMarker');
+      if (m) {
+        m.setAttribute('cx', svgViewBox.tx(node.x));
+        m.setAttribute('cy', svgViewBox.ty(node.y));
+        m.style.display = '';
+      }
+    }
+  } else if (s.startsWith('IDLE') || s.startsWith('DISABLED')) {
+    robotFromWaypoint = false;  // torna a usare l'odom
+  }
 }
 
 // ─── Odometry ─────────────────────────────────────────────────────────────────
@@ -552,10 +591,32 @@ function renderMap() {
 // ─── Calibrazione posizione robot ─────────────────────────────────────────────
 // odomOffset: offset da sottrarre alla posizione raw per avere il robot
 // visualizzato sul nodo 0. Viene settato al click su "Calibra".
-let odomOffset = { x: 0, y: 0 };
+let odomOffset  = { x: 0, y: 0 };
 let lastRawOdom = { x: 0, y: 0 };   // ultima posizione raw ricevuta da /odom
+let currentPath = [];                // path attivo ricevuto da /waypoint_manager/path
+
+// ─── Route snapping ──────────────────────────────────────────────────────────
+// Proietta (x,y) sul segmento più vicino del path attivo.
+// Come Google Maps: il marker segue la strada, non l'odom grezzo.
+function snapToPath(x, y) {
+  if (!mapData || currentPath.length < 2) return { x, y };
+  let bestDist = Infinity, bestX = x, bestY = y;
+  for (let i = 0; i < currentPath.length - 1; i++) {
+    const a = mapData.nodes[currentPath[i]];
+    const b = mapData.nodes[currentPath[i + 1]];
+    if (!a || !b) continue;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 > 0 ? Math.max(0, Math.min(1, ((x - a.x) * dx + (y - a.y) * dy) / len2)) : 0;
+    const px = a.x + t * dx, py = a.y + t * dy;
+    const d = Math.hypot(x - px, y - py);
+    if (d < bestDist) { bestDist = d; bestX = px; bestY = py; }
+  }
+  return { x: bestX, y: bestY };
+}
 
 function highlightPath(pathArr) {
+  currentPath = pathArr;   // salva per lo snapping
   const edgeSet=new Set();
   for(let i=0;i<pathArr.length-1;i++){
     edgeSet.add(`${pathArr[i]}-${pathArr[i+1]}`);
@@ -609,13 +670,18 @@ function dijkstra(mp,src,dst){
   return out;
 }
 
-function updateRobot(x,y){
-  if(!svgViewBox) return;
-  const m=document.getElementById('robotMarker');
-  if(!m) return;
-  m.setAttribute('cx',svgViewBox.tx(x));
-  m.setAttribute('cy',svgViewBox.ty(y));
-  m.style.display='';
+function updateRobot(x, y) {
+  if (!svgViewBox) return;
+  // Durante la navigazione il marker è aggiornato da updateNavBadge (waypoint corrente).
+  // L'odom viene usato solo in IDLE/DISABLED per mostrare la posizione grezza.
+  if (robotFromWaypoint) return;
+  const m = document.getElementById('robotMarker');
+  if (!m) return;
+  // Fuori navigazione: snap al path se disponibile, altrimenti posizione grezza
+  const snapped = snapToPath(x, y);
+  m.setAttribute('cx', svgViewBox.tx(snapped.x));
+  m.setAttribute('cy', svgViewBox.ty(snapped.y));
+  m.style.display = '';
 }
 
 // ─── Button handlers ──────────────────────────────────────────────────────────

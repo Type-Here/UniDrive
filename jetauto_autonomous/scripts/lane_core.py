@@ -51,19 +51,22 @@ class LaneControllerCore(object):
         self.hough_roi_top_frac = float(p.get("hough_roi_top_frac", 0.0))
 
         # ── HoughLinesP ──────────────────────────────────────────────────────
+        # I parametri in px nel YAML sono espressi a bev_scale=1.0 e vengono
+        # moltiplicati per bev_scale qui; hough_threshold (voti) non scala.
+        s = self.bev_scale
         self.hough_thresh     = int(  p.get("hough_threshold",     50))
-        self.hough_min_line   = int(  p.get("hough_min_line_px",   20))
-        self.hough_max_gap    = int(  p.get("hough_max_gap_px",    40))
-        self.hough_min_length = int(  p.get("hough_min_length_px", 20))
+        self.hough_min_line   = max(1, int(round(float(p.get("hough_min_line_px",   20)) * s)))
+        self.hough_max_gap    = max(1, int(round(float(p.get("hough_max_gap_px",    40)) * s)))
+        self.hough_min_length = max(1, int(round(float(p.get("hough_min_length_px", 20)) * s)))
         self.min_valid_points = int(  p.get("min_valid_points",     0))
         self.line_height_ratio = float(p.get("line_height_ratio",  0.8))
 
         # ── Geometria corsia ─────────────────────────────────────────────────
-        self.lane_width_px            = float(p.get("lane_width_px",              280.0))
+        self.lane_width_px            = float(p.get("lane_width_px",              280.0)) * s
         self.center_y_ratio           = float(p.get("center_y_ratio",             0.10))
         self.max_steer_angle          = float(p.get("max_steering_angle",         48.0))
-        self.single_line_offset       = float(p.get("single_line_offset",          0.0))
-        self.min_distance_from_center = float(p.get("min_distance_from_center",    0.0))
+        self.single_line_offset       = float(p.get("single_line_offset",          0.0)) * s
+        self.min_distance_from_center = float(p.get("min_distance_from_center",    0.0)) * s
 
         # ── Fit linee ────────────────────────────────────────────────────────
         # "linear" retta | "quadratic" parabola | "auto" parabola se >=6 punti
@@ -88,8 +91,8 @@ class LaneControllerCore(object):
         # ── Calibrazione dinamica larghezza corsia (solo use_bev=True) ───────
         self.lane_width_dynamic_enable = bool( p.get("lane_width_dynamic_enable", True))
         self.lane_width_ema_alpha      = float(p.get("lane_width_ema_alpha",      0.10))
-        self.lane_width_min_px         = float(p.get("lane_width_min_px",         180.0))
-        self.lane_width_max_px         = float(p.get("lane_width_max_px",         380.0))
+        self.lane_width_min_px         = float(p.get("lane_width_min_px",         180.0)) * s
+        self.lane_width_max_px         = float(p.get("lane_width_max_px",         380.0)) * s
         self.lane_width_sanity_band    = float(p.get("lane_width_sanity_band",    0.25))
         self.lane_width_reset_after    = int(  p.get("lane_width_reset_after",      0))
 
@@ -111,6 +114,7 @@ class LaneControllerCore(object):
         self._use_cuda = (hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0)
         if self._use_cuda:
             self._gpu_mat            = cv2.cuda_GpuMat()
+            self._gpu_dst            = cv2.cuda_GpuMat()   # dst esplicito per morfologia
             _k = np.ones((3, 3), np.uint8)
             self._morph_open_filter  = cv2.cuda.createMorphologyFilter(
                 cv2.MORPH_OPEN,  cv2.CV_8UC1, _k)
@@ -138,11 +142,16 @@ class LaneControllerCore(object):
     # ── Pipeline Hough ───────────────────────────────────────────────────────
 
     def _detect_hough(self, bev_binary):
+        processed = None
         if self._use_cuda:
-            self._gpu_mat.upload(bev_binary)
-            opened     = self._morph_open_filter.apply(self._gpu_mat)
-            processed  = self._morph_close_filter.apply(opened).download()
-        else:
+            try:
+                self._gpu_mat.upload(bev_binary)
+                self._morph_open_filter.apply(self._gpu_mat, self._gpu_dst)
+                self._morph_close_filter.apply(self._gpu_dst, self._gpu_mat)
+                processed = self._gpu_mat.download()
+            except Exception:
+                pass   # fallback CPU sotto
+        if processed is None:
             k         = np.ones((3, 3), np.uint8)
             opened    = cv2.morphologyEx(bev_binary, cv2.MORPH_OPEN,  k)
             processed = cv2.morphologyEx(opened,     cv2.MORPH_CLOSE, k)

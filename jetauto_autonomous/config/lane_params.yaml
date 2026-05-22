@@ -1,6 +1,10 @@
 # =============================================================================
 # Parametri lane_controller_node + waypoint_manager_node
 # Pipeline: /lane_mask_bev → ROI crop → HoughLinesP → fit polinomiale → sterzata adattiva
+#
+# NOTA SCALA: tutti i parametri in pixel (lane_width_*, hough_*_px) sono espressi
+# a bev_scale=1.0 (maschera nativa 320×128). Il codice li moltiplica automaticamente
+# per bev_scale → non serve aggiornarli manualmente quando si cambia bev_scale.
 # =============================================================================
 
 lane_controller:
@@ -12,7 +16,7 @@ lane_controller:
   enable_topic: "/lane_controller/enable"
 
   # ---- Velocità ----
-  linear_x_speed: 0.05   # m/s avanti
+  linear_x_speed: 0.10   # m/s avanti
   max_linear_y:   0.08   # m/s strafe (mecanum)
   max_angular_z:  0.80   # rad/s (classic)
 
@@ -21,61 +25,56 @@ lane_controller:
 
   # ---- Modalità BEV ----
   use_bev: true     # false = usa maschera raw in prospettiva (no calibrazione BEV richiesta)
-  bev_scale: 1.0    # fattore upscaling maschera BEV prima di Hough (1.0 = nativo 320×128)
-                    # es. 2.0 → 640×256; adattare lane_width_px proporzionalmente
+  bev_scale: 2.0    # upscaling maschera BEV (1.0=320×128, 2.0=640×256, 2.5=800×320)
+                    # tutti i param in px si adattano automaticamente
 
   # ---- Parametri no-BEV (usati solo se use_bev: false) ----
   # Usare anche: mask_topic: "/lane_mask"  e  lane_fit_mode: "quadratic"
-  lane_width_bottom_frac: 0.55  # larghezza corsia stimata come fraz. di dst_w alla riga più bassa
-  no_bev_roi_top_frac: 0.45     # ignora top 45% della maschera (riduce rumore prospettivo orizzonte)
+  lane_width_bottom_frac: 0.55  # larghezza corsia come fraz. di dst_w (no-BEV)
+  no_bev_roi_top_frac: 0.10     # ignora top X% della maschera (no-BEV)
 
   # ---- ROI Hough ----
   # BEV mode:    ignora il top della maschera BEV (lontano dal robot). Deve essere < center_y_ratio.
   # no-BEV mode: sostituito da no_bev_roi_top_frac (sopra).
   hough_roi_top_frac: 0.3  # [0-1]; linea arancione nel debug
 
-  # ---- HoughLinesP ----
-  hough_threshold:    30   # voti minimi Più bassa = più linee (anche false positive)
-  hough_min_line_px:  20   # px min segmento Hough
-  hough_max_gap_px:   40   # px gap max per unire segmenti
-  hough_min_length_px: 20  # px min linea mediata per validazione
+  # ---- HoughLinesP — valori a bev_scale=1.0, auto-scalati dal codice ----
+  hough_threshold:     30  # voti minimi (NON scala con bev_scale)
+  hough_min_line_px:    5  # px min segmento Hough  [@ 1.0x]
+  hough_max_gap_px:    20  # px gap max per unire segmenti  [@ 1.0x]
+  hough_min_length_px:  8  # px min linea mediata per validazione  [@ 1.0x]
   line_height_ratio:  1.0  # estensione verticale linea (1.0 = tutta l'altezza)
 
-  # ---- Geometria corsia ----
-  lane_width_px:      280   # px larghezza corsia BEV — fallback statico finché dyn_lane_width non è inizializzato o se lane_width_dynamic_enable=false
-  center_y_ratio:     0.50  # [0=top, 1=bot] punto di misura; >= hough_roi_top_frac; linea magenta nel debug
+  # ---- Geometria corsia — valori a bev_scale=1.0, auto-scalati dal codice ----
+  lane_width_px:      252   # px larghezza corsia  [@ 1.0x] (Wm≈504 misurato a 2.0x)
+  center_y_ratio:     0.50  # [0=top, 1=bot] punto di misura; >= hough_roi_top_frac
   max_steering_angle: 48.0  # gradi massimi di sterzata
-  single_line_offset: 0.0   # px offset aggiuntivo stima centro (singola linea)
-  min_distance_from_center: 0.0  # px distanza min dal centro per accettare una linea
+  single_line_offset:  0.0  # px offset aggiuntivo stima centro (singola linea)  [@ 1.0x]
+  min_distance_from_center: 0.0  # px distanza min dal centro  [@ 1.0x]
   min_right_margin_px: 0.0
   min_left_margin_px:  0.0
 
   # ---- Calibrazione dinamica larghezza corsia (solo use_bev=true) ----
   # Quando vediamo entrambe le linee, |rx-lx| a center_y aggiorna via EMA
-  # una stima corrente della larghezza corsia. Quando poi vediamo una sola
-  # linea, questa stima sostituisce lane_width_px nel calcolo del centro.
-  # Tutti i px sono RIFERITI all'immagine post-bev_scale.
-  # Se bev_scale=2.0, raddoppia anche lane_width_min_px / lane_width_max_px / lane_width_px.
-  lane_width_dynamic_enable: true   # false = usa solo lane_width_px statico
+  # la stima corrente. Usata per single-line estimation.
+  # Valori a bev_scale=1.0, auto-scalati dal codice.
+  lane_width_dynamic_enable: true
   lane_width_ema_alpha:      0.10   # 0=mai aggiorna, 1=segue solo l'ultima misura
-  lane_width_min_px:         180    # bound assoluto inferiore (px post-bev_scale)
-  lane_width_max_px:         380    # bound assoluto superiore (px post-bev_scale)
-  lane_width_sanity_band:    0.25   # misura accettata se |meas-dyn|/dyn <= band (solo se dyn già inizializzato)
-  lane_width_reset_after:    0      # frame consecutivi senza 2-lines prima di azzerare dyn (0 = mai)
+  lane_width_min_px:         190    # bound inferiore  [@ 1.0x]  → 380px @ 2.0x
+  lane_width_max_px:         315    # bound superiore  [@ 1.0x]  → 630px @ 2.0x
+  lane_width_sanity_band:    0.25   # misura accettata se |meas-dyn|/dyn <= band
+  lane_width_reset_after:    0      # frame senza 2-lines prima di azzerare dyn (0=mai)
 
   # ---- Modalità fit linee ----
-  # "linear"    → retta pura (deg=1, sempre)
-  # "quadratic" → parabola se >=3 punti, altrimenti retta  ← consigliato per no-BEV (prospettiva curva)
-  # "auto"      → parabola se >=6 punti, altrimenti retta  ← default BEV
-  lane_fit_mode: "auto"
+  lane_fit_mode: "linear"   # "linear" retta | "quadratic" parabola | "auto" parabola se >=6 pt
 
   # ---- Validazione linee ----
   min_valid_points: 0  # check-y da superare (0 = accetta tutto)
 
   # ---- Smoothing EMA adattivo ----
   # α = clip(alpha_base + 0.35*(1-exp(-|Δangle|/delta_scale)), base, 0.95)
-  angle_smooth_alpha_base:  0.50  # base α (più basso = più smooth)
-  angle_smooth_delta_scale: 10.0  # scala adattiva EMA
+  angle_smooth_alpha_base:  0.50  # base α (più basso = più smooth; range consigliato 0.40-0.65)
+  angle_smooth_delta_scale: 10.0  # scala adattiva EMA (deg; più alto = meno reattivo)
 
   # ---- Class IDs ----
   class_lane_marking: 2
@@ -84,7 +83,7 @@ lane_controller:
   # ---- Debug ----
   publish_debug: true
   debug_scale:   0.5
-  control_rate_hz: 20  # Hz loop controllo (FPS modello 15-30)
+  control_rate_hz: 25  # Hz loop controllo — allineare al FPS del modello (25-30)
 
 # =============================================================================
 waypoint_manager:
@@ -98,5 +97,5 @@ waypoint_manager:
   waypoint_tolerance: 0.14
   junction_slowdown: 0.06
   junction_radius: 0.20
-  rate_hz: 10
+  rate_hz: 25
   goal_completion_msg: "GOAL_REACHED"

@@ -2,7 +2,7 @@
 """
 lane_follower.py -- ROS1 lane following node for JetAuto (Jetson Nano).
 
-Uses a SegFormer segmentation model to detect lane markings in the camera
+Uses a MobileNet (SegFormer also compatible) segmentation model to detect lane markings in the camera
 image, computes a lateral error in Bird's Eye View, and sends velocity
 commands to keep the robot centred in the lane.
 
@@ -13,7 +13,7 @@ Architecture:
     preprocess: crop + resize to model input (640x256)
         |
         v
-    SegFormer inference (ONNX or TensorRT)
+    Model inference (ONNX or TensorRT)
         |
         v
     segmentation mask (5 classes: bg, road, lane_marking, lane_dashed, zebra)
@@ -499,7 +499,7 @@ def make_debug_image(img_bgr: np.ndarray,
     # BEV mask
     bev_colored = CLASS_COLORS[bev_mask.clip(0, 4)]
     bev_bgr     = cv2.cvtColor(bev_colored, cv2.COLOR_RGB2BGR)
-    bev_resized = cv2.resize(bev_bgr, (w, h))
+    bev_resized = cv2.resize(bev_bgr, (w, h), interpolation=cv2.INTER_NEAREST)
 
     # Error bar on BEV image
     cx    = int(w / 2)

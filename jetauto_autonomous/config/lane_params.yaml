@@ -104,6 +104,11 @@ waypoint_manager:
 # map_follower_node.py  --  map-assisted fallback when lane markings are lost
 # =============================================================================
 map_follower:
+  # ---- Master switch ----
+  # false → node stays INACTIVE forever (pure segmentation, no map fallback)
+  # true  → activates pure-pursuit fallback when lane is lost
+  enable: false
+
   # ---- Trigger / recovery timing ----
   # Number of control ticks (at rate_hz=10 -> 1 tick = 100ms) that lane_controller
   # must stay in HOLD before map_follower takes over.

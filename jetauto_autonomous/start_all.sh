@@ -37,6 +37,12 @@ cd "$SCRIPT_DIR"
 
 PARAMS_FILE="$SCRIPT_DIR/config/lane_params.yaml"
 MAP_FILE="$SCRIPT_DIR/maps/map_clean-edited_smooth.yaml"
+# Se esiste una versione remappata, usarla (prodotta dal pulsante Remap della dashboard)
+_REMAP="${MAP_FILE%.yaml}_remapped.yaml"
+if [[ -f "$_REMAP" ]]; then
+  MAP_FILE="$_REMAP"
+fi
+unset _REMAP
 WEB_DIR="$SCRIPT_DIR/web"
 SCRIPTS_DIR="$SCRIPT_DIR/scripts"
 PID_FILE="/tmp/jetauto_autonomous.pids"
@@ -148,15 +154,19 @@ start_proc dashboard_http \
        --map "$MAP_FILE"
 
 # ---- 5. nodi nostri ----
-echo "[5/5] lane_controller + waypoint_manager"
+echo "[5/6] lane_controller"
 start_proc lane_controller \
   $PY "$SCRIPTS_DIR/lane_controller_node.py"
 
-# Override del path mappa nel waypoint_manager (per evitare $(find ...))
+# Override del path mappa (per evitare $(find ...))
 rosparam set "waypoint_manager/map_file" "$MAP_FILE"
 
+echo "[6/6] waypoint_manager + map_follower"
 start_proc waypoint_manager \
   $PY "$SCRIPTS_DIR/waypoint_manager_node.py"
+
+start_proc map_follower \
+  $PY "$SCRIPTS_DIR/map_follower_node.py"
 
 # ---- Riepilogo ----
 echo

@@ -4,7 +4,7 @@
 lane_controller_node.py — nodo ROS per il controllo laterale JetAuto.
 
 Tutta la logica pura (Hough, fit, steering) è in lane_core.py.
-Questo file aggiunge soltanto il wiring ROS: rosparam, pub/sub, cv_bridge.
+Questo file aggiunge soltanto il wiring ROS: rosparam, pub/sub.
 
 Input:  /lane_mask_bev  (use_bev=true)  o  /lane_mask  (use_bev=false)
 Output: /jetauto_controller/cmd_vel  (Twist)
@@ -20,7 +20,6 @@ import cv2
 import numpy as np
 import rospy
 
-from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
@@ -90,7 +89,6 @@ class LaneControllerV2Node(LaneControllerCore):
         self.rate_hz       = float(rp("control_rate_hz", 10.0))
 
         # ── Stato ROS interno ─────────────────────────────────────────────────
-        self.bridge        = CvBridge()
         self.lock          = threading.Lock()
         self.latest_mask   = None
         self.enabled       = False
@@ -134,12 +132,16 @@ class LaneControllerV2Node(LaneControllerCore):
 
     def _mask_cb(self, msg):
         try:
-            mask = self.bridge.imgmsg_to_cv2(msg, desired_encoding="mono8")
-        except CvBridgeError as e:
-            rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] mask bridge: %s" % e)
+            mask = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width))
+            mask = mask.copy()  # np.frombuffer ritorna read-only
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] mask decode: %s" % e)
             return
         with self.lock:
+            is_first = self.latest_mask is None
             self.latest_mask = mask
+        if is_first:
+            rospy.loginfo("[lane_ctrl_v2] prima maschera ricevuta: shape=%s", mask.shape)
 
     def _enable_cb(self, msg):
         self.enabled = bool(msg.data)
@@ -248,9 +250,15 @@ class LaneControllerV2Node(LaneControllerCore):
             out = cv2.resize(out, None, fx=self.debug_scale, fy=self.debug_scale,
                              interpolation=cv2.INTER_AREA)
         try:
-            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(out, encoding="bgr8"))
-        except CvBridgeError as e:
-            rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] debug bridge: %s" % e)
+            msg          = Image()
+            msg.height   = out.shape[0]
+            msg.width    = out.shape[1]
+            msg.encoding = "bgr8"
+            msg.step     = out.shape[1] * 3
+            msg.data     = out.tobytes()
+            self.debug_pub.publish(msg)
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] debug publish: %s" % e)
 
     # ── Step principale ───────────────────────────────────────────────────────
 

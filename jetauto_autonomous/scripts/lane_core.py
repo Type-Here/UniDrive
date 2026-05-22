@@ -107,6 +107,13 @@ class LaneControllerCore(object):
         self.last_measured_accepted = False
         self.frames_since_two_lines = 0
 
+        # ── GPU opzionale (cv2.cuda_GpuMat) — stesso pattern di lane_follower.py ─
+        self._use_cuda = (hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0)
+        if self._use_cuda:
+            self._gpu_mat      = cv2.cuda_GpuMat()
+            self._morph_filter = cv2.cuda.createMorphologyFilter(
+                cv2.MORPH_CLOSE, cv2.CV_8UC1, np.ones((3, 3), np.uint8))
+
     # ── Hook di logging (override nella sottoclasse ROS) ─────────────────────
 
     def _warn(self, msg):
@@ -128,8 +135,11 @@ class LaneControllerCore(object):
     # ── Pipeline Hough ───────────────────────────────────────────────────────
 
     def _detect_hough(self, bev_binary):
-        kernel = np.ones((3, 3), np.uint8)
-        closed = cv2.morphologyEx(bev_binary, cv2.MORPH_CLOSE, kernel)
+        if self._use_cuda:
+            self._gpu_mat.upload(bev_binary)
+            closed = self._morph_filter.apply(self._gpu_mat).download()
+        else:
+            closed = cv2.morphologyEx(bev_binary, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
         return cv2.HoughLinesP(
             closed, 1, np.pi / 180,
             threshold=self.hough_thresh,
@@ -269,7 +279,7 @@ class LaneControllerCore(object):
         """Valuta x a target_y: usa poly se disponibile, altrimenti interpolazione lineare."""
         if poly is not None:
             v = float(np.polyval(poly, target_y))
-            return v if math.isfinite(v) else None
+            return v if np.isfinite(v) else None
         return self._get_x_at_y(line, target_y)
 
     def _validate_lines(self, left_line, right_line, img_cx, dst_h):
@@ -408,8 +418,15 @@ class LaneControllerCore(object):
         """
         # Upscaling (INTER_NEAREST preserva class IDs interi)
         if self.bev_scale != 1.0:
-            mask = cv2.resize(mask, None, fx=self.bev_scale, fy=self.bev_scale,
-                              interpolation=cv2.INTER_NEAREST)
+            if self._use_cuda:
+                new_w = int(mask.shape[1] * self.bev_scale)
+                new_h = int(mask.shape[0] * self.bev_scale)
+                self._gpu_mat.upload(mask)
+                mask = cv2.cuda.resize(self._gpu_mat, (new_w, new_h),
+                                       interpolation=cv2.INTER_NEAREST).download()
+            else:
+                mask = cv2.resize(mask, None, fx=self.bev_scale, fy=self.bev_scale,
+                                  interpolation=cv2.INTER_NEAREST)
 
         dst_h, dst_w = mask.shape[:2]
         img_cx      = dst_w / 2.0

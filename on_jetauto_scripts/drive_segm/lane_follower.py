@@ -566,6 +566,8 @@ class LaneFollowerNode:
         self.dry_run = args.dry_run
         self.debug   = args.debug
         self.publish_masks = args.publish_masks
+        self.max_fps = args.max_fps
+        self._min_period = (1.0 / args.max_fps) if args.max_fps > 0 else 0.0
 
         # State
         self.last_error    = 0.0
@@ -769,6 +771,11 @@ class LaneFollowerNode:
                 1000.0 / max(elapsed_ms, 1),
                 self.frames_no_lane, self.frames_total)
 
+            if self._min_period > 0:
+                remaining = self._min_period - (time.time() - t0)
+                if remaining > 0:
+                    time.sleep(remaining)
+
             # Debug image
             if self.debug and self.debug_pub.get_num_connections() > 0:
                 crop_px  = int(img_rgb.shape[0] * self.crop_top_frac)
@@ -859,6 +866,8 @@ def main():
     parser.add_argument("--dry-run",  action="store_true", dest="dry_run",
                         help="Run inference without publishing cmd_vel")
     parser.add_argument("--calibration", help="Path to calibration json file", default="calibration.json")
+    parser.add_argument("--max-fps", type=float, default=0.0, dest="max_fps",
+                        help="Cap inference rate to this FPS (0 = unlimited)")
 
     # ROS passes extra args -- filter them out
     import rospy

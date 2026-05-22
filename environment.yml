@@ -74,3 +74,6 @@ dependencies:
       # --- Misc ---
       - seaborn
       - python-dotenv
+
+      # --- Live offloading from PC to the robot (rosbridge client, without ROS installed) ---
+      - roslibpy

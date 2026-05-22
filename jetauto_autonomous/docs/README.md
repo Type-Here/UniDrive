@@ -143,66 +143,6 @@ cd ~/jetauto_autonomous
 ./stop_all.sh
 ```
 
-## Modalità test (senza modello acceso)
-
-Per validare la pipeline di controllo + dashboard senza dover lanciare
-SegFormer/SegNet (utile per debugging, sviluppo, e per misurare l'occupazione
-RAM dello stack senza il modello), c'è uno script alternativo
-`start_test.sh` che lancia un finto publisher di `/lane_mask`.
-
-### 1) Genera le maschere di test dai JSON LabelMe del dataset
-
-Sul Jetson:
-
-```bash
-cd ~/jetauto_autonomous
-
-# Cartella sorgente con i JSON (e relative immagini)
-DATASET_DIR=/path/al/dataset/originale
-
-# Genera le maschere a 512x256 (alleggerisce il carico)
-python2 scripts/labelme_to_mask.py "$DATASET_DIR" \
-    -o ./test_masks --resize 512x256 --debug
-```
-
-`--debug` salva anche `*_vis.png` colorati per controllo visivo.
-Verifica una maschera a campione aprendo un file `_vis.png`.
-
-### 2) Avvia il sistema in modalità test
-
-```bash
-# Sequenziale, 10 Hz (simula un video del modello)
-./start_test.sh
-
-# Random ordering, ogni maschera tenuta 0.5 secondi
-./start_test.sh --random --hold 0.5
-
-# Frequenza più alta (stress test del controller)
-./start_test.sh --rate 20
-```
-
-A questo punto la dashboard funziona come al solito ma le maschere
-arrivano dal publisher fake invece che dal modello.
-
-**ATTENZIONE**: il `/jetauto_controller/cmd_vel` viene comunque pubblicato.
-Tenere il robot **sollevato** o disattiva i motori se non vuoi che si muova.
-
-### 3) Controllo a runtime del fake publisher
-
-```bash
-# Pausa la sequenza (utile per inspezionare un singolo frame)
-rostopic pub /fake_mask_publisher/cmd std_msgs/String "data: 'pause'"
-
-# Riprende
-rostopic pub /fake_mask_publisher/cmd std_msgs/String "data: 'resume'"
-
-# Avanza al prossimo frame manualmente (in pause)
-rostopic pub /fake_mask_publisher/cmd std_msgs/String "data: 'next'"
-```
-
-Manda `kill` a tutti i processi salvati nel PID file e pubblica anche un
-`Twist` zero per fermare il robot a velocità nulla.
-
 ## Override veloci
 
 ```bash
@@ -223,12 +163,19 @@ Parametri che probabilmente vorrai toccare al primo test:
 
 | Parametro | Effetto | Default | Range tipico |
 |---|---|---|---|
-| `linear_x_speed` | velocità di crociera (m/s) | 0.10 | 0.05 - 0.25 |
-| `Kp_lat` | gain laterale (px → m/s) | 0.0030 | 0.001 - 0.008 |
-| `lateral_offset_px` | distanza dalla linea singola | 60 | 30 - 120 |
-| `mask_roi_top_fraction` | quanta parte della maschera analizzare | 0.55 | 0.4 - 0.7 |
-| `no_lane_grace_frames` | frame consecutivi senza linee prima di STOP | 3 | 2 - 8 |
-| `control_rate_hz` | frequenza loop controllo | 20 | regola sui FPS del modello |
+| `linear_x_speed` | velocità di crociera (m/s) | 0.05 | 0.03 - 0.15 |
+| `max_angular_z` | sterzata massima (rad/s, drive=classic) | 0.80 | 0.4 - 1.2 |
+| `max_steering_angle` | angolo max mappato (gradi) | 48.0 | 30 - 60 |
+| `single_line_offset` | offset px stima centro con singola linea | 0 | 0 - 60 |
+| `hough_roi_top_frac` | porzione superiore BEV ignorata (use_bev=true) | 0.30 | 0.0 - 0.6 |
+| `no_bev_roi_top_frac` | porzione superiore ignorata (use_bev=false) | 0.45 | 0.3 - 0.6 |
+| `hough_threshold` | voti minimi HoughLinesP | 50 | 30 - 80 |
+| `hough_max_gap_px` | gap max per unire segmenti Hough | 40 | 10 - 60 |
+| `hough_min_length_px` | lunghezza min linea validata | 20 | 10 - 40 |
+| `center_y_ratio` | quota di misura del centro corsia [0=top,1=bot] | 0.50 | 0.3 - 0.7 |
+| `angle_smooth_alpha_base` | base EMA sull'angolo (più basso = più smooth) | 0.50 | 0.3 - 0.8 |
+| `lane_width_px` | larghezza corsia in BEV (fallback statico) | 280 | 200 - 350 |
+| `control_rate_hz` | frequenza loop controllo (Hz) | 20 | regola sui FPS del modello |
 
 Misura gli FPS del modello con:
 
@@ -236,7 +183,66 @@ Misura gli FPS del modello con:
 rostopic hz /lane_mask
 ```
 
-E imposta `control_rate_hz` ≤ FPS_modello + 5.
+E imposta `control_rate_hz` ≤ FPS_modello + 5 (vedi sezione "Tuning consigliato per Jetson Nano 4GB" più sotto).
+
+## Calibrazione dinamica della larghezza corsia
+
+Il controller misura continuamente la distanza fra linea sinistra e destra
+quando entrambe sono visibili e mantiene una stima EMA della larghezza
+corsia in pixel BEV. Quando poi il robot vede una sola linea (es. è
+sbilanciato lateralmente e l'altra esce dal frame), usa la stima
+dinamica al posto di `lane_width_px` statico per ricostruire il centro
+corsia. Senza questo meccanismo, una `lane_width_px` errata di anche
+solo il 15% rispetto alla pista reale spinge il robot sistematicamente
+fuori centro.
+
+**Quando si attiva**: solo in modalità BEV (`use_bev: true`). Il primo
+frame con due linee valide fa il bootstrap. Ogni nuova misura entra
+nell'EMA se passa due sanity-check:
+
+1. Range assoluto `[lane_width_min_px, lane_width_max_px]` (sempre).
+2. Banda relativa `lane_width_sanity_band` rispetto al valore corrente (solo dopo il bootstrap).
+
+**Disabilitazione**: `lane_width_dynamic_enable: false` → torna al
+comportamento statico (usa sempre `lane_width_px`).
+
+**Verifica dal debug image** (`/lane_debug/image`):
+- In basso a sinistra appare `W=...` (giallo): valore EMA corrente in px.
+- Sotto: `Wm=...` ultima misura grezza, **verde** se accettata nell'EMA, **rosso** se scartata.
+- Sulla riga magenta (quota `center_y`), due tick arancioni a `±W/2` dal centro corsia stimato.
+
+**Tuning**:
+- Se `W` oscilla di ±20px frame su frame → abbassa `lane_width_ema_alpha` (es. 0.05).
+- Se `Wm` è spesso rosso anche su pista buona → allarga `lane_width_sanity_band` (es. 0.35) o ricontrolla i bound assoluti.
+- Se `W=--` permanente → nessuna misura ha mai passato i sanity-check; controlla `lane_width_min_px` / `lane_width_max_px` (sono in pixel **post-`bev_scale`**).
+
+**Scaling con bev_scale**: se imposti `bev_scale: 2.0`, raddoppia
+`lane_width_px`, `lane_width_min_px`, `lane_width_max_px`. Il nodo
+emette un warning a startup se i bound non comprendono `lane_width_px`.
+
+## Tuning consigliato per Jetson Nano 4GB
+
+Con MobileNetV3 + TensorRT esterno il modello produce 20-30 FPS sul
+Jetson Nano 4GB. Valori suggeriti per `lane_params.yaml`:
+
+```yaml
+control_rate_hz: 15        # margine su latenza ROS Melodic (Python 2)
+bev_scale: 1.0             # alzare a 2.0 solo se il Jetson regge ed è davvero utile
+hough_threshold: 50
+hough_min_line_px: 20
+hough_max_gap_px: 20       # su BEV 320×128 un gap di 40 unisce segmenti distanti
+hough_min_length_px: 20
+hough_roi_top_frac: 0.30
+center_y_ratio: 0.50
+lane_fit_mode: "auto"
+angle_smooth_alpha_base: 0.50
+lane_width_ema_alpha: 0.10
+```
+
+Note:
+- `control_rate_hz` deve essere ≤ `FPS_modello`. Con 25 FPS reali, 15 Hz lascia margine alla latenza ROS Melodic su Python 2.
+- `hough_max_gap_px=40` (default storico) su BEV 320×128 può unire segmenti che appartengono a linee diverse: con linee tratteggiate e rumore, 20 è più conservativo.
+- Se la CPU del Jetson è satura, abbassa `publish_debug: false` o `debug_scale: 0.4`.
 
 ## Troubleshooting
 

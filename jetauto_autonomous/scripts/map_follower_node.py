@@ -186,6 +186,7 @@ class MapFollowerCore(object):
 
     def __init__(self, params, map_loader):
         p = params
+        self.enabled              = bool( p.get("enable",               False))
         self.hold_fallback_frames = int(  p.get("hold_fallback_frames", 15))
         self.lane_recovery_frames = int(  p.get("lane_recovery_frames",  5))
         self.lookahead_m          = float(p.get("lookahead_m",          0.50))
@@ -229,6 +230,9 @@ class MapFollowerCore(object):
         twist_or_none       : Twist to publish to cmd_vel, or None
         enable_lane_or_none : bool to publish to /lane_controller/enable, or None
         """
+        if not self.enabled:
+            return False, self.INACTIVE, None, None
+
         is_no_lane    = lane_state in self._NO_LANE_STATES
         is_navigating = nav_status.startswith("NAVIGATING")
         is_junction   = nav_status.startswith("JUNCTION")
@@ -435,6 +439,7 @@ class MapFollowerNode(object):
         rospy.loginfo("[map_follower] Map loaded: %s", ml.stats())
 
         params = {
+            "enable":               rp("enable",               False),
             "hold_fallback_frames": rp("hold_fallback_frames", 15),
             "lane_recovery_frames": rp("lane_recovery_frames",  5),
             "lookahead_m":          rp("lookahead_m",          0.50),
@@ -489,15 +494,21 @@ class MapFollowerNode(object):
         self._publish_state(MapFollowerCore.INACTIVE)
         rospy.on_shutdown(self._on_shutdown)
 
-        rospy.loginfo(
-            "[map_follower] Ready. "
-            "lookahead=%.2f m  speed=%.2f m/s  "
-            "fallback=%d ticks  recovery=%d ticks  rate=%.0f Hz",
-            params["lookahead_m"],
-            params["map_drive_speed"],
-            params["hold_fallback_frames"],
-            params["lane_recovery_frames"],
-            self._rate_hz)
+        if not params["enable"]:
+            rospy.logwarn(
+                "[map_follower] DISABLED (map_follower/enable=false). "
+                "Node is running but will stay INACTIVE. "
+                "Set enable: true in lane_params.yaml to activate map fallback.")
+        else:
+            rospy.loginfo(
+                "[map_follower] Ready. "
+                "lookahead=%.2f m  speed=%.2f m/s  "
+                "fallback=%d ticks  recovery=%d ticks  rate=%.0f Hz",
+                params["lookahead_m"],
+                params["map_drive_speed"],
+                params["hold_fallback_frames"],
+                params["lane_recovery_frames"],
+                self._rate_hz)
 
     # -- Callbacks -------------------------------------------------------------
 

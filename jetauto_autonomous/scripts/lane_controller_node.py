@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-lane_controller_node.py — nodo ROS per il controllo laterale JetAuto.
+lane_controller_node.py - ROS node for JetAuto lateral control.
 
-Tutta la logica pura (Hough, fit, steering) è in lane_core.py.
-Questo file aggiunge soltanto il wiring ROS: rosparam, pub/sub.
+All pure logic (Hough, fit, steering) is in lane_core.py.
+This file only adds ROS wiring: rosparam, pub/sub.
 
-Input:  /lane_mask_bev  (use_bev=true)  o  /lane_mask  (use_bev=false)
+Input:  /lane_mask_bev  (use_bev=true)  or  /lane_mask  (use_bev=false)
 Output: /jetauto_controller/cmd_vel  (Twist)
-        /lane_debug/image            (Image, se publish_debug=true)
+        /lane_debug/image            (Image, if publish_debug=true)
         /lane_controller/state       (String)
 """
 
@@ -37,8 +37,8 @@ class LaneControllerV2Node(LaneControllerCore):
         def rp(key, default):
             return rospy.get_param(ns + key, default)
 
-        # ── Costruisce il dict params e inizializza LaneControllerCore ────────
-        # use_bev è letto prima per impostare il default del topic
+        # -- Build params dict and initialise LaneControllerCore -------------
+        # use_bev is read first to set the default topic
         use_bev = bool(rp("use_bev", True))
 
         params = {
@@ -74,7 +74,7 @@ class LaneControllerV2Node(LaneControllerCore):
         }
         LaneControllerCore.__init__(self, params)
 
-        # ── Parametri ROS-only ────────────────────────────────────────────────
+        # -- ROS-only parameters -----------------------------------------------
         _default_mask = "/lane_mask" if not use_bev else "/lane_mask_bev"
         self.mask_topic   = rp("mask_topic",   _default_mask)
         self.cmd_topic    = rp("cmd_topic",    "/jetauto_controller/cmd_vel")
@@ -88,13 +88,13 @@ class LaneControllerV2Node(LaneControllerCore):
         self.debug_scale   = float(rp("debug_scale",  0.5))
         self.rate_hz       = float(rp("control_rate_hz", 10.0))
 
-        # ── Stato ROS interno ─────────────────────────────────────────────────
+        # -- Internal ROS state ------------------------------------------------
         self.lock          = threading.Lock()
         self.latest_mask   = None
         self.enabled       = False
         self.last_state    = "STOP"
 
-        # ── Publishers / Subscribers ─────────────────────────────────────────
+        # -- Publishers / Subscribers -----------------------------------------
         self.cmd_pub   = rospy.Publisher(self.cmd_topic,   Twist,  queue_size=1)
         self.state_pub = rospy.Publisher(self.state_topic, String, queue_size=1, latch=True)
         if self.publish_debug:
@@ -103,7 +103,7 @@ class LaneControllerV2Node(LaneControllerCore):
         rospy.Subscriber(self.mask_topic,   Image, self._mask_cb,   queue_size=1, buff_size=2**20)
         rospy.Subscriber(self.enable_topic, Bool,  self._enable_cb, queue_size=1)
 
-        rospy.loginfo("[lane_ctrl_v2] avviato. mask=%s  drive=%s  max_steer=%.1f  "
+        rospy.loginfo("[lane_ctrl_v2] started. mask=%s  drive=%s  max_steer=%.1f  "
                       "use_bev=%s  bev_scale=%.1f  roi_top=%.0f%%  rate=%.0fHz",
                       self.mask_topic, self.drive_mode, self.max_steer_angle,
                       self.use_bev, self.bev_scale,
@@ -119,21 +119,21 @@ class LaneControllerV2Node(LaneControllerCore):
                           self.lane_width_reset_after)
             if (self.lane_width_max_px < self.lane_width_px * 1.1
                     or self.lane_width_min_px > self.lane_width_px * 0.9):
-                rospy.logwarn("[lane_ctrl_v2] lane_width_min/max_px non comprende "
-                              "lane_width_px=%.0f. Hai cambiato bev_scale senza "
-                              "scalare i bound?", self.lane_width_px)
+                rospy.logwarn("[lane_ctrl_v2] lane_width_min/max_px does not include "
+                              "lane_width_px=%.0f. Did you change bev_scale without "
+                              "scaling the bounds?", self.lane_width_px)
 
-    # ── Override logging ──────────────────────────────────────────────────────
+    # -- Override logging ------------------------------------------------------
 
     def _warn(self, msg):
         rospy.logwarn_throttle(2.0, msg)
 
-    # ── Callbacks ─────────────────────────────────────────────────────────────
+    # -- Callbacks -------------------------------------------------------------
 
     def _mask_cb(self, msg):
         try:
             mask = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width))
-            mask = mask.copy()  # np.frombuffer ritorna read-only
+            mask = mask.copy()  # np.frombuffer returns a read-only buffer
         except Exception as e:
             rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] mask decode: %s" % e)
             return
@@ -141,7 +141,7 @@ class LaneControllerV2Node(LaneControllerCore):
             is_first = self.latest_mask is None
             self.latest_mask = mask
         if is_first:
-            rospy.loginfo("[lane_ctrl_v2] prima maschera ricevuta: shape=%s", mask.shape)
+            rospy.loginfo("[lane_ctrl_v2] first mask received: shape=%s", mask.shape)
 
     def _enable_cb(self, msg):
         self.enabled = bool(msg.data)
@@ -155,7 +155,7 @@ class LaneControllerV2Node(LaneControllerCore):
             self.state_pub.publish(String(data=s))
             self.last_state = s
 
-    # ── Twist output ─────────────────────────────────────────────────────────
+    # -- Twist output ---------------------------------------------------------
 
     def _steering_to_twist(self, steering_angle):
         norm  = steering_angle / self.max_steer_angle
@@ -169,7 +169,7 @@ class LaneControllerV2Node(LaneControllerCore):
                                     -self.max_angular_z, self.max_angular_z)
         return twist
 
-    # ── Debug image ───────────────────────────────────────────────────────────
+    # -- Debug image -----------------------------------------------------------
 
     def _publish_debug_image(self, info, steering, twist):
         mask       = info["mask"]
@@ -260,7 +260,7 @@ class LaneControllerV2Node(LaneControllerCore):
         except Exception as e:
             rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] debug publish: %s" % e)
 
-    # ── Step principale ───────────────────────────────────────────────────────
+    # -- Principal Step -------------------------------------------------------
 
     def _step(self):
         with self.lock:
@@ -283,7 +283,7 @@ class LaneControllerV2Node(LaneControllerCore):
         if self.publish_debug:
             self._publish_debug_image(info, steering, twist)
 
-    # ── Spin ──────────────────────────────────────────────────────────────────
+    # -- Spin ------------------------------------------------------------------
 
     def run(self):
         rate = rospy.Rate(self.rate_hz)

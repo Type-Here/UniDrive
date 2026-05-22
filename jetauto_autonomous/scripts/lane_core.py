@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-lane_core.py — logica pura del lane controller, senza dipendenze ROS.
+lane_core.py - pure lane controller logic, no ROS dependencies.
 
-Importabile da:
-  - lane_controller_node.py  (nodo ROS sul robot)
-  - Testing/offline_tester.py (test offline su Mac, senza ROS)
+Importable from:
+  - lane_controller_node.py  (ROS node on the robot)
+  - Testing/offline_tester.py (offline testing on Mac, without ROS)
 
-La classe LaneControllerCore riceve i parametri come dict Python
-(le chiavi corrispondono ai nomi in lane_params.yaml sotto lane_controller:).
+The LaneControllerCore class receives parameters as a Python dict
+(keys match the names in lane_params.yaml under lane_controller:).
 """
 from __future__ import print_function
 import math
@@ -18,13 +18,13 @@ import cv2
 import numpy as np
 
 
-# Colori BGR per classe segmentation (usati da _make_colored_mask e dal debug)
+# BGR colors per segmentation class (used by _make_colored_mask and debug output)
 CLASS_COLORS = {
-    0: (0,   0,   0),
-    1: (180, 130,  70),
-    2: (0,   255, 255),
-    3: (255, 255,   0),
-    4: (0,   0,   255),
+    0: (0,   0,   0),    # 0 background
+    1: (180, 130,  70),  # 1 road
+    2: (0,   255, 255),  # 2 lane_marking
+    3: (255, 255,   0),  # 3 lane_dashed
+    4: (0,   0,   255),  # 4 zebra
 }
 
 
@@ -34,25 +34,25 @@ def clamp(v, lo, hi):
 
 class LaneControllerCore(object):
     """
-    Logica pura del lane controller: Hough → fit → steering.
+    Pure lane controller logic: Hough -> fit -> steering.
 
-    Instanziare con un dict params (vedere lane_params.yaml per le chiavi).
-    I valori di default corrispondono a quelli del file YAML.
+    Instantiate with a params dict (see lane_params.yaml for keys).
+    Default values match those in the YAML file.
     """
 
     def __init__(self, params):
         p = params
 
-        # ── Modalità BEV ─────────────────────────────────────────────────────
+        # -- BEV mode ----------------------------------------------------------
         self.use_bev   = bool( p.get("use_bev",   True))
         self.bev_scale = float(p.get("bev_scale", 1.0))
 
-        # ── ROI Hough ────────────────────────────────────────────────────────
+        # -- ROI Hough --------------------------------------------------------
         self.hough_roi_top_frac = float(p.get("hough_roi_top_frac", 0.0))
 
-        # ── HoughLinesP ──────────────────────────────────────────────────────
-        # I parametri in px nel YAML sono espressi a bev_scale=1.0 e vengono
-        # moltiplicati per bev_scale qui; hough_threshold (voti) non scala.
+        # -- HoughLinesP ------------------------------------------------------
+        # Pixel parameters in the YAML are expressed at bev_scale=1.0 and are
+        # multiplied by bev_scale here; hough_threshold (votes) does not scale.
         s = self.bev_scale
         self.hough_thresh     = int(  p.get("hough_threshold",     50))
         self.hough_min_line   = max(1, int(round(float(p.get("hough_min_line_px",   20)) * s)))
@@ -61,34 +61,34 @@ class LaneControllerCore(object):
         self.min_valid_points = int(  p.get("min_valid_points",     0))
         self.line_height_ratio = float(p.get("line_height_ratio",  0.8))
 
-        # ── Geometria corsia ─────────────────────────────────────────────────
+        # -- Lane geometry -----------------------------------------------------
         self.lane_width_px            = float(p.get("lane_width_px",              280.0)) * s
         self.center_y_ratio           = float(p.get("center_y_ratio",             0.10))
         self.max_steer_angle          = float(p.get("max_steering_angle",         48.0))
         self.single_line_offset       = float(p.get("single_line_offset",          0.0)) * s
         self.min_distance_from_center = float(p.get("min_distance_from_center",    0.0)) * s
 
-        # ── Fit linee ────────────────────────────────────────────────────────
-        # "linear" retta | "quadratic" parabola | "auto" parabola se >=6 punti
+        # -- Line fit ----------------------------------------------------------
+        # "linear" = line | "quadratic" = parabola | "auto" = parabola if >=6 points
         self.lane_fit_mode = p.get("lane_fit_mode", "auto")
 
-        # ── EMA adattivo ─────────────────────────────────────────────────────
+        # -- Adaptive EMA ------------------------------------------------------
         self.alpha_base  = float(p.get("angle_smooth_alpha_base",  0.65))
         self.alpha_delta = float(p.get("angle_smooth_delta_scale", 8.0))
 
-        # ── Velocità (usate per calcolare angular_z nel return di step()) ────
+        # -- Velocity (used to compute angular_z in step() return value) -------
         self.max_angular_z = float(p.get("max_angular_z",  0.80))
         self.linear_x      = float(p.get("linear_x_speed", 0.05))
 
-        # ── Class IDs ────────────────────────────────────────────────────────
+        # -- Class IDs --------------------------------------------------------
         self.cls_marking = int(p.get("class_lane_marking", 2))
         self.cls_dashed  = int(p.get("class_lane_dashed",  3))
 
-        # ── Parametri no-BEV ─────────────────────────────────────────────────
+        # -- no-BEV parameters -------------------------------------------------
         self.lane_width_bottom_frac = float(p.get("lane_width_bottom_frac", 0.55))
         self.no_bev_roi_top_frac    = float(p.get("no_bev_roi_top_frac",    0.45))
 
-        # ── Calibrazione dinamica larghezza corsia (solo use_bev=True) ───────
+        # -- Dynamic lane width calibration (only with use_bev=True) -----------
         self.lane_width_dynamic_enable = bool( p.get("lane_width_dynamic_enable", True))
         self.lane_width_ema_alpha      = float(p.get("lane_width_ema_alpha",      0.10))
         self.lane_width_min_px         = float(p.get("lane_width_min_px",         180.0)) * s
@@ -96,7 +96,7 @@ class LaneControllerCore(object):
         self.lane_width_sanity_band    = float(p.get("lane_width_sanity_band",    0.25))
         self.lane_width_reset_after    = int(  p.get("lane_width_reset_after",      0))
 
-        # ── Stato interno ────────────────────────────────────────────────────
+        # -- Internal state ----------------------------------------------------
         self.prev_steering = 0.0
         self.dyn_cx        = None
         self.dyn_cx_line   = None
@@ -110,24 +110,24 @@ class LaneControllerCore(object):
         self.last_measured_accepted = False
         self.frames_since_two_lines = 0
 
-        # ── GPU opzionale (cv2.cuda_GpuMat) — stesso pattern di lane_follower.py ─
+        # -- Optional GPU (cv2.cuda_GpuMat) - same pattern as lane_follower.py -
         self._use_cuda = (hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0)
         if self._use_cuda:
             self._gpu_mat            = cv2.cuda_GpuMat()
-            self._gpu_dst            = cv2.cuda_GpuMat()   # dst esplicito per morfologia
+            self._gpu_dst            = cv2.cuda_GpuMat()   # explicit dst for morphology ops
             _k = np.ones((3, 3), np.uint8)
             self._morph_open_filter  = cv2.cuda.createMorphologyFilter(
                 cv2.MORPH_OPEN,  cv2.CV_8UC1, _k)
             self._morph_close_filter = cv2.cuda.createMorphologyFilter(
                 cv2.MORPH_CLOSE, cv2.CV_8UC1, _k)
 
-    # ── Hook di logging (override nella sottoclasse ROS) ─────────────────────
+    # -- Logging hook (override in the ROS subclass) ---------------------------
 
     def _warn(self, msg):
-        """Override in LaneControllerV2Node per usare rospy.logwarn_throttle."""
+        """Override in LaneControllerV2Node to use rospy.logwarn_throttle."""
         pass
 
-    # ── Utilità maschera ─────────────────────────────────────────────────────
+    # -- Mask utilities --------------------------------------------------------
 
     def _get_binary(self, mask):
         return ((mask == self.cls_marking) | (mask == self.cls_dashed)).astype(np.uint8) * 255
@@ -139,7 +139,7 @@ class LaneControllerCore(object):
             colored[mask == cls_id] = color
         return colored
 
-    # ── Pipeline Hough ───────────────────────────────────────────────────────
+    # -- Pipeline Hough -------------------------------------------------------
 
     def _detect_hough(self, bev_binary):
         processed = None
@@ -150,7 +150,7 @@ class LaneControllerCore(object):
                 self._morph_close_filter.apply(self._gpu_dst, self._gpu_mat)
                 processed = self._gpu_mat.download()
             except Exception:
-                pass   # fallback CPU sotto
+                pass   # fall back to CPU below
         if processed is None:
             k         = np.ones((3, 3), np.uint8)
             opened    = cv2.morphologyEx(bev_binary, cv2.MORPH_OPEN,  k)
@@ -172,7 +172,7 @@ class LaneControllerCore(object):
         return np.array(result, dtype=np.int32)
 
     def _separate_lines(self, lines, img_cx):
-        """BEV mode: classifica per slope + posizione rispetto a dyn_cx_line."""
+        """BEV mode: classify by slope + position relative to dyn_cx_line."""
         if lines is None:
             return [], []
         if self.dyn_cx_line is None:
@@ -193,7 +193,7 @@ class LaneControllerCore(object):
         return left_lines, right_lines
 
     def _separate_lines_no_bev(self, lines, img_cx):
-        """no-BEV mode: classifica per posizione x del midpoint (non usa slope)."""
+        """no-BEV mode: classify by midpoint x position (slope not used)."""
         if lines is None:
             return [], []
         left_lines, right_lines = [], []
@@ -206,9 +206,9 @@ class LaneControllerCore(object):
         return left_lines, right_lines
 
     def _lane_width_at_y(self, y, dst_h, dst_w):
-        """Larghezza corsia stimata in px a quota y.
-        BEV: dyn_lane_width se calibrato e abilitato, altrimenti lane_width_px statico.
-        no-BEV: modello prospettivo lineare.
+        """Estimated lane width in px at height y.
+        BEV: dyn_lane_width if calibrated and enabled, otherwise static lane_width_px.
+        no-BEV: linear perspective model.
         """
         if self.use_bev:
             if self.lane_width_dynamic_enable and self.dyn_lane_width is not None:
@@ -217,9 +217,9 @@ class LaneControllerCore(object):
         return self.lane_width_bottom_frac * float(dst_w) * (float(y) / max(float(dst_h), 1.0))
 
     def _update_dyn_lane_width(self, lx, rx):
-        """Aggiorna self.dyn_lane_width via EMA con sanity-check.
-        Bound assoluti sempre; banda relativa solo se gia inizializzato.
-        Restituisce True se la misura e' stata accettata nell'EMA.
+        """Update self.dyn_lane_width via EMA with sanity-check.
+        Absolute bounds always applied; relative band only if already initialised.
+        Returns True if the measurement was accepted into the EMA.
         """
         if lx is None or rx is None:
             return False
@@ -245,9 +245,9 @@ class LaneControllerCore(object):
 
     def _fit_line(self, lines, dst_h):
         """
-        Fit polinomiale sui punti dei segmenti di un lato.
-        Grado: "linear"→1  "quadratic"→2 se ≥3 punti  "auto"→2 se ≥6 punti.
-        Ritorna ([x_bot, y_bot, x_top, y_top], poly) oppure (None, None).
+        Polynomial fit over segment endpoints for one side.
+        Degree: "linear"->1  "quadratic"->2 if ≥3 points  "auto"->2 if ≥6 points.
+        Returns ([x_bot, y_bot, x_top, y_top], poly) or (None, None).
         """
         if not lines:
             return None, None
@@ -291,14 +291,14 @@ class LaneControllerCore(object):
         return x1 + float(target_y - y1) / float(y2 - y1) * (x2 - x1)
 
     def _eval_line(self, poly, line, target_y):
-        """Valuta x a target_y: usa poly se disponibile, altrimenti interpolazione lineare."""
+        """Evaluate x at target_y: use poly if available, else linear interpolation."""
         if poly is not None:
             v = float(np.polyval(poly, target_y))
             return v if np.isfinite(v) else None
         return self._get_x_at_y(line, target_y)
 
     def _validate_lines(self, left_line, right_line, img_cx, dst_h):
-        """Lunghezza >= hough_min_length e almeno min_valid_points check-y corretti."""
+        """Length >= hough_min_length and at least min_valid_points check-y values correct."""
         check_ys = [int(dst_h * 0.3), int(dst_h * 0.5), int(dst_h * 0.7)]
 
         def check(line, side):
@@ -323,12 +323,12 @@ class LaneControllerCore(object):
     def _calc_steering(self, left_line, right_line, poly_l, poly_r,
                        valid_l, valid_r, dst_w, dst_h, roi_top_px):
         """
-        Calcola angolo di sterzata in gradi.
-        1. Campiona a center_y (clamped sopra roi_top_px).
-        2. Scarta linee dal lato sbagliato o troppo vicine al centro.
-        3. lane_center = media L+R, o stima da singola linea con larghezza prospettica.
-        4. Mappa normalizzata → angolo piecewise.
-        5. EMA adattivo.
+        Compute steering angle in degrees.
+        1. Sample at center_y (clamped above roi_top_px).
+        2. Discard lines from the wrong side or too close to center.
+        3. lane_center = average of L+R, or single-line estimate with perspective width.
+        4. Map normalised offset -> piecewise angle.
+        5. Adaptive EMA.
         """
         img_cx   = dst_w / 2.0
         center_y = max(int(dst_h * self.center_y_ratio), roi_top_px)
@@ -338,21 +338,21 @@ class LaneControllerCore(object):
             lx = self._get_x_at_y(left_line, center_y)
             if lx is not None and lx >= img_cx:
                 valid_l = False
-                self._warn("[lane_core] L line crossed center — discarded")
+                self._warn("[lane_core] L line crossed center - discarded")
                 position_check_passed = False
             elif lx is not None and abs(lx - img_cx) < self.min_distance_from_center:
                 valid_l = False
-                self._warn("[lane_core] L line too close to center — discarded")
+                self._warn("[lane_core] L line too close to center - discarded")
                 position_check_passed = False
         if valid_r:
             rx = self._get_x_at_y(right_line, center_y)
             if rx is not None and rx <= img_cx:
                 valid_r = False
-                self._warn("[lane_core] R line crossed center — discarded")
+                self._warn("[lane_core] R line crossed center - discarded")
                 position_check_passed = False
             elif rx is not None and abs(rx - img_cx) < self.min_distance_from_center:
                 valid_r = False
-                self._warn("[lane_core] R line too close to center — discarded")
+                self._warn("[lane_core] R line too close to center - discarded")
                 position_check_passed = False
 
         if not position_check_passed:
@@ -414,24 +414,24 @@ class LaneControllerCore(object):
 
         return steering, lane_center, center_y
 
-    # ── Entry point ──────────────────────────────────────────────────────────
+    # -- Entry point ----------------------------------------------------------
 
     def step(self, mask):
         """
-        Processa una maschera uint8 con class IDs (BEV o raw, dipende da use_bev).
-        Ritorna (steering_deg, angular_z, state, debug_info).
+        Process a uint8 mask with class IDs (BEV or raw, depending on use_bev).
+        Returns (steering_deg, angular_z, state, debug_info).
 
         debug_info keys:
-          mask        → maschera processata (dopo bev_scale) per la visualizzazione
-          left_line   → [x_bot, y_bot, x_top, y_top] o None
-          right_line  → idem
-          valid_l     → bool
-          valid_r     → bool
-          lane_center → float o None
-          center_y    → int (quota di misura)
-          roi_top_px  → int (limite superiore ROI Hough)
+          mask        -> processed mask (after bev_scale) for visualization
+          left_line   -> [x_bot, y_bot, x_top, y_top] or None
+          right_line  -> same
+          valid_l     -> bool
+          valid_r     -> bool
+          lane_center -> float or None
+          center_y    -> int (measurement height)
+          roi_top_px  -> int (Hough ROI upper limit)
         """
-        # Upscaling (INTER_NEAREST preserva class IDs interi)
+        # Upscaling (INTER_NEAREST preserves integer class IDs)
         if self.bev_scale != 1.0:
             if self._use_cuda:
                 new_w = int(mask.shape[1] * self.bev_scale)

@@ -130,21 +130,21 @@
     color: var(--text); padding: 5px 8px; border-radius: 4px; font: inherit;
     transition: border-color .15s, box-shadow .15s;
   }
-  /* Input "in ascolto" di un click sulla mappa */
+  /* Input listening for a click on the map */
   .controls input[type=number].picking {
     border-color: var(--accent);
     box-shadow: 0 0 0 2px rgba(78,161,255,.25);
   }
-  /* Cursore crosshair sulla mappa durante la selezione */
+  /* Crosshair cursor on the map during node selection */
   #mapSvg.picking-mode,
   #mapSvg.picking-mode .node { cursor: crosshair; }
-  /* Bottone calibrazione */
+  /* Calibration button */
   .btn.calib {
     background: #0a0c10; color: var(--teal);
     border: 1px solid var(--teal);
   }
   .btn.calib:hover { background: rgba(45,212,191,.12); }
-  /* Bottone remap */
+  /* Remap button */
   .btn.remap {
     background: #0a0c10; color: var(--yellow);
     border: 1px solid var(--yellow);
@@ -196,8 +196,8 @@
 
       <!-- Topic selector -->
       <div class="topic-selector">
-        <button class="topic-btn" id="btnCamera"  onclick="switchTopic('camera')">📷 Camera raw</button>
-        <button class="topic-btn active" id="btnDebug"   onclick="switchTopic('debug')">🔍 Controller (mask+linea)</button>
+        <button class="topic-btn active" id="btnCamera"  onclick="switchTopic('camera')">📷 Camera raw</button>
+        <button class="topic-btn" id="btnDebug"   onclick="switchTopic('debug')">🔍 Controller (mask+linea)</button>
         <button class="topic-btn" id="btnLfDebug" onclick="switchTopic('lfDebug')">🛤 Follower (BEV+err)</button>
       </div>
 
@@ -251,7 +251,7 @@
       <button class="btn start" id="startBtn">▶ NAVIGA</button>
       <button class="btn stop"  id="stopBtn" title="Annulla navigazione corrente">■ STOP NAV</button>
       <button class="btn calib" id="calibBtn" title="Imposta posizione attuale come origine del nodo Start selezionato">⊕ Calibra</button>
-      <button class="btn remap" id="remapBtn" title="1° click: registra A — guida ~5 nodi — 2° click: registra B e rimappa">🔄 Remap</button>
+      <button class="btn remap" id="remapBtn" title="1° click: registra A - guida ~5 nodi - 2° click: registra B e rimappa">🔄 Remap</button>
     </div>
   </section>
 </main>
@@ -259,7 +259,7 @@
 <script src="vendor/eventemitter2.min.js"></script>
 <script src="vendor/roslib.min.js"></script>
 <script>
-// ─── Config ───────────────────────────────────────────────────────────────────
+// --- Config -------------------------------------------------------------------
 const CONFIG = {
   rosbridge_url:    `ws://__VIDEO_SERVER_IP__:9090`,
   video_server_url: `http://__VIDEO_SERVER_IP__:8080`,
@@ -269,9 +269,9 @@ const CONFIG = {
   topic_lfDebug:    '/lane_follower/debug_image',
 };
 
-let currentTopicMode = 'debug';
+let currentTopicMode = 'camera';
 
-// ─── ROS ──────────────────────────────────────────────────────────────────────
+// --- ROS ----------------------------------------------------------------------
 const ros    = new ROSLIB.Ros({ url: CONFIG.rosbridge_url });
 const connEl = document.getElementById('connStatus');
 
@@ -284,7 +284,7 @@ ros.on('connection', () => {
 ros.on('error', () => { connEl.classList.remove('ok'); connEl.children[1].textContent = 'Error'; });
 ros.on('close', () => { connEl.classList.remove('ok'); connEl.children[1].textContent = 'Disconnected'; });
 
-// ─── Video feed ───────────────────────────────────────────────────────────────
+// --- Video feed ---------------------------------------------------------------
 function topicForMode(mode) {
   if (mode === 'camera')  return CONFIG.topic_camera;
   if (mode === 'lfDebug') return CONFIG.topic_lfDebug;
@@ -310,7 +310,7 @@ function switchTopic(mode) {
 function renderVideo(topic) {
   const wrap  = document.getElementById('videoWrap');
   const label = document.getElementById('videoSourceLabel');
-  // Qualità differenziata per risoluzione: camera 640x420 → 30, debug 320x128 → 65, bev 640x128 → 40
+  // Differentiated quality by resolution: camera 640x420 -> 30, debug 320x128 -> 65, bev 640x128 -> 40
   const QUALITY = {};
   QUALITY[CONFIG.topic_camera]  = 30;
   QUALITY[CONFIG.topic_debug]   = 65;
@@ -318,7 +318,7 @@ function renderVideo(topic) {
   const quality = QUALITY[topic] !== undefined ? QUALITY[topic] : 40;
   const url   = `${CONFIG.video_server_url}/stream?topic=${topic}&type=mjpeg&quality=${quality}`;
   wrap.innerHTML = '';
-  wrap.appendChild(label);                 // rimette il label overlay
+  wrap.appendChild(label);                 // re-attach the overlay label
   const img = document.createElement('img');
   img.alt = 'video feed';
   img.onerror = () => {
@@ -333,7 +333,7 @@ function renderVideo(topic) {
   wrap.appendChild(img);
 }
 
-// ─── Drive enable / disable ───────────────────────────────────────────────────
+// --- Drive enable / disable ---------------------------------------------------
 let laneEnablePub  = null;
 let odomOriginPub  = null;
 let driveEnabled   = false;
@@ -351,7 +351,7 @@ function syncDriveUI(val) {
   else     { el.textContent = '● FERMA';      el.className = 'drive-state stopped'; }
 }
 
-// ─── ROS topics ───────────────────────────────────────────────────────────────
+// --- ROS topics ---------------------------------------------------------------
 let goalPub = null;
 
 function setupTopics() {
@@ -374,7 +374,7 @@ function setupTopics() {
   new ROSLIB.Topic({ ros, name: '/lane_controller/state', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => {
       updateLaneBadge(m.data);
-      // Sincronizza il pulsante drive con lo stato reale del controller
+      // Sync the drive button with the actual controller state
       if (m.data === 'DISABLED') {
         driveEnabled = false; syncDriveUI(false);
       } else if (!driveEnabled && m.data !== 'STOP') {
@@ -398,7 +398,7 @@ function setupTopics() {
     });
 }
 
-// ─── Lane / Nav badges ────────────────────────────────────────────────────────
+// --- Lane / Nav badges --------------------------------------------------------
 const LANE_CLASS = {
   TRACKING_CC:'tracking-cc', TRACKING_DC:'tracking-dc',
   SINGLE_LINE:'single-line', SINGLE_DASHED:'single-dashed',
@@ -416,7 +416,7 @@ function updateLaneBadge(s) {
   b.className   = 'badge ' + (LANE_CLASS[s] || '');
 }
 
-// Ultima posizione del marker impostata dal waypoint manager (null = usa odom)
+// Last marker position set by the waypoint manager (null = use odom)
 let robotFromWaypoint = false;
 
 function updateNavBadge(s) {
@@ -430,8 +430,8 @@ function updateNavBadge(s) {
 
   if (!svgViewBox || !mapData) return;
 
-  // Estratta posizione dal waypoint corrente — fonte di verità per il marker.
-  // Formato status: "NAVIGATING | wp=5 (regular) d=0.12m idx=6/11"
+  // Extracted position from the current waypoint - source of truth for the marker.
+  // Status format: "NAVIGATING | wp=5 (regular) d=0.12m idx=6/11"
   //                 "JUNCTION | rot to 2 err=12.3deg"
   //                 "GOAL_REACHED | last=10"
   const wpMatch   = s.match(/wp=(\d+)/);
@@ -451,11 +451,11 @@ function updateNavBadge(s) {
       }
     }
   } else if (s.startsWith('IDLE') || s.startsWith('DISABLED')) {
-    robotFromWaypoint = false;  // torna a usare l'odom
+    robotFromWaypoint = false;  // fall back to odom
   }
 }
 
-// ─── Odometry ─────────────────────────────────────────────────────────────────
+// --- Odometry -----------------------------------------------------------------
 function updateOdom(msg) {
   const p = msg.pose.pose.position;
   const q = msg.pose.pose.orientation;
@@ -463,11 +463,11 @@ function updateOdom(msg) {
   const siny = 2*(q.w*q.z + q.x*q.y);
   const cosy = 1 - 2*(q.y*q.y + q.z*q.z);
 
-  // Salva posizione raw per la calibrazione
+  // save raw position for calibration
   lastRawOdom.x = p.x;
   lastRawOdom.y = p.y;
 
-  // Posizione calibrata (offset applicato)
+  // calibrated position (offset applied)
   const cx = p.x - odomOffset.x;
   const cy = p.y - odomOffset.y;
 
@@ -478,11 +478,11 @@ function updateOdom(msg) {
   updateRobot(cx, cy);
 }
 
-// ─── Map ──────────────────────────────────────────────────────────────────────
+// --- Map ----------------------------------------------------------------------
 let mapData = null, svgViewBox = null;
 
 async function loadMap() {
-  // Prova prima remap.json (persistenza del workflow Remap)
+  // try remap.json first (Remap workflow persistence)
   try {
     const r = await fetch('remap.json');
     if (r.ok) {
@@ -492,8 +492,8 @@ async function loadMap() {
       document.getElementById('mapFrame').textContent = (mapData.frame || 'odom') + ' ✓remapped';
       return;
     }
-  } catch(e) { /* nessun remap.json disponibile */ }
-  // Fallback: carica map.yaml
+  } catch(e) { /* no remap.json available */ }
+  // fallback: load map.yaml
   try {
     const txt = await (await fetch(CONFIG.map_yaml_url)).text();
     mapData = parseMapYaml(txt);
@@ -548,7 +548,7 @@ function parseMapYaml(text) {
   return {frame, nodes, edges};
 }
 
-// ─── Map node picking (click su input → poi click sul nodo) ──────────────────
+// --- Map node picking (click on input -> then click a map node) ------------------
 // activeField: null | 'start' | 'end'
 let activeField = null;
 
@@ -560,13 +560,13 @@ function setActiveField(field) {
   document.getElementById('mapSvg').classList.toggle('picking-mode', field !== null);
 }
 
-// Quando l'utente clicca su un input, lo attiva per la picking
+// When the user clicks an input field, it activates node picking mode
 ['startInput','endInput'].forEach(id => {
   const el = document.getElementById(id);
   const field = id.replace('Input','');
   el.addEventListener('focus', () => setActiveField(field));
   el.addEventListener('blur',  () => {
-    // Piccolo delay: se il blur è causato da un click sul SVG non disattivare subito
+    // Small delay: if blur is caused by an SVG click, don't deactivate immediately
     setTimeout(() => { if(activeField === field) setActiveField(null); }, 200);
   });
 });
@@ -607,13 +607,13 @@ function renderMap() {
 
   svg.querySelectorAll('.node').forEach(el=>{
     el.addEventListener('mousedown', ev => {
-      // preventDefault evita che il blur sull'input si propaghi prima del click
+      // preventDefault prevents blur on the input from propagating before the click
       ev.preventDefault();
     });
     el.addEventListener('click', ev => {
       const id = el.getAttribute('data-id');
       if (activeField) {
-        // Picking mode: assegna al campo attivo
+        // Picking mode: assign to the active field
         document.getElementById(activeField+'Input').value = id;
         setActiveField(null);
       } else if (ev.shiftKey) {
@@ -626,16 +626,16 @@ function renderMap() {
   });
 }
 
-// ─── Calibrazione posizione robot ─────────────────────────────────────────────
-// odomOffset: offset da sottrarre alla posizione raw per avere il robot
-// visualizzato sul nodo 0. Viene settato al click su "Calibra".
+// --- Robot position calibration -----------------------------------------------
+// odomOffset: offset to subtract from the raw position to place the robot
+// at node 0 on the map. Set when the user clicks "Calibra".
 let odomOffset  = { x: 0, y: 0 };
-let lastRawOdom = { x: 0, y: 0 };   // ultima posizione raw ricevuta da /odom
-let currentPath = [];                // path attivo ricevuto da /waypoint_manager/path
+let lastRawOdom = { x: 0, y: 0 };   // last raw position received from /odom
+let currentPath = [];                // active path received from /waypoint_manager/path
 
-// ─── Route snapping ──────────────────────────────────────────────────────────
-// Proietta (x,y) sul segmento più vicino del path attivo.
-// Come Google Maps: il marker segue la strada, non l'odom grezzo.
+// --- Route snapping ----------------------------------------------------------
+// Project (x,y) onto the nearest segment of the active path.
+// Like Google Maps: the marker follows the road, not the raw odom.
 function snapToPath(x, y) {
   if (!mapData || currentPath.length < 2) return { x, y };
   let bestDist = Infinity, bestX = x, bestY = y;
@@ -654,7 +654,7 @@ function snapToPath(x, y) {
 }
 
 function highlightPath(pathArr) {
-  currentPath = pathArr;   // salva per lo snapping
+  currentPath = pathArr;   // save for path snapping
   const edgeSet=new Set();
   for(let i=0;i<pathArr.length-1;i++){
     edgeSet.add(`${pathArr[i]}-${pathArr[i+1]}`);
@@ -677,7 +677,7 @@ function highlightPath(pathArr) {
   document.getElementById('pathLen').textContent  = len.toFixed(2)+' m';
   document.getElementById('pathCount').textContent = pathArr.length;
   const goalB=document.getElementById('goalBadge');
-  if(pathArr.length){ goalB.style.display=''; goalB.textContent=`GOAL: ${pathArr[0]} → ${pathArr[pathArr.length-1]}`; }
+  if(pathArr.length){ goalB.style.display=''; goalB.textContent=`GOAL: ${pathArr[0]} -> ${pathArr[pathArr.length-1]}`; }
 }
 
 function previewPath(){
@@ -722,7 +722,7 @@ function updateRobot(x, y) {
   m.style.display = '';
 }
 
-// ─── Button handlers ──────────────────────────────────────────────────────────
+// --- Button handlers ----------------------------------------------------------
 document.getElementById('previewBtn').onclick = previewPath;
 
 document.getElementById('startBtn').onclick = () => {
@@ -735,7 +735,7 @@ document.getElementById('startBtn').onclick = () => {
 
 document.getElementById('stopBtn').onclick = () => {
   if(!goalPub) return;
-  goalPub.publish(new ROSLIB.Message({ data: [] })); // goal vuoto → waypoint_manager si ferma
+  goalPub.publish(new ROSLIB.Message({ data: [] })); // empty goal -> waypoint_manager stops
 };
 
 document.getElementById('calibBtn').onclick = () => {
@@ -743,15 +743,15 @@ document.getElementById('calibBtn').onclick = () => {
   const refNode = mapData && mapData.nodes[startId];
   if (!refNode) { alert('Mappa non caricata o nodo Start non valido'); return; }
 
-  // Allinea la posizione raw al nodo Start selezionato
+  // align raw position to the selected Start node
   odomOffset.x = lastRawOdom.x - refNode.x;
   odomOffset.y = lastRawOdom.y - refNode.y;
 
-  // Aggiorna map_follower_node live via topic ROS
+  // update map_follower_node live via ROS topic
   if (odomOriginPub) {
     odomOriginPub.publish(new ROSLIB.Message({ x: odomOffset.x, y: odomOffset.y, z: 0 }));
   }
-  // Persistenza su rosparam (sopravvive al riavvio del nodo)
+  // persist to rosparam (survives node restart)
   new ROSLIB.Param({ ros, name: '/map_follower/odom_origin_x' }).set(odomOffset.x);
   new ROSLIB.Param({ ros, name: '/map_follower/odom_origin_y' }).set(odomOffset.y);
 
@@ -767,12 +767,12 @@ document.getElementById('calibBtn').onclick = () => {
   }, 2000);
 };
 
-// ─── Remap (2-click similarity transform) ─────────────────────────────────────
-// 1° click: registra (odomA, nodeA) — il robot è sul nodo Start selezionato.
-// Guidare manualmente ~5 nodi, aggiornare Start al nodo corrente.
-// 2° click: registra (odomB, nodeB), calcola roto-scala, applica a tutti i nodi.
-// Salva remap.json (dashboard al ricaricamento) e _remapped.yaml (nodi Python).
-let remapState = 0;     // 0 = idle, 1 = in attesa di B
+// --- Remap (2-click similarity transform) -------------------------------------
+// 1st click: register (odomA, nodeA) - the robot is at the selected Start node.
+// Drive manually ~5 nodes, update Start to the current node.
+// 2nd click: register (odomB, nodeB), compute roto-scale, apply to all nodes.
+// Saves remap.json (dashboard on reload) and _remapped.yaml (Python nodes).
+let remapState = 0;     // 0 = idle, 1 = waiting for B
 let remapRefA  = null;  // { odom:{x,y}, node:{x,y}, nodeId:N }
 
 document.getElementById('remapBtn').onclick = () => {
@@ -822,12 +822,12 @@ document.getElementById('remapBtn').onclick = () => {
         btn.style.borderColor = '';
       }, 3000);
     }
-    // On error: applyRemap ha già mostrato l'alert — resta in stato 1 per retry.
+    // On error: applyRemap already showed the alert - stay in state 1 for retry.
   }
 };
 
 function applyRemap(refA, refB) {
-  // Vettore nello spazio mappa (u) e nello spazio odom (v)
+  // Map-space vector (u) and odom-space vector (v)
   const ux = refB.node.x - refA.node.x, uy = refB.node.y - refA.node.y;
   const vx = refB.odom.x - refA.odom.x, vy = refB.odom.y - refA.odom.y;
   const lenU = Math.hypot(ux, uy), lenV = Math.hypot(vx, vy);
@@ -841,14 +841,14 @@ function applyRemap(refA, refB) {
     return false;
   }
 
-  // Trasformazione di similarità 2-D: odom = scale * R(θ) * map + t
+  // 2-D similarity transform: odom = scale * R(θ) * map + t
   const scale = lenV / lenU;
   const theta = Math.atan2(vy, vx) - Math.atan2(uy, ux);
   const cosT  = Math.cos(theta), sinT = Math.sin(theta);
   const tx = refA.odom.x - scale * (cosT * refA.node.x - sinT * refA.node.y);
   const ty = refA.odom.y - scale * (sinT * refA.node.x + cosT * refA.node.y);
 
-  // Applica a tutti i nodi
+  // Apply to all nodes
   const newNodes = {};
   for (const id in mapData.nodes) {
     const n = mapData.nodes[id];
@@ -857,20 +857,20 @@ function applyRemap(refA, refB) {
       y: scale * (sinT * n.x + cosT * n.y) + ty
     };
   }
-  // Le lunghezze degli archi scalano uniformemente
+  // Edge lengths scale uniformly
   const newEdges = mapData.edges.map(e => ({
     from: e.from, to: e.to, length: (e.length || 0) * scale
   }));
 
   mapData.nodes = newNodes;
   mapData.edges = newEdges;
-  // La mappa è ora nel frame odom: reset offset calibrazione
+  // Map is now in the odom frame: reset calibration offset
   odomOffset.x = 0;
   odomOffset.y = 0;
   renderMap();
   document.getElementById('mapFrame').textContent = (mapData.frame || 'odom') + ' ✓remapped';
 
-  // Salva: remap.json (JS al reload) + _remapped.yaml (nodi Python)
+  // Save: remap.json (JS on reload) + _remapped.yaml (Python nodes)
   fetch('/save_remap', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -885,7 +885,7 @@ function applyRemap(refA, refB) {
   return true;
 }
 
-// ─── Init ─────────────────────────────────────────────────────────────────────
+// --- Init ---------------------------------------------------------------------
 loadMap();
 </script>
 </body>

@@ -2,42 +2,42 @@
 # =============================================================================
 # start_all.sh
 # -----------------------------------------------------------------------------
-# Avvia il sistema autonomo di guida JetAuto. Sostituisce dashboard.launch
-# (non usiamo catkin_ws su questo Jetson).
+# Start the JetAuto autonomous driving system. Replaces dashboard.launch
+# (catkin_ws is not used on this Jetson).
 #
-# COSA FA:
-#   1. Verifica che roscore sia attivo
-#   2. Carica i parametri da config/lane_params.yaml in rosparam
-#   3. Avvia in background:
-#        - rosbridge_websocket (porta 9090)
-#        - web_video_server    (porta 8080)
-#        - serve_dashboard.py  (porta 8000)
+# WHAT IT DOES:
+#   1. Check that roscore is running
+#   2. Load parameters from config/lane_params.yaml into rosparam
+#   3. Start in background:
+#        - rosbridge_websocket (port 9090)
+#        - web_video_server    (port 8080)
+#        - serve_dashboard.py  (port 8000)
 #        - lane_controller_node.py
 #        - waypoint_manager_node.py
-#   4. Salva i PID in /tmp/jetauto_autonomous.pids
+#   4. Save PIDs to /tmp/jetauto_autonomous.pids
 #
-# COSA NON FA:
-#   - NON avvia il lane_follower.py del SegFormer (lo lancia il tuo amico
-#     dal suo ambiente conda Python 3.13).
-#   - NON avvia roscore (parte da solo all'accensione del Jetson).
+# WHAT IT DOES NOT DO:
+#   - Does NOT start lane_follower.py for the segmentation models 
+#     (launched from their conda Python 3.6.9 environment).
+#   - Does NOT start roscore (it auto-starts at Jetson boot).
 #
-# UTILIZZO:
-#   ./start_all.sh                # avvia tutto
+# USAGE:
+#   ./start_all.sh                # start everything
 #   ./start_all.sh --camera       # input_mode camera (default)
-#   ./start_all.sh --bev          # forza input_mode bev_topic
+#   ./start_all.sh --bev          # force input_mode bev_topic
 #
-# Per fermare tutto: ./stop_all.sh
+# To stop everything: ./stop_all.sh
 # =============================================================================
 
 set -e
 
-# Path del progetto (la directory dove vive questo script)
+# Project path (directory containing this script)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PARAMS_FILE="$SCRIPT_DIR/config/lane_params.yaml"
 MAP_FILE="$SCRIPT_DIR/maps/map_clean-edited_smooth.yaml"
-# Se esiste una versione remappata, usarla (prodotta dal pulsante Remap della dashboard)
+# Use the remapped map if one exists (produced by the dashboard Remap button)
 _REMAP="${MAP_FILE%.yaml}_remapped.yaml"
 if [[ -f "$_REMAP" ]]; then
   MAP_FILE="$_REMAP"
@@ -48,11 +48,11 @@ SCRIPTS_DIR="$SCRIPT_DIR/scripts"
 PID_FILE="/tmp/jetauto_autonomous.pids"
 LOG_DIR="/tmp/jetauto_autonomous_logs"
 
-# Interprete Python: usiamo python2 perché ROS Melodic vive lì
-# (Python 3.13 conda è il setup del SegFormer ed è separato)
+# Python interpreter: python2 because ROS Melodic lives there
+# (Python 3.13 conda is the SegFormer setup and is separate)
 PY="python2"
 
-# ---- Parsing argomenti ----
+# ---- Argument parsing ----
 INPUT_MODE_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,7 +61,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       grep '^#' "$0" | sed 's/^# \?//' | head -40
       exit 0 ;;
-    *) echo "Argomento sconosciuto: $1"; exit 1 ;;
+    *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
 
@@ -75,77 +75,77 @@ echo "  MAP        : $MAP_FILE"
 echo "  Python     : $PY ($($PY --version 2>&1))"
 echo "================================================="
 
-# ---- Pre-check: file e direttori ----
+# ---- Pre-check: files and directories ----
 for f in "$PARAMS_FILE" "$MAP_FILE"; do
   if [[ ! -f "$f" ]]; then
-    echo "ERRORE: file mancante: $f"; exit 1
+    echo "ERROR: missing file: $f"; exit 1
   fi
 done
 for d in "$WEB_DIR" "$SCRIPTS_DIR"; do
   if [[ ! -d "$d" ]]; then
-    echo "ERRORE: directory mancante: $d"; exit 1
+    echo "ERROR: missing directory: $d"; exit 1
   fi
 done
 
-# ---- Pre-check: roscore attivo ----
+# ---- Pre-check: roscore running ----
 if ! pgrep -f rosmaster > /dev/null; then
-  echo "ERRORE: roscore/rosmaster NON è attivo."
-  echo "        Avvialo prima (di solito è auto-startato da systemd)."
-  echo "        Per controllare: pgrep -af rosmaster"
+  echo "ERROR: roscore/rosmaster is NOT running."
+  echo "       Start it first (usually manually from script on dashboard)."
+  echo "       To check: pgrep -af rosmaster"
   exit 1
 fi
-echo "[ok] roscore attivo"
+echo "[ok] roscore running"
 
-# ---- Pre-check: Python ha cv_bridge, rospy, yaml, networkx ----
+# ---- Pre-check: Python has cv_bridge, rospy, yaml, networkx ----
 if ! $PY -c "import rospy, cv_bridge, yaml, networkx" 2>/dev/null; then
-  echo "ERRORE: dipendenze Python mancanti su $PY."
-  echo "        Verifica con: $PY -c \"import rospy, cv_bridge, yaml, networkx\""
-  echo "        Per installarle:"
-  echo "          sudo apt install python-yaml python-networkx"
+  echo "ERROR: missing Python dependencies on $PY."
+  echo "       Check with: $PY -c \"import rospy, cv_bridge, yaml, networkx\""
+  echo "       To install them:"
+  echo "         sudo apt install python-yaml python-networkx"
   exit 1
 fi
-echo "[ok] dipendenze Python OK"
+echo "[ok] Python dependencies OK"
 
-# ---- Cartella log ----
+# ---- Log directory ----
 mkdir -p "$LOG_DIR"
 > "$PID_FILE"
 
-# ---- 1. Carica parametri YAML in rosparam ----
+# ---- 1. Load YAML parameters into rosparam ----
 echo "[1/5] rosparam load $PARAMS_FILE"
 rosparam load "$PARAMS_FILE"
-# Override input_mode se richiesto da CLI
+# Override input_mode if requested via CLI
 if [[ -n "$INPUT_MODE_OVERRIDE" ]]; then
   rosparam set "lane_controller/input_mode" "$INPUT_MODE_OVERRIDE"
   echo "       input_mode override -> $INPUT_MODE_OVERRIDE"
 fi
 
-# ---- Funzione helper per lanciare un processo in bg + log + PID ----
+# ---- Helper function to launch a background process + log + PID ----
 start_proc () {
   local name="$1"; shift
   local logfile="$LOG_DIR/${name}.log"
-  echo "       avvio $name (log: $logfile)"
+  echo "       starting $name (log: $logfile)"
   "$@" > "$logfile" 2>&1 &
   local pid=$!
   echo "$pid $name" >> "$PID_FILE"
   sleep 0.5
   if ! kill -0 "$pid" 2>/dev/null; then
-    echo "ERRORE: $name è morto subito dopo l'avvio. Vedi $logfile"
+    echo "ERROR: $name died immediately after launch. See $logfile"
     tail -20 "$logfile"
     exit 1
   fi
 }
 
-# ---- 2. rosbridge_websocket (porta 9090) ----
+# ---- 2. rosbridge_websocket (port 9090) ----
 echo "[2/5] rosbridge_websocket"
 start_proc rosbridge \
   rosrun rosbridge_server rosbridge_websocket _port:=9090
 
-# ---- 3. web_video_server (porta 8080) ----
+# ---- 3. web_video_server (port 8080) ----
 echo "[3/5] web_video_server"
 start_proc web_video_server \
   rosrun web_video_server web_video_server _port:=8080
 
-# ---- 4. dashboard HTTP (porta 8000) ----
+# ---- 4. dashboard HTTP (port 8000) ----
 echo "[4/5] serve_dashboard"
 start_proc dashboard_http \
   $PY "$SCRIPTS_DIR/serve_dashboard.py" \
@@ -153,12 +153,12 @@ start_proc dashboard_http \
        --web-dir "$WEB_DIR" \
        --map "$MAP_FILE"
 
-# ---- 5. nodi nostri ----
+# ---- 5. our nodes ----
 echo "[5/6] lane_controller"
 start_proc lane_controller \
   $PY "$SCRIPTS_DIR/lane_controller_node.py"
 
-# Override del path mappa (per evitare $(find ...))
+# Override map path (to avoid using $(find ...))
 rosparam set "waypoint_manager/map_file" "$MAP_FILE"
 
 echo "[6/6] waypoint_manager + map_follower"
@@ -168,10 +168,10 @@ start_proc waypoint_manager \
 start_proc map_follower \
   $PY "$SCRIPTS_DIR/map_follower_node.py"
 
-# ---- Riepilogo ----
+# ---- Summary ----
 echo
 echo "================================================="
-echo "  Tutto avviato!"
+echo "  All services started!"
 echo "================================================="
 echo "  Dashboard web:  http://$(hostname -I | awk '{print $1}'):8000"
 echo "  Video stream:   http://$(hostname -I | awk '{print $1}'):8080"
@@ -180,11 +180,12 @@ echo
 echo "  Logs:           $LOG_DIR/"
 echo "  PID file:       $PID_FILE"
 echo
-echo "  Per fermare tutto: ./stop_all.sh"
-echo "  Per guardare un log: tail -f $LOG_DIR/lane_controller.log"
+echo "  To stop everything: ./stop_all.sh"
+echo "  To watch a log: tail -f $LOG_DIR/lane_controller.log"
 echo "================================================="
 echo
-echo "RICORDA: il lane_follower.py del modello va lanciato"
-echo "         separatamente nel suo ambiente conda Python x.x."
-echo "         Senza di lui, /lane_mask non viene pubblicato e il"
-echo "         lane_controller resta in stato STOP."
+echo "REMINDER: lane_follower.py must be started separately"
+echo "          in its conda Python 3.6.9 environment."
+echo "          Without it, /lane_mask and /lane_mask_bev"
+echo "          is not published and lane_controller"
+echo "          stays in STOP state."

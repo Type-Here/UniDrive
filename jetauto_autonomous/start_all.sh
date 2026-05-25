@@ -37,12 +37,6 @@ cd "$SCRIPT_DIR"
 
 PARAMS_FILE="$SCRIPT_DIR/config/lane_params.yaml"
 MAP_FILE="$SCRIPT_DIR/maps/map_clean-edited_smooth.yaml"
-# Use the remapped map if one exists (produced by the dashboard Remap button)
-_REMAP="${MAP_FILE%.yaml}_remapped.yaml"
-if [[ -f "$_REMAP" ]]; then
-  MAP_FILE="$_REMAP"
-fi
-unset _REMAP
 WEB_DIR="$SCRIPT_DIR/web"
 SCRIPTS_DIR="$SCRIPT_DIR/scripts"
 PID_FILE="/tmp/jetauto_autonomous.pids"

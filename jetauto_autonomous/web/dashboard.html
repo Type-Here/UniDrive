@@ -150,6 +150,20 @@
     border: 1px solid var(--yellow);
   }
   .btn.remap:hover { background: rgba(246,196,83,.12); }
+  /* Remap info popup */
+  .remap-popup {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 18px 22px; z-index: 100;
+    min-width: 340px; max-width: 440px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.6); font-size: 13px;
+  }
+  .remap-popup h3 { margin: 0 0 10px; font-size: 13px; color: var(--yellow); }
+  .remap-popup ol { padding-left: 18px; margin: 0 0 12px; }
+  .remap-popup li { margin: 5px 0; line-height: 1.5; }
+  .remap-popup b  { color: var(--text); }
+  .remap-overlay  { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 99; }
 
   /* Buttons */
   .btn { border: none; padding: 7px 16px; border-radius: 4px; font-weight: 600; font-size: 13px; cursor: pointer; transition: opacity .15s; }
@@ -251,10 +265,26 @@
       <button class="btn start" id="startBtn">▶ NAVIGA</button>
       <button class="btn stop"  id="stopBtn" title="Annulla navigazione corrente">■ STOP NAV</button>
       <button class="btn calib" id="calibBtn" title="Imposta posizione attuale come origine del nodo Start selezionato">⊕ Calibra</button>
-      <button class="btn remap" id="remapBtn" title="1° click: registra A - guida ~5 nodi - 2° click: registra B e rimappa">🔄 Remap</button>
+      <button class="btn remap" id="remapBtn" title="Guida automaticamente 5 nodi avanti e calibra rotazione + scala">🔄 Remap</button>
+      <button class="btn ghost" id="remapInfoBtn" style="padding:7px 10px;" title="Come usare Remap">ⓘ</button>
     </div>
   </section>
 </main>
+
+<div class="remap-overlay" id="remapOverlay" style="display:none" onclick="toggleRemapInfo(false)"></div>
+<div class="remap-popup" id="remapInfoPopup" style="display:none">
+  <h3>🔄 Come usare Remap</h3>
+  <ol>
+    <li>Posiziona il robot sul nodo <b>Start</b> (di default nodo 0)</li>
+    <li>Premi <b>⊕ Calibra</b> — il punto blu appare sul nodo</li>
+    <li>Assicurati che il tratto in avanti sia <b>rettilineo per ~5 nodi (~60 cm)</b></li>
+    <li>Premi <b>🔄 Remap</b> — il robot parte automaticamente in avanti</li>
+    <li>Il robot si ferma dopo ~60 cm (failsafe timeout 1.5×)</li>
+    <li>La mappa viene ricalibrata: <b>traslazione + rotazione + scala</b></li>
+    <li><b>⚠ Timeout</b>: odometria lenta o robot fermo — riposiziona e riprova</li>
+  </ol>
+  <button class="btn ghost" onclick="toggleRemapInfo(false)" style="width:100%;margin-top:6px;">✕ Chiudi</button>
+</div>
 
 <script src="vendor/eventemitter2.min.js"></script>
 <script src="vendor/roslib.min.js"></script>
@@ -334,9 +364,10 @@ function renderVideo(topic) {
 }
 
 // --- Drive enable / disable ---------------------------------------------------
-let laneEnablePub  = null;
-let odomOriginPub  = null;
-let driveEnabled   = false;
+let laneEnablePub     = null;
+let remapTransformPub = null;   // std_msgs/Float64MultiArray [theta, scale, tx, ty]
+let remapCmdPub       = null;   // pre-advertised cmd_vel for Remap (avoids advertise latency)
+let driveEnabled      = false;
 
 function setDriveEnabled(val) {
   if (!laneEnablePub) { alert('ROS non connesso'); return; }
@@ -361,8 +392,11 @@ function setupTopics() {
   laneEnablePub = new ROSLIB.Topic({
     ros, name: '/lane_controller/enable', messageType: 'std_msgs/Bool'
   });
-  odomOriginPub = new ROSLIB.Topic({
-    ros, name: '/map_follower/odom_origin', messageType: 'geometry_msgs/Point'
+  remapTransformPub = new ROSLIB.Topic({
+    ros, name: '/remap_transform', messageType: 'std_msgs/Float64MultiArray'
+  });
+  remapCmdPub = new ROSLIB.Topic({
+    ros, name: '/jetauto_controller/cmd_vel', messageType: 'geometry_msgs/Twist'
   });
 
   new ROSLIB.Topic({ ros, name: '/waypoint_manager/status', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
@@ -467,33 +501,21 @@ function updateOdom(msg) {
   lastRawOdom.x = p.x;
   lastRawOdom.y = p.y;
 
-  // calibrated position (offset applied)
-  const cx = p.x - odomOffset.x;
-  const cy = p.y - odomOffset.y;
+  // transform raw odom -> map frame using current calibration/remap transform
+  const mapped = odomToMap(p.x, p.y);
 
-  document.getElementById('odomX').textContent   = cx.toFixed(3);
-  document.getElementById('odomY').textContent   = cy.toFixed(3);
+  document.getElementById('odomX').textContent   = mapped.x.toFixed(3);
+  document.getElementById('odomY').textContent   = mapped.y.toFixed(3);
   document.getElementById('odomYaw').textContent = (Math.atan2(siny,cosy)*180/Math.PI).toFixed(1);
   document.getElementById('odomVx').textContent  = Math.hypot(v.x, v.y).toFixed(3);
-  updateRobot(cx, cy);
+  updateRobot(mapped.x, mapped.y);
 }
 
 // --- Map ----------------------------------------------------------------------
 let mapData = null, svgViewBox = null;
 
 async function loadMap() {
-  // try remap.json first (Remap workflow persistence)
-  try {
-    const r = await fetch('remap.json');
-    if (r.ok) {
-      const d = await r.json();
-      mapData = { frame: d.frame || 'odom', nodes: d.nodes, edges: d.edges };
-      renderMap();
-      document.getElementById('mapFrame').textContent = (mapData.frame || 'odom') + ' ✓remapped';
-      return;
-    }
-  } catch(e) { /* no remap.json available */ }
-  // fallback: load map.yaml
+  // Always load the canonical YAML map (source of truth)
   try {
     const txt = await (await fetch(CONFIG.map_yaml_url)).text();
     mapData = parseMapYaml(txt);
@@ -501,7 +523,19 @@ async function loadMap() {
   } catch(e) {
     document.getElementById('mapSvg').innerHTML =
       `<text x="20" y="40" fill="#f87272">Errore caricamento mappa: ${e}</text>`;
+    return;
   }
+  // Restore persisted transform from a previous Calibra/Remap session
+  try {
+    const r = await fetch('remap_params.json');
+    if (r.ok) {
+      const p = await r.json();
+      if (p && typeof p.theta === 'number') {
+        mapTransform = { theta: p.theta, scale: p.scale || 1, tx: p.tx || 0, ty: p.ty || 0 };
+        document.getElementById('mapFrame').textContent = (mapData.frame || 'odom') + ' ✓remapped';
+      }
+    }
+  } catch(e) { /* no remap_params.json yet */ }
 }
 
 function parseMapYaml(text) {
@@ -627,11 +661,11 @@ function renderMap() {
 }
 
 // --- Robot position calibration -----------------------------------------------
-// odomOffset: offset to subtract from the raw position to place the robot
-// at node 0 on the map. Set when the user clicks "Calibra".
-let odomOffset  = { x: 0, y: 0 };
-let lastRawOdom = { x: 0, y: 0 };   // last raw position received from /odom
-let currentPath = [];                // active path received from /waypoint_manager/path
+// mapTransform: 2D similarity transform  odom = scale * R(θ) * map + t
+// inverse (odomToMap):                   map  = R(-θ) / scale * (odom - t)
+let mapTransform = { theta: 0, scale: 1, tx: 0, ty: 0 };
+let lastRawOdom  = { x: 0, y: 0 };   // last raw position received from /odom
+let currentPath  = [];                // active path received from /waypoint_manager/path
 
 // --- Route snapping ----------------------------------------------------------
 // Project (x,y) onto the nearest segment of the active path.
@@ -743,17 +777,14 @@ document.getElementById('calibBtn').onclick = () => {
   const refNode = mapData && mapData.nodes[startId];
   if (!refNode) { alert('Mappa non caricata o nodo Start non valido'); return; }
 
-  // align raw position to the selected Start node
-  odomOffset.x = lastRawOdom.x - refNode.x;
-  odomOffset.y = lastRawOdom.y - refNode.y;
+  // Keep existing theta/scale; update only translation to align odom to this node.
+  const { theta, scale } = mapTransform;
+  const cosT = Math.cos(theta), sinT = Math.sin(theta);
+  mapTransform.tx = lastRawOdom.x - scale * (cosT * refNode.x - sinT * refNode.y);
+  mapTransform.ty = lastRawOdom.y - scale * (sinT * refNode.x + cosT * refNode.y);
+  robotFromWaypoint = false;
 
-  // update map_follower_node live via ROS topic
-  if (odomOriginPub) {
-    odomOriginPub.publish(new ROSLIB.Message({ x: odomOffset.x, y: odomOffset.y, z: 0 }));
-  }
-  // persist to rosparam (survives node restart)
-  new ROSLIB.Param({ ros, name: '/map_follower/odom_origin_x' }).set(odomOffset.x);
-  new ROSLIB.Param({ ros, name: '/map_follower/odom_origin_y' }).set(odomOffset.y);
+  publishAndSaveTransform();
 
   const btn = document.getElementById('calibBtn');
   const orig = btn.textContent;
@@ -767,123 +798,169 @@ document.getElementById('calibBtn').onclick = () => {
   }, 2000);
 };
 
-// --- Remap (2-click similarity transform) -------------------------------------
-// 1st click: register (odomA, nodeA) - the robot is at the selected Start node.
-// Drive manually ~5 nodes, update Start to the current node.
-// 2nd click: register (odomB, nodeB), compute roto-scale, apply to all nodes.
-// Saves remap.json (dashboard on reload) and _remapped.yaml (Python nodes).
-let remapState = 0;     // 0 = idle, 1 = waiting for B
-let remapRefA  = null;  // { odom:{x,y}, node:{x,y}, nodeId:N }
+// --- Remap (auto-drive similarity transform) ----------------------------------
+// Press Remap: robot drives forward REMAP_NODES hops from Start, measures the
+// odom displacement, computes theta+scale+tx+ty non-destructively (mapData.nodes
+// stays in original map-frame coordinates; odomToMap() applies the inverse).
+const REMAP_NODES = 5;
+const REMAP_SPEED = 0.10;   // m/s forward during auto-drive
+let remapState      = 0;    // 0 = idle, 1 = driving
+let remapDriveTimer = null;
+let remapFailTimer  = null;
 
 document.getElementById('remapBtn').onclick = () => {
   if (!mapData) { alert('Mappa non caricata'); return; }
-  const btn = document.getElementById('remapBtn');
+  if (remapState === 1) return;
   const startId = +document.getElementById('startInput').value;
+  const nodeA = mapData.nodes[startId];
+  if (!nodeA) { alert('Nodo Start non valido'); return; }
 
-  if (remapState === 0) {
-    const nodeA = mapData.nodes[startId];
-    if (!nodeA) { alert('Nodo Start non valido'); return; }
-    remapRefA  = { odom: { x: lastRawOdom.x, y: lastRawOdom.y },
-                   node: { x: nodeA.x, y: nodeA.y }, nodeId: startId };
-    remapState = 1;
-    // Force odom-based robot marker (overrides any stale waypoint-navigation state)
-    robotFromWaypoint = false;
-    // Highlight reference node A so the user can judge distance while driving
-    document.querySelectorAll('#mapSvg .node').forEach(el => el.classList.remove('remap-ref'));
-    const refEl = document.querySelector('#mapSvg .node[data-id="' + startId + '"]');
-    if (refEl) refEl.classList.add('remap-ref');
-    btn.textContent       = '📍 Registra B';
-    btn.style.background  = 'rgba(246,196,83,.25)';
-    btn.style.color       = 'var(--yellow)';
-    btn.style.borderColor = 'var(--yellow)';
-
-  } else {
-    const nodeB = mapData.nodes[startId];
-    if (!nodeB) { alert('Nodo Start non valido'); return; }
-
-    // Clear the reference-node highlight regardless of outcome
-    document.querySelectorAll('#mapSvg .node').forEach(el => el.classList.remove('remap-ref'));
-
-    const ok = applyRemap(
-      remapRefA,
-      { odom: { x: lastRawOdom.x, y: lastRawOdom.y },
-        node: { x: nodeB.x, y: nodeB.y }, nodeId: startId }
-    );
-    if (ok) {
-      remapState = 0; remapRefA = null;
-      btn.textContent       = '✓ Remappato';
-      btn.style.background  = 'rgba(54,211,153,.18)';
-      btn.style.color       = 'var(--green)';
-      btn.style.borderColor = 'var(--green)';
-      setTimeout(() => {
-        btn.textContent       = '🔄 Remap';
-        btn.style.background  = '';
-        btn.style.color       = '';
-        btn.style.borderColor = '';
-      }, 3000);
-    }
-    // On error: applyRemap already showed the alert - stay in state 1 for retry.
+  const fwd = findForwardPath(startId, REMAP_NODES);
+  if (fwd.path.length <= REMAP_NODES) {
+    console.log('Remap path too short:', fwd.path + '; ' + fwd.distance.toFixed(2) + 'm; EndId: ' +  fwd.endId);
+    alert('Non ci sono abbastanza nodi in avanti (' + REMAP_NODES + ') dalla Start. Controlla la mappa.');
+    return;
   }
+  const endId    = fwd.endId;
+  const pathDist = fwd.distance;
+  const nodeB    = mapData.nodes[endId];
+  const odomA    = { x: lastRawOdom.x, y: lastRawOdom.y };
+  const nodeAsnap = { x: nodeA.x, y: nodeA.y };
+  const nodeBsnap = { x: nodeB.x, y: nodeB.y };
+  const timeoutMs = (pathDist / REMAP_SPEED) * 1.5 * 1000;
+
+  if (!remapCmdPub) { alert('ROS non connesso'); return; }
+
+  remapState = 1;
+  robotFromWaypoint = false;
+
+  if (laneEnablePub) laneEnablePub.publish(new ROSLIB.Message({ data: false }));
+  const remapRefEl = document.querySelector('#mapSvg .node[data-id="' + startId + '"]');
+  if (remapRefEl) remapRefEl.classList.add('remap-ref');
+
+  const btn = document.getElementById('remapBtn');
+  btn.textContent = '⏳ Guida…';
+  btn.style.background  = 'rgba(246,196,83,.25)';
+  btn.style.color       = 'var(--yellow)';
+  btn.style.borderColor = 'var(--yellow)';
+
+  remapDriveTimer = setInterval(() => {
+    remapCmdPub.publish(new ROSLIB.Message({
+      linear: { x: REMAP_SPEED, y: 0, z: 0 },
+      angular: { x: 0, y: 0, z: 0 }
+    }));
+    if (Math.hypot(lastRawOdom.x - odomA.x, lastRawOdom.y - odomA.y) >= pathDist)
+      finishRemap(odomA, nodeAsnap, nodeBsnap, false);
+  }, 30);
+
+  remapFailTimer = setTimeout(() => {
+    if (remapState === 1) finishRemap(odomA, nodeAsnap, nodeBsnap, true);
+  }, timeoutMs);
 };
 
-function applyRemap(refA, refB) {
-  // Map-space vector (u) and odom-space vector (v)
-  const ux = refB.node.x - refA.node.x, uy = refB.node.y - refA.node.y;
-  const vx = refB.odom.x - refA.odom.x, vy = refB.odom.y - refA.odom.y;
+function finishRemap(odomA, nodeA, nodeB, timedOut) {
+  clearInterval(remapDriveTimer);
+  clearTimeout(remapFailTimer);
+  remapDriveTimer = remapFailTimer = null;
+  remapState = 0;
+  robotFromWaypoint = false;  // always fall back to odom after remap ends
+
+  remapCmdPub.publish(new ROSLIB.Message({ linear:{x:0,y:0,z:0}, angular:{x:0,y:0,z:0} }));
+  if (laneEnablePub) laneEnablePub.publish(new ROSLIB.Message({ data: true }));
+  document.querySelectorAll('#mapSvg .node').forEach(el => el.classList.remove('remap-ref'));
+
+  const odomB = { x: lastRawOdom.x, y: lastRawOdom.y };
+  const ux = nodeB.x - nodeA.x, uy = nodeB.y - nodeA.y;
+  const vx = odomB.x - odomA.x, vy = odomB.y - odomA.y;
   const lenU = Math.hypot(ux, uy), lenV = Math.hypot(vx, vy);
 
-  if (lenU < 0.01) {
-    alert('I nodi A e B sono troppo vicini sulla mappa. Seleziona nodi più distanti.');
-    return false;
-  }
-  if (lenV < 0.05) {
-    alert('Il robot non si è mosso abbastanza. Guida più lontano prima di registrare B.');
-    return false;
+  const btn = document.getElementById('remapBtn');
+  if (lenU < 0.01 || lenV < 0.03) {
+    btn.textContent = '⚠ Remap fallito';
+    btn.style.background  = 'rgba(248,114,114,.18)';
+    btn.style.color       = 'var(--red)';
+    btn.style.borderColor = 'var(--red)';
+    setTimeout(resetRemapBtn, 3000);
+    if (timedOut) alert('Timeout Remap: odometria non cambiata. Riposiziona e riprova.');
+    else          alert('Remap fallito: distanza percorsa troppo piccola (lenV=' + lenV.toFixed(3) + 'm).');
+    return;
   }
 
-  // 2-D similarity transform: odom = scale * R(θ) * map + t
   const scale = lenV / lenU;
   const theta = Math.atan2(vy, vx) - Math.atan2(uy, ux);
   const cosT  = Math.cos(theta), sinT = Math.sin(theta);
-  const tx = refA.odom.x - scale * (cosT * refA.node.x - sinT * refA.node.y);
-  const ty = refA.odom.y - scale * (sinT * refA.node.x + cosT * refA.node.y);
+  mapTransform = {
+    theta, scale,
+    tx: odomA.x - scale * (cosT * nodeA.x - sinT * nodeA.y),
+    ty: odomA.y - scale * (sinT * nodeA.x + cosT * nodeA.y)
+  };
 
-  // Apply to all nodes
-  const newNodes = {};
-  for (const id in mapData.nodes) {
-    const n = mapData.nodes[id];
-    newNodes[id] = {
-      x: scale * (cosT * n.x - sinT * n.y) + tx,
-      y: scale * (sinT * n.x + cosT * n.y) + ty
-    };
-  }
-  // Edge lengths scale uniformly
-  const newEdges = mapData.edges.map(e => ({
-    from: e.from, to: e.to, length: (e.length || 0) * scale
-  }));
-
-  mapData.nodes = newNodes;
-  mapData.edges = newEdges;
-  // Map is now in the odom frame: reset calibration offset
-  odomOffset.x = 0;
-  odomOffset.y = 0;
-  renderMap();
+  publishAndSaveTransform();
   document.getElementById('mapFrame').textContent = (mapData.frame || 'odom') + ' ✓remapped';
 
-  // Save: remap.json (JS on reload) + _remapped.yaml (Python nodes)
-  fetch('/save_remap', {
+  btn.textContent = timedOut ? '⚠ Timeout (parziale)' : '✓ Remappato';
+  btn.style.background  = timedOut ? 'rgba(246,196,83,.25)' : 'rgba(54,211,153,.18)';
+  btn.style.color       = timedOut ? 'var(--yellow)' : 'var(--green)';
+  btn.style.borderColor = timedOut ? 'var(--yellow)' : 'var(--green)';
+  setTimeout(resetRemapBtn, 3000);
+
+  // Stop the car from moving
+  setDriveEnabled(false);
+}
+
+function resetRemapBtn() {
+  const btn = document.getElementById('remapBtn');
+  btn.textContent = '🔄 Remap';
+  btn.style.background = btn.style.color = btn.style.borderColor = '';
+}
+
+function odomToMap(x, y) {
+  const { theta, scale, tx, ty } = mapTransform;
+  if (scale === 0) return { x, y };
+  const cosT = Math.cos(-theta), sinT = Math.sin(-theta);
+  const dx = x - tx, dy = y - ty;
+  return { x: (cosT * dx - sinT * dy) / scale, y: (sinT * dx + cosT * dy) / scale };
+}
+
+function findForwardPath(startId, nHops) {
+  const adj = {};
+  for (const e of mapData.edges) {
+    if (!adj[e.from]) adj[e.from] = [];
+    adj[e.from].push({ to: e.to, length: e.length || 0 });
+  }
+  const path = [startId];
+  let cur = startId, totalLength = 0;
+  for (let i = 0; i < nHops; i++) {
+    const nbrs = adj[cur] || [];
+    if (!nbrs.length) break;
+    const next = nbrs[0];
+    path.push(next.to);
+    totalLength += next.length;
+    cur = next.to;
+  }
+  return { path, endId: cur, distance: totalLength };
+}
+
+function publishAndSaveTransform() {
+  if (remapTransformPub) {
+    remapTransformPub.publish(new ROSLIB.Message({
+      data: [mapTransform.theta, mapTransform.scale, mapTransform.tx, mapTransform.ty]
+    }));
+  }
+  fetch('/save_remap_params', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      nodes: mapData.nodes,
-      edges: mapData.edges,
-      frame: mapData.frame,
-      transform: { theta, scale, tx, ty }
-    })
-  }).catch(e => console.error('[remap] save_remap failed:', e));
-
-  return true;
+    body: JSON.stringify(mapTransform)
+  }).catch(e => console.error('[remap] save_remap_params failed:', e));
 }
+
+function toggleRemapInfo(show) {
+  const popup   = document.getElementById('remapInfoPopup');
+  const overlay = document.getElementById('remapOverlay');
+  const visible = (show === undefined) ? (popup.style.display === 'none') : show;
+  popup.style.display = overlay.style.display = visible ? '' : 'none';
+}
+document.getElementById('remapInfoBtn').onclick = () => toggleRemapInfo();
 
 // --- Init ---------------------------------------------------------------------
 loadMap();

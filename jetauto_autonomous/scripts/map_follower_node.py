@@ -54,9 +54,8 @@ Parameters (rosparam, namespace map_follower/)
     angular_kp            float  1.2     P-gain: heading error -> angular.z
     max_angular_z         float  0.80    clamp (rad/s)
     rate_hz               float  10.0    control loop frequency
-    odom_origin_x         float  0.0     raw odom x that corresponds to map origin
-    odom_origin_y         float  0.0     raw odom y that corresponds to map origin
     map_file              str    (inherits from waypoint_manager/map_file)
+    (transform loaded from ../web/remap_params.json, updated live via /remap_transform)
 
 Usage
 -----
@@ -78,9 +77,9 @@ import sys
 import threading
 
 import rospy
-from geometry_msgs.msg import Point, Twist
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, Int32MultiArray, String
+from std_msgs.msg import Bool, Float64MultiArray, Int32MultiArray, String
 
 # map_loader.py lives in the same directory
 sys.path.insert(0, rospy.get_param(
@@ -450,10 +449,13 @@ class MapFollowerNode(object):
         self._core = MapFollowerCore(params, ml)
         self._lock = threading.Lock()
 
-        # Odom-to-map origin offset (set when user clicks Calibra in dashboard)
-        # Defaults to 0,0 -- works when robot boots at odom origin = map node 0.
-        self._odom_origin_x = float(rp("odom_origin_x", 0.0))
-        self._odom_origin_y = float(rp("odom_origin_y", 0.0))
+        # 2D similarity transform: odom = scale * R(theta) * map + t
+        # Loaded at startup from remap_params.json, updated live via /remap_transform.
+        self._remap_theta = 0.0
+        self._remap_scale = 1.0
+        self._remap_tx    = 0.0
+        self._remap_ty    = 0.0
+        self._load_remap_params()
 
         # Topic names (overrideable via rosparam)
         cmd_topic         = rp("cmd_topic",         "/jetauto_controller/cmd_vel")
@@ -464,7 +466,7 @@ class MapFollowerNode(object):
         path_topic         = rp("path_topic",          "/waypoint_manager/path")
         lane_state_topic   = rp("lane_state_topic",    "/lane_controller/state")
         nav_status_topic   = rp("nav_status_topic",    "/waypoint_manager/status")
-        odom_origin_topic  = rp("odom_origin_topic",   "/map_follower/odom_origin")
+        remap_topic        = rp("remap_topic",         "/remap_transform")
 
         # Publishers
         self._cmd_pub    = rospy.Publisher(cmd_topic,         Twist,  queue_size=1)
@@ -486,8 +488,8 @@ class MapFollowerNode(object):
                          self._path_cb,        queue_size=1)
         rospy.Subscriber(odom_topic,        Odometry,
                          self._odom_cb,        queue_size=5)
-        rospy.Subscriber(odom_origin_topic, Point,
-                         self._odom_origin_cb, queue_size=1)
+        rospy.Subscriber(remap_topic, Float64MultiArray,
+                         self._remap_cb, queue_size=1)
 
         self._rate_hz = float(rp("rate_hz", 10.0))
 
@@ -512,12 +514,37 @@ class MapFollowerNode(object):
 
     # -- Callbacks -------------------------------------------------------------
 
-    def _odom_origin_cb(self, msg):
-        """Live-update the odom-to-map origin offset published by the dashboard Calibra button."""
+    def _load_remap_params(self):
+        """Load persisted transform from ../web/remap_params.json (relative to this script)."""
+        import json as _json
+        import os as _os
+        here  = _os.path.dirname(_os.path.abspath(__file__))
+        fpath = _os.path.join(here, "..", "web", "remap_params.json")
+        try:
+            with open(fpath) as f:
+                p = _json.load(f)
+            self._remap_theta = float(p.get("theta", 0.0))
+            self._remap_scale = float(p.get("scale", 1.0))
+            self._remap_tx    = float(p.get("tx",    0.0))
+            self._remap_ty    = float(p.get("ty",    0.0))
+            rospy.loginfo(
+                "[map_follower] remap_params loaded: theta=%.3f scale=%.3f tx=%.3f ty=%.3f",
+                self._remap_theta, self._remap_scale, self._remap_tx, self._remap_ty)
+        except Exception as e:
+            rospy.loginfo("[map_follower] no remap_params.json (%s), using identity transform", e)
+
+    def _remap_cb(self, msg):
+        """Live-update the similarity transform from /remap_transform [theta, scale, tx, ty]."""
+        if len(msg.data) < 4:
+            return
         with self._lock:
-            self._odom_origin_x = msg.x
-            self._odom_origin_y = msg.y
-        rospy.loginfo("[map_follower] odom_origin updated: (%.3f, %.3f)", msg.x, msg.y)
+            self._remap_theta = float(msg.data[0])
+            self._remap_scale = float(msg.data[1])
+            self._remap_tx    = float(msg.data[2])
+            self._remap_ty    = float(msg.data[3])
+        rospy.loginfo(
+            "[map_follower] remap_transform updated: theta=%.3f scale=%.3f tx=%.3f ty=%.3f",
+            self._remap_theta, self._remap_scale, self._remap_tx, self._remap_ty)
 
     def _lane_cb(self, msg):
         with self._lock:
@@ -535,10 +562,16 @@ class MapFollowerNode(object):
         p   = msg.pose.pose.position
         yaw = _yaw_from_quat(msg.pose.pose.orientation)
         with self._lock:
-            # Subtract odom origin so poses are in the same frame as map coords
+            # Apply inverse similarity transform: map = R(-theta)/scale * (odom - t)
+            theta = self._remap_theta
+            scale = self._remap_scale if self._remap_scale != 0.0 else 1.0
+            cos_t = math.cos(-theta)
+            sin_t = math.sin(-theta)
+            dx = p.x - self._remap_tx
+            dy = p.y - self._remap_ty
             self._core.set_pose(
-                p.x - self._odom_origin_x,
-                p.y - self._odom_origin_y,
+                (cos_t * dx - sin_t * dy) / scale,
+                (sin_t * dx + cos_t * dy) / scale,
                 yaw)
 
     # -- Main loop -------------------------------------------------------------

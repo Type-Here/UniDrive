@@ -31,8 +31,6 @@ import os
 import sys
 import socket
 
-import yaml
-
 try:
     # Python 3
     from http.server import SimpleHTTPRequestHandler, HTTPServer
@@ -96,19 +94,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         return os.path.join(self.web_dir, clean)
 
     def do_POST(self):
-        """Handle POST /save_remap: persist transformed map for JS and Python nodes.
+        """Handle POST /save_remap_params: persist the 2D similarity transform.
 
         Expects a JSON body with keys:
-            nodes     {id_str: {x, y}}   transformed map nodes
-            edges     [{from, to, length}]
-            frame     str                coordinate frame name
-            transform {theta, scale, tx, ty}
+            theta   float   rotation angle (rad)
+            scale   float   scale factor
+            tx      float   translation x
+            ty      float   translation y
 
-        Saves:
-            <web_dir>/remap.json               -- loaded by dashboard.html on reload
-            <map_dir>/<stem>_remapped.yaml      -- used by Python nodes on next start
+        Saves <web_dir>/remap_params.json (loaded by dashboard on next page load
+        and by Python nodes at startup via relative path ../web/remap_params.json).
         """
-        if self.path.split("?", 1)[0] != "/save_remap":
+        if self.path.split("?", 1)[0] != "/save_remap_params":
             self.send_error(404)
             return
 
@@ -120,50 +117,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_error(400, str(exc))
             return
 
-        # 1. remap.json in web_dir (served as static file to the browser)
-        remap_json = os.path.join(self.web_dir, "remap.json")
-        with open(remap_json, "w") as fout:
+        remap_params = os.path.join(self.web_dir, "remap_params.json")
+        with open(remap_params, "w") as fout:
             json.dump(data, fout)
 
-        # 2. _remapped.yaml alongside the original map file
-        map_dir   = os.path.dirname(self.map_file)
-        map_stem  = os.path.splitext(os.path.basename(self.map_file))[0]
-        # Avoid double-suffixing when map_file is already a _remapped.yaml
-        if map_stem.endswith("_remapped"):
-            map_stem = map_stem[:-len("_remapped")]
-        remapped_yaml = os.path.join(map_dir, map_stem + "_remapped.yaml")
-
-        try:
-            with open(self.map_file, "r") as fin:
-                original = yaml.safe_load(fin)
-            frame_id = (original or {}).get("frame_id", "odom")
-        except Exception:
-            frame_id = "odom"
-
-        yaml_nodes = sorted(
-            [{"id": int(k), "x": float(v["x"]), "y": float(v["y"])}
-             for k, v in data["nodes"].items()],
-            key=lambda n: n["id"]
-        )
-        yaml_edges = [
-            {"from": int(e["from"]), "to": int(e["to"]), "length": float(e.get("length", 0))}
-            for e in data["edges"]
-        ]
-        with open(remapped_yaml, "w") as fout:
-            yaml.dump(
-                {"frame_id": frame_id, "nodes": yaml_nodes, "edges": yaml_edges},
-                fout,
-                default_flow_style=False,
-                allow_unicode=True
-            )
-
-        reply = json.dumps({"ok": True, "remap_yaml": remapped_yaml}).encode("utf-8")
+        reply = json.dumps({"ok": True, "file": remap_params}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(reply)))
         self.end_headers()
         self.wfile.write(reply)
-        sys.stderr.write("[dashboard_http] remap saved: %s\n" % remapped_yaml)
+        sys.stderr.write("[dashboard_http] remap_params saved: %s\n" % remap_params)
 
     def do_GET(self):
         clean_path = self.path.split("?", 1)[0]
@@ -192,16 +156,7 @@ def main():
     DashboardHandler.web_dir         = os.path.abspath(args.web_dir)
     DashboardHandler.video_server_ip = get_local_ip()
 
-    # Use remapped map if one exists alongside the original
-    abs_map  = os.path.abspath(args.map)
-    map_dir  = os.path.dirname(abs_map)
-    map_stem = os.path.splitext(os.path.basename(abs_map))[0]
-    remapped = os.path.join(map_dir, map_stem + "_remapped.yaml")
-    if os.path.isfile(remapped):
-        DashboardHandler.map_file = remapped
-        print("[dashboard_http] Using remapped map: %s" % remapped)
-    else:
-        DashboardHandler.map_file = abs_map
+    DashboardHandler.map_file = os.path.abspath(args.map)
 
     if not os.path.isdir(DashboardHandler.web_dir):
         print("ERROR: web-dir does not exist: %s" % DashboardHandler.web_dir)

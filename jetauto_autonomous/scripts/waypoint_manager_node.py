@@ -25,7 +25,7 @@ import threading
 import rospy
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool, String, Int32MultiArray
+from std_msgs.msg import Bool, Float64MultiArray, String, Int32MultiArray
 
 from map_loader import MapLoader, NODE_JUNCTION
 
@@ -77,9 +77,17 @@ class WaypointManagerNode(object):
         self.map = MapLoader(self.map_file)
         rospy.loginfo("[waypoint_manager] %s", self.map.stats())
 
+        # 2D similarity transform: odom = scale * R(theta) * map + t
+        # Loaded from remap_params.json at startup, updated live via /remap_transform.
+        self._remap_theta = 0.0
+        self._remap_scale = 1.0
+        self._remap_tx    = 0.0
+        self._remap_ty    = 0.0
+        self._load_remap_params()
+
         # State
         self.lock = threading.Lock()
-        self.pose = None      # (x, y, yaw)
+        self.pose = None      # (x, y, yaw) in MAP frame
         self.path = []        # list of node_id
         self.idx  = 0         # current waypoint index in path
         self.state = self.IDLE
@@ -93,17 +101,61 @@ class WaypointManagerNode(object):
 
         rospy.Subscriber(self.odom_topic, Odometry, self._odom_cb, queue_size=10)
         rospy.Subscriber(self.goal_topic, Int32MultiArray, self._goal_cb, queue_size=1)
+        rospy.Subscriber("/remap_transform", Float64MultiArray, self._remap_cb, queue_size=1)
 
         self._publish_status(self.IDLE, "")
         self._set_lane_enabled(False)
         rospy.loginfo("[waypoint_manager] ready.")
 
+    # ------------------------------------------------------------- helpers: remap
+    def _load_remap_params(self):
+        """Load persisted transform from ../web/remap_params.json."""
+        import json as _json
+        import os as _os
+        here  = _os.path.dirname(_os.path.abspath(__file__))
+        fpath = _os.path.join(here, "..", "web", "remap_params.json")
+        try:
+            with open(fpath) as f:
+                p = _json.load(f)
+            self._remap_theta = float(p.get("theta", 0.0))
+            self._remap_scale = float(p.get("scale", 1.0))
+            self._remap_tx    = float(p.get("tx",    0.0))
+            self._remap_ty    = float(p.get("ty",    0.0))
+            rospy.loginfo(
+                "[waypoint_manager] remap_params loaded: theta=%.3f scale=%.3f tx=%.3f ty=%.3f",
+                self._remap_theta, self._remap_scale, self._remap_tx, self._remap_ty)
+        except Exception as e:
+            rospy.loginfo("[waypoint_manager] no remap_params.json (%s), using identity", e)
+
+    def _remap_cb(self, msg):
+        """Live-update the similarity transform from /remap_transform [theta, scale, tx, ty]."""
+        if len(msg.data) < 4:
+            return
+        self._remap_theta = float(msg.data[0])
+        self._remap_scale = float(msg.data[1])
+        self._remap_tx    = float(msg.data[2])
+        self._remap_ty    = float(msg.data[3])
+        rospy.loginfo(
+            "[waypoint_manager] remap_transform updated: theta=%.3f scale=%.3f tx=%.3f ty=%.3f",
+            self._remap_theta, self._remap_scale, self._remap_tx, self._remap_ty)
+
+    def _odom_to_map(self, x, y):
+        """Apply inverse similarity transform: map = R(-theta)/scale * (odom - t)."""
+        theta = self._remap_theta
+        scale = self._remap_scale if self._remap_scale != 0.0 else 1.0
+        cos_t = math.cos(-theta)
+        sin_t = math.sin(-theta)
+        dx = x - self._remap_tx
+        dy = y - self._remap_ty
+        return (cos_t * dx - sin_t * dy) / scale, (sin_t * dx + cos_t * dy) / scale
+
     # ------------------------------------------------------------- callbacks
     def _odom_cb(self, msg):
         p = msg.pose.pose.position
         yaw = yaw_from_quat(msg.pose.pose.orientation)
+        mx, my = self._odom_to_map(p.x, p.y)
         with self.lock:
-            self.pose = (p.x, p.y, yaw)
+            self.pose = (mx, my, yaw)
 
     def _goal_cb(self, msg):
         if len(msg.data) == 0:

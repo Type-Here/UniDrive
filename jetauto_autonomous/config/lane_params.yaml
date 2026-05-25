@@ -16,9 +16,9 @@ lane_controller:
   enable_topic: "/lane_controller/enable"
 
   # ---- Velocity ---- Validated Velocity linear_x_speed 0.10/0.15 m/s, max_angular_z 0.80/1.20 rad/s
-  linear_x_speed: 0.10   # m/s forward
+  linear_x_speed: 0.15   # m/s forward
   max_linear_y:   0.08   # m/s strafe (mecanum)
-  max_angular_z:  0.80   # rad/s (classic)
+  max_angular_z:  0.90   # rad/s (classic)
 
   # ---- Drive mode ----
   drive_mode: "classic"  # "mecanum" -> linear.y | "classic" -> angular.z
@@ -133,14 +133,12 @@ map_follower:
   max_angular_z: 0.80   # rad/s clamp
 
   # ---- Coordinate frame ----
-  # Raw odom (x, y) that corresponds to map origin (node 0).
-  # Default 0,0 works when the robot boots with odom at origin.
-  # Override these if the robot starts with a non-zero odom reading.
-  odom_origin_x: 0.0
-  odom_origin_y: 0.0
+  # Transform is now managed by remap_params.json (written by the dashboard
+  # Calibra / Remap buttons) and updated live via /remap_transform.
+  # These keys are kept for backward compatibility but are no longer read.
 
   # ---- Rate ----
-  rate_hz: 10.0
+  rate_hz: 25.0
 
   # ---- Topic overrides (leave as default unless needed) ----
   cmd_topic:        "/jetauto_controller/cmd_vel"

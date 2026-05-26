@@ -40,6 +40,7 @@ class MapLoader(object):
         self.frame_id = "odom"
         self.graph = nx.DiGraph()
         self.node_types = {}        # id -> NODE_*
+        self._xy = {}               # id -> (x, y)  — NX 1.x compat (nodes is a method)
         self._load()
 
     # load ------------------------------------------------------------------
@@ -53,12 +54,14 @@ class MapLoader(object):
         for n in data.get("nodes", []):
             nid = int(n["id"])
             self.graph.add_node(nid, x=float(n["x"]), y=float(n["y"]))
+            self._xy[nid] = (float(n["x"]), float(n["y"]))
 
         # Edges
         for e in data.get("edges", []):
             a = int(e["from"])
             b = int(e["to"])
-            length = float(e.get("length", self._euclid(a, b)))
+            # Use explicit check to avoid eager evaluation of _euclid default
+            length = float(e["length"]) if "length" in e else self._euclid(a, b)
             self.graph.add_edge(a, b, length=length, weight=length)
             if self.bidirectional and not self.graph.has_edge(b, a):
                 self.graph.add_edge(b, a, length=length, weight=length)
@@ -66,8 +69,8 @@ class MapLoader(object):
         self._classify_nodes()
 
     def _euclid(self, a, b):
-        ax, ay = self.graph.nodes[a]["x"], self.graph.nodes[a]["y"]
-        bx, by = self.graph.nodes[b]["x"], self.graph.nodes[b]["y"]
+        ax, ay = self._xy[a]
+        bx, by = self._xy[b]
         return math.hypot(ax - bx, ay - by)
 
     def _classify_nodes(self):
@@ -103,8 +106,7 @@ class MapLoader(object):
         return total
 
     def node_xy(self, nid):
-        n = self.graph.nodes[int(nid)]
-        return (n["x"], n["y"])
+        return self._xy[int(nid)]
 
     def node_type(self, nid):
         return self.node_types.get(int(nid), NODE_ISOLATED)
@@ -133,8 +135,8 @@ class MapLoader(object):
     def closest_node(self, x, y):
         """Find the node nearest to a Cartesian coordinate (m)."""
         best, best_d = None, float("inf")
-        for nid, attr in self.graph.nodes(data=True):
-            d = math.hypot(attr["x"] - x, attr["y"] - y)
+        for nid, (nx_, ny_) in self._xy.items():
+            d = math.hypot(nx_ - x, ny_ - y)
             if d < best_d:
                 best_d, best = d, nid
         return best, best_d

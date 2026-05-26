@@ -155,12 +155,9 @@ start_proc lane_controller \
 # Override map path (to avoid using $(find ...))
 rosparam set "waypoint_manager/map_file" "$MAP_FILE"
 
-echo "[6/6] waypoint_manager + map_follower"
+echo "[6/6] waypoint_manager (includes map fallback)"
 start_proc waypoint_manager \
   $PY "$SCRIPTS_DIR/waypoint_manager_node.py"
-
-start_proc map_follower \
-  $PY "$SCRIPTS_DIR/map_follower_node.py"
 
 # ---- Summary ----
 echo

@@ -94,9 +94,9 @@ waypoint_manager:
   cmd_topic: "/jetauto_controller/cmd_vel"
   lane_enable_topic: "/lane_controller/enable"
 
-  waypoint_tolerance: 0.14
+  waypoint_tolerance: 0.25
   junction_slowdown: 0.06
-  junction_radius: 0.20
+  junction_radius: 0.30
   rate_hz: 25
   goal_completion_msg: "GOAL_REACHED"
 
@@ -105,9 +105,11 @@ waypoint_manager:
 # =============================================================================
 map_follower:
   # ---- Master switch ----
-  # false -> node stays INACTIVE forever (pure segmentation, no map fallback)
+  # false -> map fallback disabled (pure segmentation only)
   # true  -> activates pure-pursuit fallback when lane is lost
-  enable: false
+  # Note: map_follower_node.py is no longer a separate process; this is now
+  #       handled inside waypoint_manager_node.py.
+  enable: true
 
   # ---- Trigger / recovery timing ----
   # Number of control ticks (at rate_hz=10 -> 1 tick = 100ms) that lane_controller

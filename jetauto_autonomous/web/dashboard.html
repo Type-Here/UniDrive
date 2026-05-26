@@ -184,7 +184,8 @@
   .node.end        { fill: var(--red);    stroke: #fff; stroke-width: 2; }
   .node.remap-ref  { fill: var(--orange); stroke: #fff; stroke-width: 2; }
   .node-label { fill: #8a93a4; font-size: 7px; pointer-events: none; font-family: monospace; }
-  .robot { fill: var(--accent); stroke: #fff; stroke-width: 1.5; }
+  .robot  { fill: var(--accent); stroke: #fff; stroke-width: 1.5; }
+  .target { fill: var(--orange); stroke: #fff; stroke-width: 1.5; }
 
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
 </style>
@@ -218,8 +219,8 @@
       <!-- Drive enable/disable -->
       <div class="drive-bar">
         <span class="drive-label">Guida autonoma</span>
-        <button class="btn enable"  onclick="setDriveEnabled(true)">▶ AVVIA</button>
-        <button class="btn disable" onclick="setDriveEnabled(false)">■ FERMA</button>
+        <button class="btn enable"  onclick="avvia()">▶ AVVIA</button>
+        <button class="btn disable" onclick="ferma()">■ FERMA</button>
         <span class="drive-state stopped" id="driveState">● FERMA</span>
       </div>
 
@@ -255,12 +256,16 @@
 
     <!-- Waypoint / navigation controls -->
     <div class="controls">
-      <label title="Clicca qui poi clicca un nodo sulla mappa">Start
+      <label title="Nodo corrente del robot — usato come ancora di calibrazione al momento di NAVIGA">Da
         <input type="number" id="startInput" min="0" max="155" value="0" />
       </label>
-      <label title="Clicca qui poi clicca un nodo sulla mappa">End
+      <label title="Clicca qui poi clicca un nodo sulla mappa">A
         <input type="number" id="endInput"   min="0" max="155" value="50" />
       </label>
+      <span style="font-size:11px;color:var(--muted);white-space:nowrap;" title="Nodo stimato dalla posizione odom+trasformata. Inserisci questo come Da prima di NAVIGA.">
+        Vicino: <b id="nearestNodeId">--</b> (<span id="nearestNodeDist">--</span>)
+        <button class="btn ghost" id="useNearestBtn" style="font-size:11px;padding:3px 7px;margin-left:2px;" title="Usa come Da">↑ Da</button>
+      </span>
       <button class="btn ghost" id="previewBtn">Preview</button>
       <button class="btn start" id="startBtn">▶ NAVIGA</button>
       <button class="btn stop"  id="stopBtn" title="Annulla navigazione corrente">■ STOP NAV</button>
@@ -450,17 +455,15 @@ function updateLaneBadge(s) {
   b.className   = 'badge ' + (LANE_CLASS[s] || '');
 }
 
-// Last marker position set by the waypoint manager (null = use odom)
-let robotFromWaypoint = false;
-
 function updateNavBadge(s) {
   const b = document.getElementById('navState');
   b.textContent = 'NAV: ' + s;
-  if      (s.startsWith('NAVIGATING')) b.className = 'badge nav';
-  else if (s.startsWith('JUNCTION'))   b.className = 'badge junction';
-  else if (s.startsWith('GOAL'))       b.className = 'badge done';
-  else if (s.startsWith('ERROR'))      b.className = 'badge stop';
-  else                                  b.className = 'badge';
+  if      (s.startsWith('NAVIGATING'))   b.className = 'badge nav';
+  else if (s.startsWith('JUNCTION'))    b.className = 'badge junction';
+  else if (s.startsWith('MAP_FALLBACK'))b.className = 'badge map-follower';
+  else if (s.startsWith('GOAL'))        b.className = 'badge done';
+  else if (s.startsWith('ERROR'))       b.className = 'badge stop';
+  else                                   b.className = 'badge';
 
   if (!svgViewBox || !mapData) return;
 
@@ -473,23 +476,34 @@ function updateNavBadge(s) {
   const nodeId    = wpMatch   ? +wpMatch[1]   :
                     lastMatch ? +lastMatch[1] : null;
 
-  if (nodeId !== null) {
-    const node = mapData.nodes[nodeId];
-    if (node) {
-      robotFromWaypoint = true;
-      const m = document.getElementById('robotMarker');
-      if (m) {
-        m.setAttribute('cx', svgViewBox.tx(node.x));
-        m.setAttribute('cy', svgViewBox.ty(node.y));
-        m.style.display = '';
+  // Move the orange target marker to the current target waypoint node.
+  // The blue robot marker (robotMarker) always reflects the odom-derived position.
+  const tm = document.getElementById('targetMarker');
+  if (tm) {
+    if (nodeId !== null) {
+      const node = mapData.nodes[nodeId];
+      if (node) {
+        tm.setAttribute('cx', svgViewBox.tx(node.x));
+        tm.setAttribute('cy', svgViewBox.ty(node.y));
+        tm.style.display = '';
       }
+    } else {
+      tm.style.display = 'none';
     }
-  } else if (s.startsWith('IDLE') || s.startsWith('DISABLED')) {
-    robotFromWaypoint = false;  // fall back to odom
   }
 }
 
 // --- Odometry -----------------------------------------------------------------
+function nearestMapNode(mx, my) {
+  if (!mapData) return null;
+  let best = null, bestD = Infinity;
+  for (const [id, n] of Object.entries(mapData.nodes)) {
+    const d = Math.hypot(n.x - mx, n.y - my);
+    if (d < bestD) { bestD = d; best = { id: +id, dist: d }; }
+  }
+  return best;
+}
+
 function updateOdom(msg) {
   const p = msg.pose.pose.position;
   const q = msg.pose.pose.orientation;
@@ -509,6 +523,13 @@ function updateOdom(msg) {
   document.getElementById('odomYaw').textContent = (Math.atan2(siny,cosy)*180/Math.PI).toFixed(1);
   document.getElementById('odomVx').textContent  = Math.hypot(v.x, v.y).toFixed(3);
   updateRobot(mapped.x, mapped.y);
+
+  // Show nearest node estimate — helps user choose correct start before NAVIGA
+  const nn = nearestMapNode(mapped.x, mapped.y);
+  if (nn) {
+    document.getElementById('nearestNodeId').textContent   = nn.id;
+    document.getElementById('nearestNodeDist').textContent = nn.dist.toFixed(2) + ' m';
+  }
 }
 
 // --- Map ----------------------------------------------------------------------
@@ -632,11 +653,12 @@ function renderMap() {
     html+=`<line class="edge" data-from="${e.from}" data-to="${e.to}" x1="${tx(a.x)}" y1="${ty(a.y)}" x2="${tx(b.x)}" y2="${ty(b.y)}"/>`;
   }
   for(const id of ids){
-    const n=mapData.nodes[id], isJ=(deg[id]||0)>4;
+    const n=mapData.nodes[id], isJ=(deg[id]||0)>2;
     html+=`<circle class="node ${isJ?'junction':''}" data-id="${id}" cx="${tx(n.x)}" cy="${ty(n.y)}" r="4"><title>Node ${id} (${n.x.toFixed(2)}, ${n.y.toFixed(2)})</title></circle>`;
     html+=`<text class="node-label" x="${tx(n.x)+5}" y="${ty(n.y)-5}">${id}</text>`;
   }
-  html+=`<circle id="robotMarker" class="robot" cx="0" cy="0" r="6" style="display:none"/>`;
+  html+=`<circle id="robotMarker" class="robot"  cx="0" cy="0" r="6" style="display:none"/>`;
+  html+=`<circle id="targetMarker" class="target" cx="0" cy="0" r="4" style="display:none"/>`;
   svg.innerHTML=html;
 
   svg.querySelectorAll('.node').forEach(el=>{
@@ -744,9 +766,6 @@ function dijkstra(mp,src,dst){
 
 function updateRobot(x, y) {
   if (!svgViewBox) return;
-  // During remap manual drive we always want the free odom position.
-  // Otherwise defer to the waypoint marker while navigating.
-  if (robotFromWaypoint && remapState === 0) return;
   const m = document.getElementById('robotMarker');
   if (!m) return;
   // Skip path-snapping while driving for Remap so the marker moves freely.
@@ -759,17 +778,54 @@ function updateRobot(x, y) {
 // --- Button handlers ----------------------------------------------------------
 document.getElementById('previewBtn').onclick = previewPath;
 
-document.getElementById('startBtn').onclick = () => {
-  if(!goalPub){ alert('ROS non connesso'); return; }
-  goalPub.publish(new ROSLIB.Message({ data: [
-    +document.getElementById('startInput').value,
-    +document.getElementById('endInput').value
-  ]}));
+document.getElementById('useNearestBtn').onclick = () => {
+  const id = document.getElementById('nearestNodeId').textContent;
+  if (id !== '--') document.getElementById('startInput').value = id;
 };
 
+// AVVIA: simple lane-following mode (no route plan).
+// Cancels any active navigation goal first so waypoint_manager releases enable control.
+function avvia() {
+  if (!goalPub) { alert('ROS non connesso'); return; }
+  goalPub.publish(new ROSLIB.Message({ data: [] }));  // cancel any navigation
+  setDriveEnabled(true);
+}
+
+// FERMA: stop lane-following and cancel any active navigation.
+function ferma() {
+  if (goalPub) goalPub.publish(new ROSLIB.Message({ data: [] }));
+  setDriveEnabled(false);
+}
+
+// NAVIGA: send start→end goal to waypoint_manager (handles enable internally).
+// Also, auto-snaps the position transform so the robot appears at the start node:
+// equivalent to pressing Calibra right before sending the goal.  This means
+// "Da" must be the node the robot is physically at right now.
+document.getElementById('startBtn').onclick = () => {
+  if (!goalPub) { alert('ROS non connesso'); return; }
+  const start = +document.getElementById('startInput').value;
+  const end   = +document.getElementById('endInput').value;
+  if (isNaN(start) || isNaN(end)) { alert('Nodi Start/End non validi'); return; }
+  // Snap tx/ty to place robot at the start node (keeps existing theta/scale)
+  const refNode = mapData && mapData.nodes[start];
+  if (refNode) {
+    const { theta, scale } = mapTransform;
+    const cosT = Math.cos(theta), sinT = Math.sin(theta);
+    mapTransform.tx = lastRawOdom.x - scale * (cosT * refNode.x - sinT * refNode.y);
+    mapTransform.ty = lastRawOdom.y - scale * (sinT * refNode.x + cosT * refNode.y);
+    publishAndSaveTransform();
+  }
+  // Release direct enable — waypoint_manager will manage it from here
+  driveEnabled = false;
+  syncDriveUI(false);
+  goalPub.publish(new ROSLIB.Message({ data: [start, end] }));
+};
+
+// STOP NAV: cancel navigation and stop the robot.
 document.getElementById('stopBtn').onclick = () => {
-  if(!goalPub) return;
-  goalPub.publish(new ROSLIB.Message({ data: [] })); // empty goal -> waypoint_manager stops
+  if (!goalPub) return;
+  goalPub.publish(new ROSLIB.Message({ data: [] }));
+  setDriveEnabled(false);
 };
 
 document.getElementById('calibBtn').onclick = () => {
@@ -782,7 +838,6 @@ document.getElementById('calibBtn').onclick = () => {
   const cosT = Math.cos(theta), sinT = Math.sin(theta);
   mapTransform.tx = lastRawOdom.x - scale * (cosT * refNode.x - sinT * refNode.y);
   mapTransform.ty = lastRawOdom.y - scale * (sinT * refNode.x + cosT * refNode.y);
-  robotFromWaypoint = false;
 
   publishAndSaveTransform();
 
@@ -832,7 +887,6 @@ document.getElementById('remapBtn').onclick = () => {
   if (!remapCmdPub) { alert('ROS non connesso'); return; }
 
   remapState = 1;
-  robotFromWaypoint = false;
 
   if (laneEnablePub) laneEnablePub.publish(new ROSLIB.Message({ data: false }));
   const remapRefEl = document.querySelector('#mapSvg .node[data-id="' + startId + '"]');
@@ -863,7 +917,6 @@ function finishRemap(odomA, nodeA, nodeB, timedOut) {
   clearTimeout(remapFailTimer);
   remapDriveTimer = remapFailTimer = null;
   remapState = 0;
-  robotFromWaypoint = false;  // always fall back to odom after remap ends
 
   remapCmdPub.publish(new ROSLIB.Message({ linear:{x:0,y:0,z:0}, angular:{x:0,y:0,z:0} }));
   if (laneEnablePub) laneEnablePub.publish(new ROSLIB.Message({ data: true }));

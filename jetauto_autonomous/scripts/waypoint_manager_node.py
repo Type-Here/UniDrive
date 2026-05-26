@@ -137,7 +137,6 @@ class WaypointManagerNode(object):
         # Step-local counters — only written in _step(), reset on new goal
         self._hold_count = 0   # consecutive HOLD/STOP ticks while in NAV
         self._recv_count = 0   # consecutive non-HOLD ticks while in MAP_FALLBACK
-        self._odom_raw = (0.0, 0.0, 0.0)  # last raw odom (x, y, yaw) before transform
 
         # Publishers
         self.cmd_pub     = rospy.Publisher(self.cmd_topic,    Twist,  queue_size=1)
@@ -215,7 +214,6 @@ class WaypointManagerNode(object):
     def _odom_cb(self, msg):
         p   = msg.pose.pose.position
         yaw = yaw_from_quat(msg.pose.pose.orientation)
-        self._odom_raw = (p.x, p.y, yaw)   # store raw before transform
         mx, my = self._odom_to_map(p.x, p.y)
         # Transform yaw to map frame: map_yaw = odom_yaw - theta
         map_yaw = angle_diff(yaw, self._remap_theta)
@@ -253,25 +251,7 @@ class WaypointManagerNode(object):
             self._publish_status(self.ERROR, str(e))
             return
 
-        # Snap tx/ty so current odom position maps to the start node.
-        # "start" must be the node the robot is physically at right now.
-        # Theta/scale are kept from remap_params (or identity if not calibrated).
-        ox, oy, oyaw = self._odom_raw
-        sx, sy = self.map.node_xy(start)
-        theta = self._remap_theta
-        scale = self._remap_scale if self._remap_scale != 0.0 else 1.0
-        cos_t = math.cos(theta)
-        sin_t = math.sin(theta)
-        self._remap_tx = ox - scale * (cos_t * sx - sin_t * sy)
-        self._remap_ty = oy - scale * (sin_t * sx + cos_t * sy)
-        map_yaw = angle_diff(oyaw, theta)
-        rospy.loginfo(
-            "[waypoint_manager] snap to node %d: odom(%.3f,%.3f) -> map(%.3f,%.3f)  "
-            "new tx=%.3f ty=%.3f",
-            start, ox, oy, sx, sy, self._remap_tx, self._remap_ty)
-
         with self.lock:
-            self.pose  = (sx, sy, map_yaw)   # robot is at start node in map frame
             self.path  = path
             self.idx   = 0
             self.state = self.NAV

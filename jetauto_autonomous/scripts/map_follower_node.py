@@ -1,7 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-map_follower_node.py  --  Map-assisted fallback driving for JetAuto.
+map_follower_node.py  --  SUPERSEDED: logic merged into waypoint_manager_node.py.
+
+This file is kept for reference only.  It is no longer launched by start_all.sh.
+The MapFollowerCore class and all pure-pursuit / remap logic now lives inside
+WaypointManagerNode (MAP_FALLBACK state).  Enable via map_follower/enable: true
+in lane_params.yaml.
+
+Original description: Map-assisted fallback driving for JetAuto.
 
 Automatically activates when the lane controller stays in HOLD state for
 hold_fallback_frames consecutive ticks, meaning no lane markings are

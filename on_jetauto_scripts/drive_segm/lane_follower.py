@@ -568,6 +568,7 @@ class LaneFollowerNode:
         self.publish_masks = args.publish_masks
         self.max_fps = args.max_fps
         self._min_period = (1.0 / args.max_fps) if args.max_fps > 0 else 0.0
+        self.print_debug = args.print_debug
 
         # State
         self.last_error    = 0.0
@@ -765,11 +766,14 @@ class LaneFollowerNode:
                 self.cmd_pub.publish(twist)
 
             elapsed_ms = (time.time() - t0) * 1000
-            rospy.loginfo_throttle(
-                1, "[lane_follower] err=%+.3f ang=%+.3f px=%d fps=%.1f no_lane=%d/%d",
-                error_norm, angular_z, n_pixels,
-                1000.0 / max(elapsed_ms, 1),
-                self.frames_no_lane, self.frames_total)
+            if self.print_debug:
+                rospy.loginfo_throttle(
+                    1, "[lane_follower] err=%+.3f ang=%+.3f px=%d fps=%.1f no_lane=%d/%d",
+                    error_norm, angular_z, n_pixels,
+                    1000.0 / max(elapsed_ms, 1),
+                    self.frames_no_lane, self.frames_total)
+            else:
+                rospy.loginfo_once("[lane_follower] Started Inference")
 
             if self._min_period > 0:
                 remaining = self._min_period - (time.time() - t0)
@@ -868,6 +872,8 @@ def main():
     parser.add_argument("--calibration", help="Path to calibration json file", default="calibration.json")
     parser.add_argument("--max-fps", type=float, default=0.0, dest="max_fps",
                         help="Cap inference rate to this FPS (0 = unlimited)")
+    parser.add_argument("--print-debug", action="store_true", dest="print_debug", default=False,
+                        help="Print debug info (error, angular.z, fps) to console")
 
     # ROS passes extra args -- filter them out
     import rospy

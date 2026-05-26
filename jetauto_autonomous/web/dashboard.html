@@ -276,6 +276,17 @@
   </section>
 </main>
 
+<div id="navConfirmOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:200;align-items:center;justify-content:center">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:22px 26px;max-width:400px;width:90%">
+    <p style="margin:0 0 4px;font-weight:700;font-size:14px;color:var(--text)">Verifica posizione</p>
+    <p id="navConfirmMsg" style="margin:0 0 18px;color:var(--muted);font-size:13px;line-height:1.6"></p>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button id="navConfirmNearest" class="btn start"  style="text-align:left;white-space:nowrap"></button>
+      <button id="navConfirmSnap"    class="btn calib"  style="text-align:left;white-space:nowrap"></button>
+      <button id="navConfirmCancel"  class="btn stop"   style="text-align:left">✕ Annulla</button>
+    </div>
+  </div>
+</div>
 <div class="remap-overlay" id="remapOverlay" style="display:none" onclick="toggleRemapInfo(false)"></div>
 <div class="remap-popup" id="remapInfoPopup" style="display:none">
   <h3>🔄 Come usare Remap</h3>
@@ -304,6 +315,7 @@ const CONFIG = {
   topic_lfDebug:    '/lane_follower/debug_image',
 };
 
+const NAV_CONFIRM_DIST = 0.30;  // m — below this, proceed silently
 let currentTopicMode = 'camera';
 
 // --- ROS ----------------------------------------------------------------------
@@ -797,16 +809,18 @@ function ferma() {
   setDriveEnabled(false);
 }
 
-// NAVIGA: send start→end goal to waypoint_manager (handles enable internally).
-// Also, auto-snaps the position transform so the robot appears at the start node:
-// equivalent to pressing Calibra right before sending the goal.  This means
-// "Da" must be the node the robot is physically at right now.
-document.getElementById('startBtn').onclick = () => {
-  if (!goalPub) { alert('ROS non connesso'); return; }
-  const start = +document.getElementById('startInput').value;
-  const end   = +document.getElementById('endInput').value;
-  if (isNaN(start) || isNaN(end)) { alert('Nodi Start/End non validi'); return; }
-  // Snap tx/ty to place robot at the start node (keeps existing theta/scale)
+// NAVIGA: send start→end goal to waypoint_manager.
+// If the robot's estimated position differs from "Da" by more than NAV_CONFIRM_DIST,
+// shows a confirmation popup so the user can pick the right node or snap and override.
+// NAV_CONFIRM_DIST see above
+
+function _doNavigate(start, end) {
+  driveEnabled = false;
+  syncDriveUI(false);
+  goalPub.publish(new ROSLIB.Message({ data: [start, end] }));
+}
+
+function _snapAndNavigate(start, end) {
   const refNode = mapData && mapData.nodes[start];
   if (refNode) {
     const { theta, scale } = mapTransform;
@@ -815,10 +829,54 @@ document.getElementById('startBtn').onclick = () => {
     mapTransform.ty = lastRawOdom.y - scale * (sinT * refNode.x + cosT * refNode.y);
     publishAndSaveTransform();
   }
-  // Release direct enable — waypoint_manager will manage it from here
-  driveEnabled = false;
-  syncDriveUI(false);
-  goalPub.publish(new ROSLIB.Message({ data: [start, end] }));
+  _doNavigate(start, end);
+}
+
+function hideNavConfirm() {
+  document.getElementById('navConfirmOverlay').style.display = 'none';
+}
+
+document.getElementById('startBtn').onclick = () => {
+  if (!goalPub) { alert('ROS non connesso'); return; }
+  const start = +document.getElementById('startInput').value;
+  const end   = +document.getElementById('endInput').value;
+  if (isNaN(start) || isNaN(end)) { alert('Nodi Start/End non validi'); return; }
+
+  const refNode = mapData && mapData.nodes[start];
+  if (!refNode) { _doNavigate(start, end); return; }
+
+  const mapped      = odomToMap(lastRawOdom.x, lastRawOdom.y);
+  const distToStart = Math.hypot(mapped.x - refNode.x, mapped.y - refNode.y);
+  const nearest     = nearestMapNode(mapped.x, mapped.y);
+
+  if (distToStart <= NAV_CONFIRM_DIST) {
+    // Already close to the declared start — proceed without asking.
+    _doNavigate(start, end);
+    return;
+  }
+
+  // Robot appears far from the entered "Da" node: ask the user.
+  const nearId   = nearest ? nearest.id   : '?';
+  const nearDist = nearest ? nearest.dist.toFixed(2) : '?';
+  document.getElementById('navConfirmMsg').innerHTML =
+    `Posizione stimata: nodo <b>${nearId}</b> (a ${nearDist} m dal robot)<br>` +
+    `Nodo <em>Da</em> impostato: <b>${start}</b> (a ${distToStart.toFixed(2)} m)`;
+  document.getElementById('navConfirmNearest').textContent =
+    '► Inizia da nodo ' + nearId + ' (posizione attuale)';
+  document.getElementById('navConfirmSnap').textContent =
+    '📌 Sono al nodo ' + start + ' — calibra e inizia';
+  document.getElementById('navConfirmOverlay').style.display = 'flex';
+
+  document.getElementById('navConfirmNearest').onclick = () => {
+    hideNavConfirm();
+    document.getElementById('startInput').value = nearId;
+    _doNavigate(nearId, end);          // trust existing calibration
+  };
+  document.getElementById('navConfirmSnap').onclick = () => {
+    hideNavConfirm();
+    _snapAndNavigate(start, end);      // user confirms they ARE at start — snap then go
+  };
+  document.getElementById('navConfirmCancel').onclick = hideNavConfirm;
 };
 
 // STOP NAV: cancel navigation and stop the robot.

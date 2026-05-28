@@ -87,6 +87,7 @@ class LaneControllerV2Node(LaneControllerCore):
         self.publish_debug = bool(rp("publish_debug", True))
         self.debug_scale   = float(rp("debug_scale",  0.5))
         self.rate_hz       = float(rp("control_rate_hz", 10.0))
+        self.enable_log    = bool(rp("enable_log", True))
 
         # -- Internal ROS state ------------------------------------------------
         self.lock          = threading.Lock()
@@ -103,30 +104,34 @@ class LaneControllerV2Node(LaneControllerCore):
         rospy.Subscriber(self.mask_topic,   Image, self._mask_cb,   queue_size=1, buff_size=2**20)
         rospy.Subscriber(self.enable_topic, Bool,  self._enable_cb, queue_size=1)
 
-        rospy.loginfo("[lane_ctrl_v2] started. mask=%s  drive=%s  max_steer=%.1f  "
-                      "use_bev=%s  bev_scale=%.1f  roi_top=%.0f%%  rate=%.0fHz",
-                      self.mask_topic, self.drive_mode, self.max_steer_angle,
-                      self.use_bev, self.bev_scale,
-                      (self.hough_roi_top_frac if self.use_bev
-                       else self.no_bev_roi_top_frac) * 100,
-                      self.rate_hz)
+        if self.enable_log:
+            rospy.loginfo("[lane_ctrl_v2] started. mask=%s  drive=%s  max_steer=%.1f  "
+                          "use_bev=%s  bev_scale=%.1f  roi_top=%.0f%%  rate=%.0fHz",
+                          self.mask_topic, self.drive_mode, self.max_steer_angle,
+                          self.use_bev, self.bev_scale,
+                          (self.hough_roi_top_frac if self.use_bev
+                           else self.no_bev_roi_top_frac) * 100,
+                          self.rate_hz)
 
         if self.use_bev and self.lane_width_dynamic_enable:
-            rospy.loginfo("[lane_ctrl_v2] dyn lane width: ENABLED  alpha=%.2f  "
-                          "range=[%.0f,%.0f]px  band=%.0f%%  reset_after=%d",
-                          self.lane_width_ema_alpha, self.lane_width_min_px,
-                          self.lane_width_max_px, self.lane_width_sanity_band * 100,
-                          self.lane_width_reset_after)
+            if self.enable_log:
+                rospy.loginfo("[lane_ctrl_v2] dyn lane width: ENABLED  alpha=%.2f  "
+                              "range=[%.0f,%.0f]px  band=%.0f%%  reset_after=%d",
+                              self.lane_width_ema_alpha, self.lane_width_min_px,
+                              self.lane_width_max_px, self.lane_width_sanity_band * 100,
+                              self.lane_width_reset_after)
             if (self.lane_width_max_px < self.lane_width_px * 1.1
                     or self.lane_width_min_px > self.lane_width_px * 0.9):
-                rospy.logwarn("[lane_ctrl_v2] lane_width_min/max_px does not include "
-                              "lane_width_px=%.0f. Did you change bev_scale without "
-                              "scaling the bounds?", self.lane_width_px)
+                if self.enable_log:
+                    rospy.logwarn("[lane_ctrl_v2] lane_width_min/max_px does not include "
+                                  "lane_width_px=%.0f. Did you change bev_scale without "
+                                  "scaling the bounds?", self.lane_width_px)
 
     # -- Override logging ------------------------------------------------------
 
     def _warn(self, msg):
-        rospy.logwarn_throttle(2.0, msg)
+        if self.enable_log:
+            rospy.logwarn_throttle(2.0, msg)
 
     # -- Callbacks -------------------------------------------------------------
 
@@ -135,17 +140,19 @@ class LaneControllerV2Node(LaneControllerCore):
             mask = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width))
             mask = mask.copy()  # np.frombuffer returns a read-only buffer
         except Exception as e:
-            rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] mask decode: %s" % e)
+            if self.enable_log:
+                rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] mask decode: %s" % e)
             return
         with self.lock:
             is_first = self.latest_mask is None
             self.latest_mask = mask
-        if is_first:
+        if is_first and self.enable_log:
             rospy.loginfo("[lane_ctrl_v2] first mask received: shape=%s", mask.shape)
 
     def _enable_cb(self, msg):
         self.enabled = bool(msg.data)
-        rospy.loginfo("[lane_ctrl_v2] enable=%s", self.enabled)
+        if self.enable_log:
+            rospy.loginfo("[lane_ctrl_v2] enable=%s", self.enabled)
         if not self.enabled:
             self.cmd_pub.publish(Twist())
             self._publish_state("DISABLED")
@@ -199,9 +206,12 @@ class LaneControllerV2Node(LaneControllerCore):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         cx = dst_w // 2
-        cv2.line(out, (cx, 0), (cx, dst_h), (0, 0, 255), 1)
-        cv2.putText(out, "SX", (cx - 28, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
-        cv2.putText(out, "DX", (cx + 5,  12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+        cv2.line(out, (cx, 0), (cx, dst_h), (100, 100, 100), 1)
+        cv2.putText(out, "SX", (cx - 28, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
+        cv2.putText(out, "DX", (cx + 5,  12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
+        if lane_center is not None:
+            lc_x = int(lane_center)
+            cv2.line(out, (lc_x, 0), (lc_x, dst_h), (0, 0, 255), 2)
 
         if roi_top_px > 0:
             cv2.line(out, (0, roi_top_px), (dst_w - 1, roi_top_px), (0, 165, 255), 1)
@@ -258,7 +268,8 @@ class LaneControllerV2Node(LaneControllerCore):
             msg.data     = out.tobytes()
             self.debug_pub.publish(msg)
         except Exception as e:
-            rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] debug publish: %s" % e)
+            if self.enable_log:
+                rospy.logwarn_throttle(5.0, "[lane_ctrl_v2] debug publish: %s" % e)
 
     # -- Principal Step -------------------------------------------------------
 
@@ -291,7 +302,8 @@ class LaneControllerV2Node(LaneControllerCore):
             try:
                 self._step()
             except Exception as e:
-                rospy.logerr_throttle(2.0, "[lane_ctrl_v2] step err: %s" % e)
+                if self.enable_log:
+                    rospy.logerr_throttle(2.0, "[lane_ctrl_v2] step err: %s" % e)
             rate.sleep()
         self.cmd_pub.publish(Twist())
 

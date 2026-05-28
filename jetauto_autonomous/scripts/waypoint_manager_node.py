@@ -98,10 +98,11 @@ class WaypointManagerNode(object):
         self.cmd_topic       = rospy.get_param(ns + "cmd_topic",         "/jetauto_controller/cmd_vel")
         self.enable_topic    = rospy.get_param(ns + "lane_enable_topic", "/lane_controller/enable")
 
-        self.tol             = float(rospy.get_param(ns + "waypoint_tolerance", 0.25))
-        self.junction_speed  = float(rospy.get_param(ns + "junction_slowdown",  0.08))
-        self.junction_radius = float(rospy.get_param(ns + "junction_radius",    0.30))
-        self.rate_hz         = float(rospy.get_param(ns + "rate_hz",            25))
+        self.tol                 = float(rospy.get_param(ns + "waypoint_tolerance",  0.25))
+        self.junction_speed      = float(rospy.get_param(ns + "junction_slowdown",   0.08))
+        self.junction_radius     = float(rospy.get_param(ns + "junction_radius",     0.30))
+        self.junction_spin_speed = float(rospy.get_param(ns + "junction_spin_speed", 0.40))
+        self.rate_hz             = float(rospy.get_param(ns + "rate_hz",             25))
 
         # Map-follower (pure-pursuit fallback) parameters — namespace map_follower/
         mf = "map_follower/"
@@ -312,9 +313,10 @@ class WaypointManagerNode(object):
             self._publish_status(self.NAV, "exit junction -> %d" % next_id)
             return
 
-        # Still rotating: slight forward motion to avoid spinning in place
-        twist.linear.x  = 0.03
-        twist.angular.z = max(-1.0, min(1.0, 1.5 * err))
+        # Pure in-place spin — mecanum wheels avoid tire slip
+        spd = self.junction_spin_speed
+        twist.linear.x  = 0.0
+        twist.angular.z = max(-spd, min(spd, 1.5 * err))
         self.cmd_pub.publish(twist)
         self._publish_status(self.JUNCTION,
                              "rot to %d err=%.1fdeg" % (next_id, math.degrees(err)))

@@ -47,7 +47,7 @@ lane_controller:
 
   # ---- Lane geometry - values at bev_scale=1.0, auto-scaled by the code ----
   lane_width_px:      252   # lane width in px  [@ 1.0x] (Wm≈504 measured at 2.0x)
-  center_y_ratio:     0.50  # [0=top, 1=bot] measurement point; >= hough_roi_top_frac
+  center_y_ratio:     0.80  # [0=top, 1=bot] measurement point; >= hough_roi_top_frac
   max_steering_angle: 48.0  # maximum steering angle in degrees
   single_line_offset:  0.0  # extra px offset for center estimation (single line)  [@ 1.0x]
   min_distance_from_center: 0.0  # min distance from center in px  [@ 1.0x]
@@ -84,6 +84,7 @@ lane_controller:
   publish_debug: true
   debug_scale:   0.5
   control_rate_hz: 25  # control loop rate in Hz - align with model FPS (25-30)
+  enable_log: true     # false = suppress all [lane_ctrl_v2] runtime log messages
 
 # =============================================================================
 waypoint_manager:
@@ -97,6 +98,7 @@ waypoint_manager:
   waypoint_tolerance: 0.25
   junction_slowdown: 0.06
   junction_radius: 0.30
+  junction_spin_speed: 0.40  # rad/s cap for in-place junction rotation (lower = smoother)
   rate_hz: 25
   goal_completion_msg: "GOAL_REACHED"
 

@@ -72,7 +72,7 @@
     <!-- Waypoint / navigation controls -->
     <div class="controls">
       <label title="Nodo corrente del robot — usato come ancora di calibrazione al momento di NAVIGA">Da
-        <input type="number" id="startInput" min="0" max="31" value="0" />
+        <input type="number" id="startInput" min="0" max="31" value="31" />
       </label>
       <label title="Clicca qui poi clicca un nodo sulla mappa">A
         <input type="number" id="endInput"   min="0" max="31" value="31" />
@@ -85,7 +85,7 @@
       <button class="btn start" id="startBtn">▶ NAVIGA</button>
       <button class="btn stop"  id="stopBtn" title="Annulla navigazione corrente">■ STOP NAV</button>
       <button class="btn calib" id="calibBtn" title="Imposta posizione attuale come origine del nodo Start selezionato">⊕ Calibra</button>
-      <button class="btn remap" id="remapBtn" title="Guida automaticamente 5 nodi avanti e calibra rotazione + scala">🔄 Remap</button>
+      <button class="btn remap" id="remapBtn" title="Guida automaticamente 1 nodo avanti (~45 cm) e calibra rotazione + scala">🔄 Remap</button>
       <button class="btn ghost" id="remapInfoBtn" style="padding:7px 10px;" title="Come usare Remap">ⓘ</button>
     </div>
   </section>
@@ -106,11 +106,11 @@
 <div class="remap-popup" id="remapInfoPopup" style="display:none">
   <h3>🔄 Come usare Remap</h3>
   <ol>
-    <li>Posiziona il robot sul nodo <b>Start</b> (di default nodo 0)</li>
+    <li>Posiziona il robot sul nodo <b>Start</b> (di default nodo 31)</li>
     <li>Premi <b>⊕ Calibra</b> — il punto blu appare sul nodo</li>
-    <li>Assicurati che il tratto in avanti sia <b>rettilineo per ~5 nodi (~60 cm)</b></li>
+    <li>Assicurati che il tratto in avanti sia <b>rettilineo per 1 nodo (~45 cm)</b></li>
     <li>Premi <b>🔄 Remap</b> — il robot parte automaticamente in avanti</li>
-    <li>Il robot si ferma dopo ~60 cm (failsafe timeout 1.5×)</li>
+    <li>Il robot si ferma dopo ~45 cm (failsafe timeout 1.5×)</li>
     <li>La mappa viene ricalibrata: <b>traslazione + rotazione + scala</b></li>
     <li><b>⚠ Timeout</b>: odometria lenta o robot fermo — riposiziona e riprova</li>
   </ol>

@@ -604,7 +604,8 @@ document.getElementById('calibBtn').onclick = () => {
 // Press Remap: robot drives forward REMAP_NODES hops from Start, measures the
 // odom displacement, computes theta+scale+tx+ty non-destructively (mapData.nodes
 // stays in original map-frame coordinates; odomToMap() applies the inverse).
-const REMAP_NODES = 5;
+// 1 hop = node 31 → node 2 (0.45 m straight) — enough to calibrate.
+const REMAP_NODES = 1;
 const REMAP_SPEED = 0.10;   // m/s forward during auto-drive
 let remapState      = 0;    // 0 = idle, 1 = driving
 let remapDriveTimer = null;

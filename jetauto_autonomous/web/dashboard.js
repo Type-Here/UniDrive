@@ -343,7 +343,11 @@ function renderMap() {
   svg.setAttribute('viewBox',`0 0 ${SVG_W} ${SVG_H}`);
   const deg={};
   for(const e of mapData.edges){deg[e.from]=(deg[e.from]||0)+1;deg[e.to]=(deg[e.to]||0)+1;}
+  // Background grid: mg=0.3 is the cell size → 14 cols × 11 rows
   let html='';
+  const nCols=Math.round(W/mg), nRows=Math.round(H/mg);
+  for(let i=0;i<=nCols;i++){const sx=tx(minX+i*mg); html+=`<line class="grid-line" x1="${sx}" y1="0" x2="${sx}" y2="${SVG_H}"/>`;}
+  for(let j=0;j<=nRows;j++){const sy=ty(minY+j*mg); html+=`<line class="grid-line" x1="0" y1="${sy}" x2="${SVG_W}" y2="${sy}"/>`;}
   for(const e of mapData.edges){
     const a=mapData.nodes[e.from],b=mapData.nodes[e.to];
     if(!a||!b) continue;

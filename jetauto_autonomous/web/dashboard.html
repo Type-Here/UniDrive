@@ -72,10 +72,10 @@
     <!-- Waypoint / navigation controls -->
     <div class="controls">
       <label title="Nodo corrente del robot — usato come ancora di calibrazione al momento di NAVIGA">Da
-        <input type="number" id="startInput" min="0" max="155" value="0" />
+        <input type="number" id="startInput" min="0" max="31" value="0" />
       </label>
       <label title="Clicca qui poi clicca un nodo sulla mappa">A
-        <input type="number" id="endInput"   min="0" max="155" value="50" />
+        <input type="number" id="endInput"   min="0" max="31" value="31" />
       </label>
       <span style="font-size:11px;color:var(--muted);white-space:nowrap;" title="Nodo stimato dalla posizione odom+trasformata. Inserisci questo come Da prima di NAVIGA.">
         Vicino: <b id="nearestNodeId">--</b> (<span id="nearestNodeDist">--</span>)

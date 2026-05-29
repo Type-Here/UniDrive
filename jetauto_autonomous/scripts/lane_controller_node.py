@@ -7,9 +7,9 @@ All pure logic (Hough, fit, steering) is in lane_core.py.
 This file only adds ROS wiring: rosparam, pub/sub.
 
 Input:  /lane_mask_bev  (use_bev=true)  or  /lane_mask  (use_bev=false)
-Output: /jetauto_controller/cmd_vel  (Twist)
-        /lane_debug/image            (Image, if publish_debug=true)
-        /lane_controller/state       (String)
+Output: /lane_controller/cmd_vel  (Twist, proposed — forwarded to hardware by orchestrator)
+        /lane_debug/image         (Image, if publish_debug=true)
+        /lane_controller/state    (String)
 """
 
 from __future__ import print_function
@@ -77,7 +77,7 @@ class LaneControllerV2Node(LaneControllerCore):
         # -- ROS-only parameters -----------------------------------------------
         _default_mask = "/lane_mask" if not use_bev else "/lane_mask_bev"
         self.mask_topic   = rp("mask_topic",   _default_mask)
-        self.cmd_topic    = rp("cmd_topic",    "/jetauto_controller/cmd_vel")
+        self.cmd_topic    = rp("cmd_topic",    "/lane_controller/cmd_vel")
         self.debug_topic  = rp("debug_topic",  "/lane_debug/image")
         self.state_topic  = rp("state_topic",  "/lane_controller/state")
         self.enable_topic = rp("enable_topic", "/lane_controller/enable")

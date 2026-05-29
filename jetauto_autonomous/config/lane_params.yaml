@@ -10,7 +10,7 @@
 lane_controller:
   # ---- Topic ----
   mask_topic:   "/lane_mask_bev"
-  cmd_topic:    "/jetauto_controller/cmd_vel"
+  cmd_topic:    "/lane_controller/cmd_vel"   # proposed only; orchestrator forwards to hardware
   debug_topic:  "/lane_debug/image"
   state_topic:  "/lane_controller/state"
   enable_topic: "/lane_controller/enable"
@@ -92,64 +92,31 @@ waypoint_manager:
   odom_topic: "/odom"
   goal_topic: "/waypoint_manager/goal"
   status_topic: "/waypoint_manager/status"
-  cmd_topic: "/jetauto_controller/cmd_vel"
-  lane_enable_topic: "/lane_controller/enable"
-
   waypoint_tolerance: 0.25
-  junction_slowdown: 0.06
-  junction_radius: 0.30
-  junction_spin_speed: 0.40  # rad/s cap for in-place junction rotation (lower = smoother)
   rate_hz: 25
-  goal_completion_msg: "GOAL_REACHED"
 
 # =============================================================================
-# map_follower_node.py  --  map-assisted fallback when lane markings are lost
+# orchestrator — sole publisher of /jetauto_controller/cmd_vel
+# Owns: junction rotation, map fallback, lane/map blending
 # =============================================================================
-map_follower:
-  # ---- Master switch ----
-  # false -> map fallback disabled (pure segmentation only)
-  # true  -> activates pure-pursuit fallback when lane is lost
-  # Note: map_follower_node.py is no longer a separate process; this is now
-  #       handled inside waypoint_manager_node.py.
-  enable: true
-
-  # ---- Trigger / recovery timing ----
-  # Number of control ticks (at rate_hz=10 -> 1 tick = 100ms) that lane_controller
-  # must stay in HOLD before map_follower takes over.
-  hold_fallback_frames: 15   # 1.5 s of no lane before activation
-
-  # Number of consecutive ticks where the lane is visible again before
-  # handing back control to the lane controller.
-  lane_recovery_frames: 5    # 0.5 s of stable lane before recovery
-
-  # ---- Pure-pursuit parameters ----
-  # Lookahead distance (metres). Map nodes are ~12cm apart after smoothing,
-  # so 0.50m ~ 4 nodes ahead. Increase for smoother curves; decrease for
-  # tighter turns.
-  lookahead_m: 0.50
-
-  # Forward speed while in map-follower mode. Keep slower than lane speed
-  # to compensate for reduced steering accuracy.
-  map_drive_speed: 0.04   # m/s
-
-  # Proportional gain: angular.z = Kp * heading_error
-  angular_kp: 1.2
-  max_angular_z: 0.80   # rad/s clamp
-
-  # ---- Coordinate frame ----
-  # Transform is now managed by remap_params.json (written by the dashboard
-  # Calibra / Remap buttons) and updated live via /remap_transform.
-  # These keys are kept for backward compatibility but are no longer read.
-
-  # ---- Rate ----
+orchestrator:
   rate_hz: 25.0
+  stale_timeout: 0.5         # seconds before a stale proposal is treated as zero
 
-  # ---- Topic overrides (leave as default unless needed) ----
-  cmd_topic:        "/jetauto_controller/cmd_vel"
-  lane_enable_topic: "/lane_controller/enable"
-  odom_topic:       "/odom"
-  path_topic:       "/waypoint_manager/path"
-  lane_state_topic: "/lane_controller/state"
-  nav_status_topic: "/waypoint_manager/status"
-  active_topic:     "/map_follower/active"
-  state_topic:      "/map_follower/state"
+  # ---- Blending ----
+  # alpha=0 -> pure lane, alpha=1 -> pure map heading
+  alpha_near_junction: 0.6   # map guardrail when approaching a junction node
+  hold_ramp_ticks: 15        # HOLD ticks before alpha ramps to 1.0 (full fallback)
+  recovery_ticks: 5          # OK ticks before exiting FALLBACK
+
+  # ---- Junction rotation ----
+  junction_radius: 0.30      # m — distance to trigger junction maneuver
+  junction_align_deg: 8.0    # deg — alignment threshold to exit rotation
+  junction_spin_speed: 0.40  # rad/s cap for in-place rotation
+  junction_creep_speed: 0.06 # m/s forward creep after alignment
+
+  # ---- Map pure-pursuit (FALLBACK state) ----
+  lookahead_m: 0.50
+  map_drive_speed: 0.04      # m/s (slower than lane speed)
+  map_kp: 1.2                # angular.z = kp * heading_error
+  map_max_angular: 0.80      # rad/s clamp

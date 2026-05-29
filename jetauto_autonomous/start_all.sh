@@ -148,16 +148,20 @@ start_proc dashboard_http \
        --map "$MAP_FILE"
 
 # ---- 5. our nodes ----
-echo "[5/6] lane_controller"
+echo "[5/7] lane_controller"
 start_proc lane_controller \
   $PY "$SCRIPTS_DIR/lane_controller_node.py"
 
 # Override map path (to avoid using $(find ...))
 rosparam set "waypoint_manager/map_file" "$MAP_FILE"
 
-echo "[6/6] waypoint_manager (includes map fallback)"
+echo "[6/7] waypoint_manager (path-tracker)"
 start_proc waypoint_manager \
   $PY "$SCRIPTS_DIR/waypoint_manager_node.py"
+
+echo "[7/7] orchestrator (sole cmd_vel publisher)"
+start_proc orchestrator \
+  $PY "$SCRIPTS_DIR/orchestrator.py"
 
 # ---- Summary ----
 echo
@@ -172,7 +176,8 @@ echo "  Logs:           $LOG_DIR/"
 echo "  PID file:       $PID_FILE"
 echo
 echo "  To stop everything: ./stop_all.sh"
-echo "  To watch a log: tail -f $LOG_DIR/lane_controller.log"
+echo "  To watch a log: tail -f $LOG_DIR/lane_controller.log
+                  tail -f $LOG_DIR/orchestrator.log"
 echo "================================================="
 echo
 echo "REMINDER: lane_follower.py must be started separately"

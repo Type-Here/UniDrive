@@ -121,15 +121,37 @@ function setupTopics() {
   new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 200, queue_length: 1 })
     .subscribe(m => updateOdom(m));
 
-  new ROSLIB.Topic({ ros, name: '/map_follower/active', messageType: 'std_msgs/Bool', throttle_rate: 500, queue_length: 1 })
+  new ROSLIB.Topic({ ros, name: '/orchestrator/state', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => {
       const b = document.getElementById('mapFollowerBadge');
-      if (m.data) {
+      const s = m.data;
+      if (s === 'JUNCTION') {
+        b.style.display = '';
+        b.className = 'badge junction';
+        b.textContent = 'JUNCTION';
+      } else if (s === 'FALLBACK') {
         b.style.display = '';
         b.className = 'badge map-follower';
-        b.textContent = '🗺 MAP GUIDE';
+        b.textContent = 'MAP FALLBACK';
       } else {
         b.style.display = 'none';
+      }
+    });
+
+  new ROSLIB.Topic({ ros, name: '/waypoint_manager/nav_info', messageType: 'std_msgs/Float64MultiArray', throttle_rate: 200, queue_length: 1 })
+    .subscribe(m => {
+      if (!svgViewBox || !mapData || m.data.length < 8) return;
+      const isActive = m.data[7] > 0.5;
+      const nodeId   = isActive ? Math.round(m.data[0]) : -1;
+      const tm = document.getElementById('targetMarker');
+      if (!tm) return;
+      if (nodeId >= 0 && mapData.nodes[nodeId]) {
+        const node = mapData.nodes[nodeId];
+        tm.setAttribute('cx', svgViewBox.tx(node.x));
+        tm.setAttribute('cy', svgViewBox.ty(node.y));
+        tm.style.display = '';
+      } else {
+        tm.style.display = 'none';
       }
     });
 }
@@ -155,39 +177,10 @@ function updateLaneBadge(s) {
 function updateNavBadge(s) {
   const b = document.getElementById('navState');
   b.textContent = 'NAV: ' + s;
-  if      (s.startsWith('NAVIGATING'))   b.className = 'badge nav';
-  else if (s.startsWith('JUNCTION'))    b.className = 'badge junction';
-  else if (s.startsWith('MAP_FALLBACK'))b.className = 'badge map-follower';
+  if      (s.startsWith('NAVIGATING'))  b.className = 'badge nav';
   else if (s.startsWith('GOAL'))        b.className = 'badge done';
   else if (s.startsWith('ERROR'))       b.className = 'badge stop';
   else                                   b.className = 'badge';
-
-  if (!svgViewBox || !mapData) return;
-
-  // Extracted position from the current waypoint - source of truth for the marker.
-  // Status format: "NAVIGATING | wp=5 (regular) d=0.12m idx=6/11"
-  //                 "JUNCTION | rot to 2 err=12.3deg"
-  //                 "GOAL_REACHED | last=10"
-  const wpMatch   = s.match(/wp=(\d+)/);
-  const lastMatch = s.match(/last=(\d+)/);
-  const nodeId    = wpMatch   ? +wpMatch[1]   :
-                    lastMatch ? +lastMatch[1] : null;
-
-  // Move the orange target marker to the current target waypoint node.
-  // The blue robot marker (robotMarker) always reflects the odom-derived position.
-  const tm = document.getElementById('targetMarker');
-  if (tm) {
-    if (nodeId !== null) {
-      const node = mapData.nodes[nodeId];
-      if (node) {
-        tm.setAttribute('cx', svgViewBox.tx(node.x));
-        tm.setAttribute('cy', svgViewBox.ty(node.y));
-        tm.style.display = '';
-      }
-    } else {
-      tm.style.display = 'none';
-    }
-  }
 }
 
 // --- Odometry -----------------------------------------------------------------
@@ -469,10 +462,8 @@ function updateRobot(x, y) {
   if (!svgViewBox) return;
   const m = document.getElementById('robotMarker');
   if (!m) return;
-  // Skip path-snapping while driving for Remap so the marker moves freely.
-  const snapped = (remapState === 1) ? { x, y } : snapToPath(x, y);
-  m.setAttribute('cx', svgViewBox.tx(snapped.x));
-  m.setAttribute('cy', svgViewBox.ty(snapped.y));
+  m.setAttribute('cx', svgViewBox.tx(x));
+  m.setAttribute('cy', svgViewBox.ty(y));
   m.style.display = '';
 }
 
@@ -604,8 +595,7 @@ document.getElementById('calibBtn').onclick = () => {
 // Press Remap: robot drives forward REMAP_NODES hops from Start, measures the
 // odom displacement, computes theta+scale+tx+ty non-destructively (mapData.nodes
 // stays in original map-frame coordinates; odomToMap() applies the inverse).
-// 1 hop = node 31 → node 2 (0.45 m straight) — enough to calibrate.
-const REMAP_NODES = 1;
+const REMAP_NODES = 2;
 const REMAP_SPEED = 0.10;   // m/s forward during auto-drive
 let remapState      = 0;    // 0 = idle, 1 = driving
 let remapDriveTimer = null;

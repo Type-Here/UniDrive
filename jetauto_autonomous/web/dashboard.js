@@ -440,7 +440,7 @@ function dijkstra(mp,src,dst){
   if(!(src in mp.nodes)||!(dst in mp.nodes)) return null;
   const adj={};
   for(const id of Object.keys(mp.nodes)) adj[id]=[];
-  for(const e of mp.edges){ adj[e.from].push([e.to,e.length]); adj[e.to].push([e.from,e.length]); }
+  for(const e of mp.edges){ adj[e.from].push([e.to,e.length]); }
   const dist={},prev={},vis=new Set();
   for(const id of Object.keys(mp.nodes)) dist[id]=Infinity;
   dist[src]=0;

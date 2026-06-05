@@ -105,7 +105,7 @@ mkdir -p "$LOG_DIR"
 > "$PID_FILE"
 
 # ---- 1. Load YAML parameters into rosparam ----
-echo "[1/5] rosparam load $PARAMS_FILE"
+echo "[1/7] rosparam load $PARAMS_FILE"
 rosparam load "$PARAMS_FILE"
 # Override input_mode if requested via CLI
 if [[ -n "$INPUT_MODE_OVERRIDE" ]]; then
@@ -130,17 +130,17 @@ start_proc () {
 }
 
 # ---- 2. rosbridge_websocket (port 9090) ----
-echo "[2/5] rosbridge_websocket"
+echo "[2/7] rosbridge_websocket"
 start_proc rosbridge \
   rosrun rosbridge_server rosbridge_websocket _port:=9090
 
 # ---- 3. web_video_server (port 8080) ----
-echo "[3/5] web_video_server"
+echo "[3/7] web_video_server"
 start_proc web_video_server \
   rosrun web_video_server web_video_server _port:=8080
 
 # ---- 4. dashboard HTTP (port 8000) ----
-echo "[4/5] serve_dashboard"
+echo "[4/7] serve_dashboard"
 start_proc dashboard_http \
   $PY "$SCRIPTS_DIR/serve_dashboard.py" \
        --port 8000 \

@@ -103,17 +103,30 @@ orchestrator:
   rate_hz: 25.0
   stale_timeout: 0.5         # seconds before a stale proposal is treated as zero
 
-  # ---- Blending ----
-  # alpha=0 -> pure lane, alpha=1 -> pure map heading
-  alpha_near_junction: 0.6   # map guardrail when approaching a junction node
-  hold_ramp_ticks: 15        # HOLD ticks before alpha ramps to 1.0 (full fallback)
-  recovery_ticks: 5          # OK ticks before exiting FALLBACK
+  # ---- Fallback blending (lane=primary; map only when lane lost) ----
+  # alpha=0 -> pure lane (always during NAVIGATING)
+  # alpha ramps 0->1 over hold_ramp_ticks when lane is HOLD/STOP
+  hold_ramp_ticks: 15        # HOLD ticks before entering full FALLBACK
+  recovery_ticks: 3          # consecutive OK+near ticks before exiting FALLBACK
+  fallback_recovery_radius: 0.50  # m — must be within this dist of a path node to exit FALLBACK
 
   # ---- Junction rotation ----
   junction_radius: 0.30      # m — distance to trigger junction maneuver
-  junction_align_deg: 8.0    # deg — alignment threshold to exit rotation
+  junction_align_deg: 22.0   # deg — loose threshold; lane takes over once roughly aligned
   junction_spin_speed: 0.40  # rad/s cap for in-place rotation
-  junction_creep_speed: 0.06 # m/s forward creep after alignment
+  junction_alpha: 1       # spin blend: 90% map heading, 10% lane hint (0 if lane bad)
+
+  # ---- Drift auto-correction ----
+  # Position fix fires once per node when dist < drift_trigger_radius (NAVIGATING only).
+  # Theta fix fires at each JUNCTION completion (robot intentionally aligned).
+  drift_pos_alpha: 0.0         # EMA weight for tx/ty (0=disabled, 1=snap)
+  drift_theta_alpha: 0.0       # EMA weight for theta (0=disabled, 1=snap)
+  drift_min_correct_m: 0.03    # ignore errors smaller than this (noise floor)
+  drift_max_correct_m: 0.50    # reject errors larger than this (broken remap)
+  drift_trigger_radius: 0.20   # m — fire position fix when closer than this to target node
+
+  # ---- Turn-angle-aware junction ----
+  gentle_turn_deg: 20.0      # junctions with turn angle below this skip the rotation maneuver
 
   # ---- Map pure-pursuit (FALLBACK state) ----
   lookahead_m: 0.50

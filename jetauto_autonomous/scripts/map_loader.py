@@ -40,6 +40,7 @@ class MapLoader(object):
         self.graph = nx.DiGraph()
         self.node_types = {}        # id -> NODE_*
         self._xy = {}               # id -> (x, y)  — NX 1.x compat (nodes is a method)
+        self._roundabout_nodes = set()
         self._load()
 
     # load ------------------------------------------------------------------
@@ -48,6 +49,8 @@ class MapLoader(object):
             data = yaml.safe_load(f)
 
         self.frame_id = data.get("frame_id", "odom")
+        self._roundabout_nodes = set(
+            int(n) for n in data.get("roundabout_nodes", []))
 
         # Nodes
         for n in data.get("nodes", []):
@@ -113,6 +116,9 @@ class MapLoader(object):
     def is_junction(self, nid):
         return self.node_type(nid) == NODE_JUNCTION
 
+    def is_roundabout_node(self, nid):
+        return int(nid) in self._roundabout_nodes
+
     def neighbors(self, nid):
         return list(self.graph.successors(int(nid)))
 
@@ -141,6 +147,7 @@ class MapLoader(object):
             "edges": self.graph.number_of_edges(),
             "junctions": n_junc,
             "endpoints": n_end,
+            "roundabout_nodes": len(self._roundabout_nodes),
             "frame_id": self.frame_id,
         }
 

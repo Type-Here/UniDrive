@@ -29,12 +29,11 @@ class MapLoader(object):
         nodes: [ {id, x, y}, ... ]
         edges: [ {from, to, length}, ... ]   # DIRECTIONAL edges
 
-    NB: in the provided YAML many edges exist in ONE direction only,
-    but in practice the robot can traverse them in both directions. The `bidirectional`
-    flag duplicates missing reverse edges to allow full path planning.
+    Edges are one-way: from→to only. Dijkstra respects direction.
+    Pass bidirectional=True only for testing/debugging with undirected maps.
     """
 
-    def __init__(self, yaml_path, bidirectional=True):
+    def __init__(self, yaml_path, bidirectional=False):
         self.yaml_path = yaml_path
         self.bidirectional = bidirectional
         self.frame_id = "odom"
@@ -121,16 +120,8 @@ class MapLoader(object):
         return list(self.graph.nodes())
 
     def all_edges(self):
-        # For visualization: returns (a,b,length) tuples of unique edges
-        seen = set()
-        out = []
-        for a, b, d in self.graph.edges(data=True):
-            key = (min(a, b), max(a, b))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append((a, b, d["length"]))
-        return out
+        """Returns (from, to, length) tuples for all directed edges."""
+        return [(a, b, d["length"]) for a, b, d in self.graph.edges(data=True)]
 
     def closest_node(self, x, y):
         """Find the node nearest to a Cartesian coordinate (m)."""

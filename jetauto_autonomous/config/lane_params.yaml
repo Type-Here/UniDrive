@@ -128,6 +128,9 @@ orchestrator:
   # ---- Turn-angle-aware junction ----
   gentle_turn_deg: 20.0      # junctions with turn angle below this skip the rotation maneuver
 
+  # ---- Roundabout ----
+  roundabout_drive_speed: 0.10  # m/s — pure map following speed inside roundabout
+
   # ---- Map pure-pursuit (FALLBACK state) ----
   lookahead_m: 0.50
   map_drive_speed: 0.04      # m/s (slower than lane speed)

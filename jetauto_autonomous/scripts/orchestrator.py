@@ -115,6 +115,8 @@ class Orchestrator(object):
         self._drift_trigger_r    = float(rp("drift_trigger_radius",  0.20))
         # Turn-angle-aware junction: skip full rotation for gentle heading changes
         self._gentle_turn_deg   = float(rp("gentle_turn_deg",    20.0))
+        # Roundabout: pure map following at this speed (lane detection unreliable)
+        self._roundabout_speed  = float(rp("roundabout_drive_speed", 0.10))
 
         # Remap transform (odom -> map frame), mirrors waypoint_manager
         self._remap_theta = 0.0
@@ -155,6 +157,7 @@ class Orchestrator(object):
         self._handled_junction    = -1   # node ID of last completed junction; blocks re-trigger
         self._node_corrected      = False  # True once drift correction fired for current node
         self._last_corrected_node = -1     # node ID that was last drift-corrected
+        self._in_roundabout       = False  # True while navigating through roundabout nodes
 
         # Publishers
         self._cmd_pub    = rospy.Publisher(
@@ -429,6 +432,17 @@ class Orchestrator(object):
         cur_node_id  = int(nav_info[self._NI_NODE])
         cur_path_idx = int(nav_info[self._NI_IDX])
 
+        # Roundabout flag: either the current node or the immediate next node is in the
+        # roundabout set. Lane detection is unreliable there (triangular island confuses
+        # left/right), so the orchestrator uses pure map following for those segments.
+        in_roundabout = (self._map is not None and (
+            self._map.is_roundabout_node(cur_node_id) or
+            (next_id >= 0 and self._map.is_roundabout_node(next_id))))
+        if in_roundabout != self._in_roundabout:
+            self._in_roundabout = in_roundabout
+            rospy.loginfo("[orchestrator] roundabout mode: %s (node=%d)",
+                          "ENTER" if in_roundabout else "EXIT", cur_node_id)
+
         # Position drift correction — fires once per node when the robot is close
         # enough that the odom position is a reliable fix (dist < drift_trigger_radius).
         # Guarded to NAVIGATING state only: must not fire mid-junction and corrupt heading_nxt.
@@ -447,9 +461,11 @@ class Orchestrator(object):
         # ======== JUNCTION ========
         # Re-trigger guard: skip if this junction node was already handled this path.
         # _handled_junction is cleared on every new path arrival.
+        # Roundabout junction nodes (24, 26, 28) are also blocked — map following handles them.
         _enter_junction = (is_junction and next_id >= 0
                            and dist <= self._junc_radius
-                           and cur_node_id != self._handled_junction)
+                           and cur_node_id != self._handled_junction
+                           and not in_roundabout)
 
         # Turn-angle gate: skip full rotation for gentle heading changes.
         # Use map edge directions (stable) rather than robot-relative heading_nxt.
@@ -546,6 +562,24 @@ class Orchestrator(object):
             self._set_lane_enabled(True)
             rospy.loginfo("[orchestrator] -> NAVIGATING")
         self._publish_orc_state(self.NAVIGATING)
+
+        # Roundabout override: pure map following — skip lane entirely.
+        # Lane controller stays enabled so lane_state reflects visibility,
+        # but its angular output is not used.
+        if in_roundabout:
+            self._hold_count = 0
+            carrot = self._carrot(rx, ry, path_ids)
+            if carrot is not None:
+                heading = math.atan2(carrot[1] - ry, carrot[0] - rx)
+                err = angle_diff(heading, ryaw)
+                twist = Twist()
+                twist.linear.x  = self._roundabout_speed
+                twist.angular.z = clamp(self._map_kp * err,
+                                        -self._map_max_w, self._map_max_w)
+                self._cmd_pub.publish(twist)
+            else:
+                self._cmd_pub.publish(Twist())
+            return
 
         # Compute dynamic alpha
         if next_id < 0:

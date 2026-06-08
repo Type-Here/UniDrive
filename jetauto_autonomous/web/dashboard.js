@@ -20,18 +20,20 @@ let currentTopicMode = 'camera';
 function topicForMode(mode) {
   if (mode === 'camera')  return CONFIG.topic_camera;
   if (mode === 'lfDebug') return CONFIG.topic_lfDebug;
+  if (mode === 'objDet')  return CONFIG.topic_objDet;
   return CONFIG.topic_debug;
 }
 
 function labelForMode(mode) {
   if (mode === 'camera')  return CONFIG.topic_camera;
   if (mode === 'lfDebug') return CONFIG.topic_lfDebug;
+  if (mode === 'objDet')  return CONFIG.topic_objDet;
   return CONFIG.topic_debug;
 }
 
 function switchTopic(mode) {
   currentTopicMode = mode;
-  ['camera', 'debug', 'lfDebug'].forEach(m => {
+  ['camera', 'debug', 'lfDebug', 'objDet'].forEach(m => {
     const id = 'btn' + m.charAt(0).toUpperCase() + m.slice(1);
     document.getElementById(id).classList.toggle('active', m === mode);
   });
@@ -47,6 +49,7 @@ function renderVideo(topic) {
   QUALITY[CONFIG.topic_camera]  = 30;
   QUALITY[CONFIG.topic_debug]   = 65;
   QUALITY[CONFIG.topic_lfDebug] = 40;
+  QUALITY[CONFIG.topic_objDet]  = 50;
   const quality = QUALITY[topic] !== undefined ? QUALITY[topic] : 40;
   const url   = `${CONFIG.video_server_url}/stream?topic=${topic}&type=mjpeg&quality=${quality}`;
   wrap.innerHTML = '';

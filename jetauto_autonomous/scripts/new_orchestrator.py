@@ -41,12 +41,13 @@ place of `orchestrator.py` (never both at once — same node name).
 """
 
 from __future__ import print_function
+import json
 import math
 from collections import namedtuple
 
 import rospy
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Int32MultiArray, String  # noqa: F401 (String kept for parity)
+from std_msgs.msg import Int32MultiArray, String
 
 from orchestrator import Orchestrator, angle_diff, clamp
 
@@ -89,6 +90,7 @@ class NewOrchestrator(Orchestrator):
     # Extra states beyond the parent's IDLE/NAVIGATING/JUNCTION/FALLBACK/DONE.
     ROUNDABOUT    = "ROUNDABOUT"
     CONFLICT_STOP = "CONFLICT_STOP"
+    TRAFFIC_STOP  = "TRAFFIC_STOP"   # held at a red light (object-detection override)
 
     def __init__(self):
         super(NewOrchestrator, self).__init__()
@@ -121,6 +123,30 @@ class NewOrchestrator(Orchestrator):
         self._offroute_count   = 0      # consecutive off-route ticks
         self._last_replan      = rospy.Time(0)
 
+        # --- Object-detection / traffic-light override (opt-in) --------------
+        # Subscribes to the perception node's JSON detections and, while a red
+        # light is seen, overrides ALL driving with a full stop until a green
+        # light appears. Latched: a red stays in effect until green is seen
+        # (matches "stop until you see the green light").
+        #
+        # Turn OFF (traffic_light_enable=false) to develop/test the driving
+        # stack on its own, independent of the object-detection group's node.
+        self._tl_enable = bool(rp("traffic_light_enable", True))
+        self._tl_topic  = rp("traffic_light_topic", "/object_detection/drive")
+        self._tl_red    = rp("traffic_light_red_label",   "red_TL")
+        self._tl_green  = rp("traffic_light_green_label", "green_TL")
+        # Current light: "GREEN" (go) until a red is detected. Default GREEN so a
+        # silent/absent detection topic never blocks driving.
+        self._traffic_light = "GREEN"
+
+        if self._tl_enable:
+            rospy.Subscriber(self._tl_topic, String, self._traffic_cb, queue_size=1)
+            rospy.loginfo(
+                "[new_orch] traffic-light override ON: topic=%s red='%s' green='%s'",
+                self._tl_topic, self._tl_red, self._tl_green)
+        else:
+            rospy.loginfo("[new_orch] traffic-light override OFF (driving-only mode)")
+
         # GPS-style replan goes out on the existing goal topic (no other file changes).
         self._goal_pub = rospy.Publisher(
             "/waypoint_manager/goal", Int32MultiArray, queue_size=1)
@@ -131,6 +157,31 @@ class NewOrchestrator(Orchestrator):
             self._offroute_t, self._conflict_ticks,
             math.degrees(self._proxy_max), self._junction_influence_radius,
             self._replan_cooldown)
+
+    # --------------------------------------------------- traffic-light callback
+
+    def _traffic_cb(self, msg):
+        """Parse the perception node's JSON detections and latch the light state.
+
+        Payload: {"detections": [{"class_name": ..., "score": ..., "box": ...}]}.
+        A frame with a red label -> RED; a frame with a green label -> GREEN;
+        a frame with neither keeps the previous state (latched)."""
+        try:
+            detections = json.loads(msg.data).get("detections", [])
+            labels = [d.get("class_name") for d in detections]
+        except (ValueError, AttributeError, TypeError):
+            rospy.logwarn_throttle(5.0, "[new_orch] bad detection payload")
+            return
+
+        if self._tl_red in labels:
+            if self._traffic_light != "RED":
+                rospy.logwarn("[new_orch] RED light detected -> STOP")
+            self._traffic_light = "RED"
+        elif self._tl_green in labels:
+            if self._traffic_light != "GREEN":
+                rospy.loginfo("[new_orch] GREEN light detected -> GO")
+            self._traffic_light = "GREEN"
+        # neither seen this frame: keep the latched state
 
     # ------------------------------------------------------------ small helpers
 
@@ -213,6 +264,15 @@ class NewOrchestrator(Orchestrator):
     # --------------------------------------------------------------- main FSM
 
     def _step(self):
+        # --- Traffic-light override (object-detection integration) ---
+        # Highest priority: while a red light is latched, seize the cmd_vel bus
+        # with a full stop and freeze the FSM (we return before touching
+        # self._state, so navigation resumes from where it left off on green).
+        if self._tl_enable and self._traffic_light == "RED":
+            self._publish_orc_state(self.TRAFFIC_STOP)
+            self._cmd_pub.publish(Twist())
+            return
+
         # --- snapshot shared state under one lock (mirrors parent) ---
         with self._lock:
             pose       = self._pose

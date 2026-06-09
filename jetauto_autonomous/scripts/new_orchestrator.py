@@ -46,7 +46,7 @@ from collections import namedtuple
 
 import rospy
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Int32MultiArray, String  # noqa: F401 (String kept for parity)
+from std_msgs.msg import Float64MultiArray, Int32MultiArray, String  # noqa: F401 (String kept for parity)
 
 from orchestrator import Orchestrator, angle_diff, clamp
 
@@ -56,7 +56,7 @@ _Ctx = namedtuple(
     "_Ctx",
     "rx ry ryaw dist is_junction heading_nxt next_id cur_node_id cur_path_idx "
     "path_ids lane_cmd lane_state lane_fresh lane_usable in_roundabout "
-    "theta_m c odom_yaw")
+    "theta_m c odom_yaw lane_info")
 
 
 def decide_blend(lane_angular, theta_m, dist, in_junction,
@@ -84,6 +84,58 @@ def decide_blend(lane_angular, theta_m, dist, in_junction,
     return a_lane, c
 
 
+def _polar_arc(center, a0, r0, a1, r1, res):
+    """Dense points along a polar arc from (a0,r0) to (a1,r1) about `center`.
+
+    Angle is interpolated along the SHORT direction; radius is interpolated
+    linearly, so the arc keeps each endpoint's true distance from the center
+    (an outlying node -> a locally flatter arc).  Excludes the end point (the
+    next segment / final append provides it).  py2-safe.
+    """
+    cx, cy = center
+    da = a1 - a0
+    while da >  math.pi: da -= 2.0 * math.pi
+    while da < -math.pi: da += 2.0 * math.pi
+    arc   = abs(da) * max(0.5 * (r0 + r1), 1e-3)
+    steps = max(2, int(math.ceil(arc / max(res, 1e-3))))
+    pts = []
+    for s in range(steps):
+        f = s / float(steps)
+        a = a0 + da * f
+        r = r0 + (r1 - r0) * f
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return pts
+
+
+def radial_ring_curve(center, nodes, res):
+    """Dense polyline through ring `nodes` via per-segment polar interpolation.
+
+    Pure function (no ROS), py2-safe.  `nodes` are (x,y) in traversal order.
+    Because each node keeps its own radius about `center`, an outlying node
+    (e.g. the higher east node) yields a flatter local arc while a tighter node
+    yields a sharper one — the "smooth radial" behaviour.  Passes through every
+    node exactly (polar(node) about any centre reproduces the node).
+    """
+    cx, cy = center
+    polar = [(math.atan2(y - cy, x - cx), math.hypot(x - cx, y - cy))
+             for (x, y) in nodes]
+    out = []
+    for i in range(len(nodes) - 1):
+        a0, r0 = polar[i]
+        a1, r1 = polar[i + 1]
+        out.extend(_polar_arc(center, a0, r0, a1, r1, res))
+    out.append((nodes[-1][0], nodes[-1][1]))
+    return out
+
+
+def _densify(p, q, res):
+    """Dense points from p to q (excludes q); for straight lead-in/out segments."""
+    d     = math.hypot(q[0] - p[0], q[1] - p[1])
+    steps = max(1, int(math.ceil(d / max(res, 1e-3))))
+    return [(p[0] + (q[0] - p[0]) * s / float(steps),
+             p[1] + (q[1] - p[1]) * s / float(steps)) for s in range(steps)]
+
+
 class NewOrchestrator(Orchestrator):
 
     # Extra states beyond the parent's IDLE/NAVIGATING/JUNCTION/FALLBACK/DONE.
@@ -103,12 +155,41 @@ class NewOrchestrator(Orchestrator):
         self._conflict_ticks = int(rp("conflict_ticks", 12))
         # angular.z -> implied heading proxy: full steer maps to this many deg.
         self._proxy_max    = math.radians(float(rp("proxy_max_deg", 80.0)))
-        # Distance over which the map progressively pulls into a junction turn.
+        # Distance over which the map progressively blends the robot INTO a junction
+        # turn. This approach-blend is what actually curves the robot before the
+        # in-place spin arms at junction_radius. With an imperfect map the robot may
+        # never pass within junction_radius of the node, so this must be wide enough
+        # to start the turn on its own — 0.30 (~= junction_radius) made it miss the
+        # turn entirely and then CONFLICT_STOP. Must comfortably exceed junction_radius.
         self._junction_influence_radius = float(rp("junction_influence_radius", 0.50))
         # Min seconds between GPS-style replans (avoid spamming the planner).
         self._replan_cooldown = float(rp("replan_cooldown", 3.0))
         # Roundabout conflict is judged more leniently (lane is unreliable there).
         self._roundabout_conflict_c = float(rp("roundabout_conflict_c", -0.5))
+        # Roundabout curve (item 1): follow a smooth per-segment radial arc through
+        # the ring nodes instead of aiming at sparse chords (which cuts the circle).
+        # Small lookahead so the carrot hugs the curve; fine sample spacing.
+        self._round_lookahead   = float(rp("roundabout_lookahead_m", 0.25))
+        self._round_spline_res  = float(rp("roundabout_spline_res_m", 0.03))
+        # Roundabout lane guardrail (item 2): camera-frame correction, ROUNDABOUT
+        # only. NOT lane-following — it only nudges away from a road edge we are
+        # about to cross. If the relevant painted line isn't confidently seen, it
+        # does nothing and the map-frame curve drives (e.g. the unreliable outer
+        # line at the entrance is simply ignored). inner = island side, outer =
+        # road edge; the side is decided from where the roundabout centre is.
+        self._round_lane_correct = bool (rp("roundabout_lane_correct", True))
+        self._round_outer_clear  = float(rp("roundabout_outer_clear", 0.25))
+        self._round_inner_clear  = float(rp("roundabout_inner_clear", 0.20))
+        self._round_lane_gain    = float(rp("roundabout_lane_gain",   0.40))
+        self._round_lane_max     = float(rp("roundabout_lane_max",    0.50))
+        # Roundabout off-reference failsafe: how far the robot may stray from its OWN
+        # reference (the radial spline on the ring, or the path on the exit leg) before
+        # it trips the SHARED stop failsafe (CONFLICT_STOP). Debounced. Lane is
+        # unreliable in the ring, so this geometric check — not a lane check — is the
+        # only safety net here; without it a bad map/odom drive just runs away off-road
+        # (the observed failure). Generous threshold so only a genuine excursion trips.
+        self._round_offref_m     = float(rp("roundabout_offref_m", 0.40))
+        self._round_offref_ticks = int  (rp("roundabout_offref_ticks", 10))
         # Off-route / REPLAN is localization-dependent. OFF by default: it must
         # never preempt a healthy lane, and with an imperfect remap a geometric
         # check can mis-fire. When enabled it only triggers a debounced REPLAN
@@ -119,7 +200,24 @@ class NewOrchestrator(Orchestrator):
         self._conflict_count   = 0      # consecutive conflict ticks
         self._conflict_recover = 0      # consecutive recovered ticks in CONFLICT_STOP
         self._offroute_count   = 0      # consecutive off-route ticks
+        self._round_offref_count = 0    # consecutive off-reference ticks (roundabout failsafe)
+        self._round_offset       = 0.0  # latest robot distance to its roundabout reference (m)
         self._last_replan      = rospy.Time(0)
+
+        # Roundabout curve cache (rebuilt when the ring node set changes, e.g. REPLAN).
+        self._round_spline = None       # dense [(x,y), ...] curve through ring nodes
+        self._round_key    = None       # tuple of ring node ids the cache was built for
+        self._round_center = None       # (cx,cy) center of the ring (for inner/outer side)
+        self._round_i      = 0          # monotonic progress index along the polyline
+        # Allow a little backward search so odom noise can't make progress jitter,
+        # but not enough to latch onto the spatially-near exit (entry/exit are close).
+        self._round_back   = max(1, int(0.10 / max(self._round_spline_res, 1e-3)))
+
+        # Latest /lane_controller/info (camera-frame lane geometry; item 2).
+        self._lane_info       = None
+        self._lane_info_stamp = None
+        rospy.Subscriber("/lane_controller/info", Float64MultiArray,
+                         self._lane_info_cb, queue_size=1)
 
         # GPS-style replan goes out on the existing goal topic (no other file changes).
         self._goal_pub = rospy.Publisher(
@@ -133,6 +231,13 @@ class NewOrchestrator(Orchestrator):
             self._replan_cooldown)
 
     # ------------------------------------------------------------ small helpers
+
+    def _lane_info_cb(self, msg):
+        if len(msg.data) < 8:
+            return
+        with self._lock:
+            self._lane_info       = list(msg.data)
+            self._lane_info_stamp = rospy.Time.now()
 
     def _offpath_dist(self, rx, ry, path_ids):
         """Cross-track distance from the robot to the nearest path *segment* (m).
@@ -204,11 +309,11 @@ class NewOrchestrator(Orchestrator):
             self._publish_orc_state(self.FALLBACK)
             rospy.loginfo("[new_orch] -> FALLBACK (%s)", why)
 
-    def _enter_conflict_stop(self):
+    def _enter_conflict_stop(self, why="lane vs map conflict"):
         self._state            = self.CONFLICT_STOP
         self._conflict_recover = 0
         self._publish_orc_state(self.CONFLICT_STOP)
-        rospy.logwarn("[new_orch] -> CONFLICT_STOP (lane vs map conflict)")
+        rospy.logwarn("[new_orch] -> CONFLICT_STOP (%s)", why)
 
     # --------------------------------------------------------------- main FSM
 
@@ -224,6 +329,9 @@ class NewOrchestrator(Orchestrator):
             path_ids   = list(self._path_ids)
             lane_fresh = self._fresh(self._lane_cmd_stamp)
             info_fresh = self._fresh(self._nav_info_stamp)
+            lane_info  = (list(self._lane_info)
+                          if self._lane_info is not None
+                          and self._fresh(self._lane_info_stamp) else None)
 
         if pose is None:
             self._cmd_pub.publish(Twist())
@@ -244,9 +352,15 @@ class NewOrchestrator(Orchestrator):
         cur_path_idx = int(nav_info[self._NI_IDX])
 
         # Roundabout window (current or next node tagged) — lane unreliable here.
+        # Extended through the EXIT STUB: the first non-ring node whose path
+        # predecessor is a ring node (e.g. node 23 reached from 28). Keep map/curve
+        # authority across it so the lane controller can't hijack the exit drive and
+        # follow the ring line off-road — the observed failure. The robot hands back
+        # to the lane only once it is genuinely out (predecessor no longer a ring node).
         in_roundabout = (self._map is not None and (
             self._map.is_roundabout_node(cur_node_id) or
-            (next_id >= 0 and self._map.is_roundabout_node(next_id))))
+            (next_id >= 0 and self._map.is_roundabout_node(next_id)) or
+            self._is_exit_stub(cur_node_id, cur_path_idx, path_ids)))
         if in_roundabout != self._in_roundabout:
             self._in_roundabout = in_roundabout
             rospy.loginfo("[new_orch] roundabout: %s (node=%d)",
@@ -276,7 +390,8 @@ class NewOrchestrator(Orchestrator):
 
         C = _Ctx(rx, ry, ryaw, dist, is_junction, heading_nxt, next_id,
                  cur_node_id, cur_path_idx, path_ids, lane_cmd, lane_state,
-                 lane_fresh, lane_usable, in_roundabout, theta_m, c, odom_yaw)
+                 lane_fresh, lane_usable, in_roundabout, theta_m, c, odom_yaw,
+                 lane_info)
 
         # Heartbeat: one line/sec so a misbehavior is traceable to its inputs.
         rospy.loginfo_throttle(
@@ -286,11 +401,17 @@ class NewOrchestrator(Orchestrator):
             math.degrees(theta_m), c)
 
         # --- dispatch ---
-        # Roundabout pre-empts everything except an in-progress junction spin.
-        if in_roundabout and self._state != self.JUNCTION:
-            self._h_roundabout(C)
-        elif self._state == self.CONFLICT_STOP:
+        # CONFLICT_STOP is the SINGLE shared failsafe halt and is checked FIRST so it
+        # is sticky everywhere: once stopped, _h_conflict_stop owns the robot until it
+        # clears, even inside the roundabout. (Previously the roundabout pre-empted it,
+        # so a stop entered in the ring never actually ran its handler — the state just
+        # flickered ROUNDABOUT<->CONFLICT_STOP. Ordering it first fixes that and lets
+        # the roundabout off-reference failsafe reuse the same stop.)
+        # Otherwise the roundabout pre-empts everything except an in-progress junction.
+        if self._state == self.CONFLICT_STOP:
             self._h_conflict_stop(C)
+        elif in_roundabout and self._state != self.JUNCTION:
+            self._h_roundabout(C)
         elif self._state == self.JUNCTION:
             self._h_junction(C)
         elif self._state == self.FALLBACK:
@@ -329,7 +450,13 @@ class NewOrchestrator(Orchestrator):
         self._publish_orc_state(self.NAVIGATING)
 
         # 1) Direct conflict (lane vs map > 90 deg apart) — debounced stop.
-        if C.lane_usable and C.next_id >= 0 and C.c < 0.0:
+        #    SUPPRESSED while the current node is a junction: there the map heading
+        #    points at the *post-junction* node, so lane (straight) and map (into the
+        #    turn) are *expected* to diverge past 90 deg. That divergence is the turn
+        #    signal, not a wrong-way conflict — counting it stops the robot dead in
+        #    the middle of every sharp turn (observed). A genuine wrong-way is still
+        #    caught once past the junction (is_junction clears -> counting resumes).
+        if (C.lane_usable and C.next_id >= 0 and not C.is_junction and C.c < 0.0):
             self._conflict_count += 1
             if self._conflict_count >= self._conflict_ticks:
                 self._enter_conflict_stop()
@@ -433,6 +560,119 @@ class NewOrchestrator(Orchestrator):
 
     # ------------------------------------------------------------- ROUNDABOUT
 
+    def _is_exit_stub(self, cur_id, idx, path_ids):
+        """True when the current target is the first non-ring node right after the
+        ring on the path (the exit stub, e.g. 23 reached from 28).
+
+        Keeps map/curve authority across the exit so the lane controller can't grab
+        the exit drive and follow the ring line off-road. Detected exactly as the
+        user described: the node is outside the roundabout but its path predecessor
+        is a ring node (a 'lookahead' on the previous node)."""
+        if self._map is None or idx <= 0 or idx >= len(path_ids):
+            return False
+        if self._map.is_roundabout_node(cur_id):
+            return False
+        return self._map.is_roundabout_node(int(path_ids[idx - 1]))
+
+    def _ring_ids(self, path_ids):
+        """Ordered ring node ids on the path (first..last tagged-roundabout span).
+
+        Takes the contiguous span between the first and last roundabout-tagged
+        nodes so the spline covers the whole ring portion of the route, tolerant
+        of an untagged node slipping in between.
+        """
+        if self._map is None or not path_ids:
+            return []
+        ridx = [i for i, nid in enumerate(path_ids)
+                if self._map.is_roundabout_node(int(nid))]
+        if not ridx:
+            return []
+        return [int(path_ids[i]) for i in range(ridx[0], ridx[-1] + 1)]
+
+    def _build_round_curve(self, path_ids, center):
+        """Per-segment radial-arc polyline through the ring nodes (MAP frame).
+
+        Each ring segment is a polar arc about `center` keeping each node's own
+        radius, so an outlying node gives a flatter local arc and a tighter node a
+        sharper one (the "smooth radial").  Straight lead-in/out segments connect
+        the entry/exit neighbors so the curve joins the rest of the path.  Returns
+        the dense polyline, or None for < 3 ring nodes (caller falls back to nodes).
+        """
+        if self._map is None or not path_ids:
+            return None
+        ridx = [i for i, nid in enumerate(path_ids)
+                if self._map.is_roundabout_node(int(nid))]
+        if not ridx:
+            return None
+        first, last = ridx[0], ridx[-1]
+        nodes = [self._map.node_xy(int(path_ids[i])) for i in range(first, last + 1)]
+        if len(nodes) < 3:
+            return None
+        out = []
+        if first > 0:  # straight lead-in from the entry neighbor
+            out.extend(_densify(self._map.node_xy(int(path_ids[first - 1])),
+                                nodes[0], self._round_spline_res))
+        out.extend(radial_ring_curve(center, nodes, self._round_spline_res))
+        if last < len(path_ids) - 1:  # straight lead-out to the exit neighbor
+            ex = self._map.node_xy(int(path_ids[last + 1]))
+            out.extend(_densify(nodes[-1], ex, self._round_spline_res)[1:])
+            out.append(ex)
+        return out
+
+    def _ensure_round_spline(self, path_ids):
+        """Return the cached roundabout polyline + center, rebuilding on ring change."""
+        key = tuple(self._ring_ids(path_ids))
+        if key != self._round_key:
+            self._round_key    = key
+            self._round_i      = 0
+            self._round_center = None
+            self._round_spline = None
+            if len(key) >= 3 and self._map is not None:
+                pts = [self._map.node_xy(n) for n in key]
+                cx  = sum(p[0] for p in pts) / len(pts)
+                cy  = sum(p[1] for p in pts) / len(pts)
+                self._round_center = (cx, cy)
+                self._round_spline = self._build_round_curve(path_ids, (cx, cy))
+                rospy.loginfo(
+                    "[new_orch] roundabout curve: %d pts / %d nodes %s centre=(%.2f,%.2f)",
+                    len(self._round_spline) if self._round_spline else 0,
+                    len(key), list(key), cx, cy)
+            else:
+                rospy.logwarn_throttle(
+                    5.0, "[new_orch] roundabout: %d ring node(s) (<3) — node pursuit",
+                    len(key))
+        return self._round_spline
+
+    def _spline_carrot(self, rx, ry, poly):
+        """Lookahead point on the dense roundabout polyline (MAP frame).
+
+        Nearest-point search is forward-only (with a small backward slack) from the
+        last progress index, so the carrot can't snap to the spatially-near exit
+        portion of the ring and cut straight across.
+        """
+        if not poly:
+            return None
+        lo = max(0, self._round_i - self._round_back)
+        best_i, best_d = lo, float("inf")
+        for i in range(lo, len(poly)):
+            px, py = poly[i]
+            d = (rx - px) ** 2 + (ry - py) ** 2
+            if d < best_d:
+                best_d, best_i = d, i
+        self._round_i = best_i
+        self._round_offset = math.sqrt(best_d)  # deviation from the curve (failsafe)
+        accum  = 0.0
+        px, py = poly[best_i]
+        for i in range(best_i + 1, len(poly)):
+            nx, ny = poly[i]
+            seg = math.hypot(nx - px, ny - py)
+            if accum + seg >= self._round_lookahead:
+                frac = (self._round_lookahead - accum) / max(seg, 1e-9)
+                return (px + frac * (nx - px), py + frac * (ny - py))
+            accum += seg
+            px, py = nx, ny
+        return poly[-1]
+
     def _h_roundabout(self, C):
         if self._state != self.ROUNDABOUT:
             self._state = self.ROUNDABOUT
@@ -450,17 +690,112 @@ class NewOrchestrator(Orchestrator):
         else:
             self._conflict_count = 0
 
-        # Pure map following at roundabout speed.
-        carrot = self._carrot(C.rx, C.ry, C.path_ids)
+        # Carrot source.
+        #   - Ring (next target still a ring node): follow the smooth radial curve
+        #     through the ring nodes (built for >=3 ring nodes).
+        #   - EXIT approach (next target has LEFT the ring, e.g. 28->23->2): drop the
+        #     spline and use plain pure-pursuit straight at the exit node — the user's
+        #     "map, pure-pursuit, no radial between 28-23". Why: the spline's tangent
+        #     at the last ring node still points AROUND the ring, so with the small
+        #     lookahead the carrot holds that tangent and the robot sails PAST the
+        #     exit, then snaps ~90deg toward 23 and cuts the edge off-road (observed).
+        #     _carrot aims into the exit from the start (smooth turn-in) and, unlike
+        #     _spline_carrot, recomputes from the nearest path node every tick — so it
+        #     can never latch onto a stale curve endpoint and run away off-road.
+        # Same boundary as the guardrail-off test in _round_lane_nudge (kept in sync):
+        # when `next` leaves the ring, both the radial AND the guardrail give way.
+        exiting = (C.next_id < 0 or (self._map is not None
+                   and not self._map.is_roundabout_node(C.next_id)))
+        poly = None if exiting else self._ensure_round_spline(C.path_ids)
+        if poly:
+            carrot = self._spline_carrot(C.rx, C.ry, poly)  # sets self._round_offset
+            src    = "curve"
+        else:
+            carrot = self._carrot(C.rx, C.ry, C.path_ids)
+            src    = "exit" if exiting else "nodes"
+            # No spline here, so measure deviation against the path the pursuit follows.
+            self._round_offset = self._offpath_dist(C.rx, C.ry, C.path_ids)
         if carrot is None:
             self._cmd_pub.publish(Twist())
             return
+
+        # Off-reference failsafe -> the SINGLE shared stop (CONFLICT_STOP).
+        # Lane is unreliable in the roundabout, so a geometric deviation from our own
+        # reference (spline on the ring, path on the exit) is the only safety net. A
+        # sustained excursion means the map/odom drive has gone wrong; halt rather than
+        # keep driving off-road. Debounced; recovery is the shared lane/map-agreement
+        # gate in _h_conflict_stop (a stop that waits for a human is the safe default).
+        if self._round_offset > self._round_offref_m:
+            self._round_offref_count += 1
+            if self._round_offref_count >= self._round_offref_ticks:
+                self._round_offref_count = 0
+                self._enter_conflict_stop("off-reference %.2fm (roundabout)"
+                                          % self._round_offset)
+                self._cmd_pub.publish(Twist())
+                return
+        else:
+            self._round_offref_count = 0
         heading = math.atan2(carrot[1] - C.ry, carrot[0] - C.rx)
         err     = angle_diff(heading, C.ryaw)
+        base    = clamp(self._map_kp * err, -self._map_max_w, self._map_max_w)
+        # Camera-frame guardrail nudge (additive; 0 unless a road edge is close).
+        nudge   = self._round_lane_nudge(C)
         twist = Twist()
         twist.linear.x  = self._roundabout_speed
-        twist.angular.z = clamp(self._map_kp * err, -self._map_max_w, self._map_max_w)
+        twist.angular.z = clamp(base + nudge, -self._map_max_w, self._map_max_w)
         self._cmd_pub.publish(twist)
+        rospy.loginfo_throttle(
+            1.0, "[new_orch] ROUND src=%s carrot=(%.2f,%.2f) err=%+.0fdeg "
+            "base=%+.2f nudge=%+.2f w=%+.2f", src, carrot[0], carrot[1],
+            math.degrees(err), base, nudge, twist.angular.z)
+
+    def _round_lane_nudge(self, C):
+        """Camera-frame guardrail correction inside the roundabout (rad/s).
+
+        NOT lane-following: returns 0 unless a painted line is confidently seen
+        AND close enough to the robot centre that we're about to cross an edge.
+          - outer (road-edge) line too close  -> nudge inward (toward the centre)
+          - inner (island) line too close     -> nudge outward
+        Inner/outer is decided per-tick from which side the ring center is on, so
+        it works for CW or CCW travel. If the relevant line isn't seen, the map
+        curve drives unaided (e.g. the unreliable outer line at the entrance).
+        """
+        if (not self._round_lane_correct or self._round_center is None
+                or C.lane_info is None):
+            return 0.0
+        # Near the exit the robot must CROSS the ring's outer boundary to leave;
+        # the guardrail would read that as "about to go off-road" and nudge inward,
+        # blocking the exit (observed -> went off-road). Within the roundabout window
+        # the next target is outside the ring only on the exit leg, so disable the
+        # guardrail there and let the radial lead-out + map drive the robot out.
+        if C.next_id < 0 or (self._map is not None
+                             and not self._map.is_roundabout_node(C.next_id)):
+            rospy.loginfo_throttle(1.0, "[new_orch] ROUND guardrail OFF (exit leg)")
+            return 0.0
+        li = C.lane_info
+        left_valid,  left_off  = li[2] > 0.5, li[4]
+        right_valid, right_off = li[3] > 0.5, li[5]
+
+        cx, cy = self._round_center
+        rel    = angle_diff(math.atan2(cy - C.ry, cx - C.rx), C.ryaw)
+        center_left = rel > 0.0          # ring centre is to the robot's left
+        if center_left:                  # island on the left, road edge on the right
+            inner_valid, inner_off = left_valid,  left_off
+            outer_valid, outer_off = right_valid, right_off
+            inward = 1.0                 # turning left (+w) heads toward the center
+        else:
+            inner_valid, inner_off = right_valid, right_off
+            outer_valid, outer_off = left_valid,  left_off
+            inward = -1.0
+
+        nudge = 0.0
+        if outer_valid and abs(outer_off) < self._round_outer_clear:
+            sev = (self._round_outer_clear - abs(outer_off)) / self._round_outer_clear
+            nudge += inward * self._round_lane_gain * sev
+        if inner_valid and abs(inner_off) < self._round_inner_clear:
+            sev = (self._round_inner_clear - abs(inner_off)) / self._round_inner_clear
+            nudge -= inward * self._round_lane_gain * sev
+        return clamp(nudge, -self._round_lane_max, self._round_lane_max)
 
     # --------------------------------------------------------------- FALLBACK
 

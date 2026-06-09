@@ -170,7 +170,7 @@
 
   /* SVG map styles */
   .grid-line { stroke: #1d2233; stroke-width: 0.5; }
-  .edge { stroke: #2f3645; stroke-width: 1.5; fill: none; }
+  .edge { stroke: #2f3645; stroke-width: 1.5; fill: none; marker-mid: url(#arr); }
   .edge.path { stroke: var(--accent); stroke-width: 3.5; }
   .node { fill: #4a5263; stroke: #1b1f29; stroke-width: 1; cursor: pointer; }
   .node:hover { fill: var(--accent); }

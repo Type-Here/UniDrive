@@ -13,6 +13,7 @@ lane_controller:
   cmd_topic:    "/lane_controller/cmd_vel"   # proposed only; orchestrator forwards to hardware
   debug_topic:  "/lane_debug/image"
   state_topic:  "/lane_controller/state"
+  info_topic:   "/lane_controller/info"      # additive lane geometry (Float64MultiArray) for orchestrator roundabout guardrail
   enable_topic: "/lane_controller/enable"
 
   # ---- Velocity ---- Validated Velocity linear_x_speed 0.10/0.15 m/s, max_angular_z 0.80/1.20 rad/s
@@ -92,7 +93,7 @@ waypoint_manager:
   odom_topic: "/odom"
   goal_topic: "/waypoint_manager/goal"
   status_topic: "/waypoint_manager/status"
-  waypoint_tolerance: 0.25
+  waypoint_tolerance: 0.12   # m — arrival radius at final node (was 0.25: stopped short of the node)
   rate_hz: 25
 
 # =============================================================================
@@ -106,13 +107,14 @@ orchestrator:
   # ---- Fallback blending (lane=primary; map only when lane lost) ----
   # alpha=0 -> pure lane (always during NAVIGATING)
   # alpha ramps 0->1 over hold_ramp_ticks when lane is HOLD/STOP
-  hold_ramp_ticks: 15        # HOLD ticks before entering full FALLBACK
+  hold_ramp_ticks: 22        # HOLD ticks before full FALLBACK (raised: a brief lane loss mid-turn shouldn't escalate before reacquire)
   recovery_ticks: 3          # consecutive OK+near ticks before exiting FALLBACK
   fallback_recovery_radius: 0.50  # m — must be within this dist of a path node to exit FALLBACK
 
   # ---- Junction rotation ----
-  junction_radius: 0.30      # m — distance to trigger junction maneuver
-  junction_align_deg: 22.0   # deg — loose threshold; lane takes over once roughly aligned
+  junction_radius: 0.30      # m — distance to trigger the in-place spin maneuver
+  junction_influence_radius: 0.50  # m — distance over which the map blends the robot INTO the turn (new_orchestrator only). MUST exceed junction_radius; too small (~0.30) and the turn is missed entirely on an imperfect map.
+  junction_align_deg: 14.0   # deg — lower so the spin completes more of the turn before lane takeover (was 22, curved too soon)
   junction_spin_speed: 0.40  # rad/s cap for in-place rotation
   junction_alpha: 1       # spin blend: 90% map heading, 10% lane hint (0 if lane bad)
 
@@ -129,7 +131,23 @@ orchestrator:
   gentle_turn_deg: 20.0      # junctions with turn angle below this skip the rotation maneuver
 
   # ---- Roundabout ----
-  roundabout_drive_speed: 0.10  # m/s — pure map following speed inside roundabout
+  roundabout_drive_speed: 0.10  # m/s — map-following speed inside roundabout
+  # Curve following (item 1): per-segment radial arc through the ring nodes.
+  roundabout_lookahead_m:  0.25 # carrot lookahead along the curve (smaller = hugs tighter, larger = smoother / less spin-in-place)
+  roundabout_spline_res_m: 0.03 # dense-curve sample spacing (m)
+  # Lane guardrail (item 2): camera-frame nudge AWAY from a road edge we're about
+  # to cross. NOT lane-following — does nothing unless a line is confidently seen.
+  roundabout_lane_correct: true # master enable for the guardrail nudge
+  roundabout_outer_clear:  0.25 # normalized clearance to OUTER (road-edge) line below which we nudge inward
+  roundabout_inner_clear:  0.20 # normalized clearance to INNER (island) line below which we nudge outward
+  roundabout_lane_gain:    0.40 # rad/s per unit severity of the edge proximity
+  roundabout_lane_max:     0.50 # rad/s cap on the guardrail nudge
+  # Off-reference failsafe: deviation from our own reference (spline on the ring,
+  # path on the exit) that trips the shared CONFLICT_STOP halt. Lane is unreliable
+  # here, so this geometric check is the only roundabout safety net. Generous +
+  # debounced so only a genuine off-road excursion stops the robot.
+  roundabout_offref_m:     0.40 # m of deviation before tripping the stop
+  roundabout_offref_ticks: 10   # consecutive off-reference ticks (debounce)
 
   # ---- Map pure-pursuit (FALLBACK state) ----
   lookahead_m: 0.50

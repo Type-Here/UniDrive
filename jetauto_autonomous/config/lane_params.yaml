@@ -143,7 +143,7 @@ orchestrator:
   roundabout_lane_gain:    0.40 # rad/s per unit severity of the edge proximity
   roundabout_lane_max:     0.50 # rad/s cap on the guardrail nudge
   # Off-reference failsafe: deviation from our own reference (spline on the ring,
-  # path on the exit) that trips the shared CONFLICT_STOP halt. Lane is unreliable
+  # path on the exit) that trips the terminal EMERGENCY_STOP. Lane is unreliable
   # here, so this geometric check is the only roundabout safety net. Generous +
   # debounced so only a genuine off-road excursion stops the robot.
   roundabout_offref_m:     0.40 # m of deviation before tripping the stop

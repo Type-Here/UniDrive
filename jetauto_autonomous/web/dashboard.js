@@ -124,7 +124,10 @@ function setupTopics() {
   new ROSLIB.Topic({ ros, name: '/orchestrator/state', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => {
       const b = document.getElementById('mapFollowerBadge');
+      const banner = document.getElementById('emergencyBanner');
       const s = m.data;
+      // Terminal emergency stop: loud, persistent banner until a new goal resumes.
+      banner.style.display = (s === 'EMERGENCY_STOP') ? '' : 'none';
       if (s === 'JUNCTION') {
         b.style.display = '';
         b.className = 'badge junction';
@@ -133,6 +136,14 @@ function setupTopics() {
         b.style.display = '';
         b.className = 'badge map-follower';
         b.textContent = 'MAP FALLBACK';
+      } else if (s === 'EMERGENCY_STOP') {
+        b.style.display = '';
+        b.className = 'badge stop';
+        b.textContent = '⛔ EMERGENCY STOP';
+      } else if (s === 'ROUNDABOUT') {
+        b.style.display = '';
+        b.className = 'badge nav';
+        b.textContent = 'ROUNDABOUT';
       } else {
         b.style.display = 'none';
       }

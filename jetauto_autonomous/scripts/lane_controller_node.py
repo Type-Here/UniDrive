@@ -22,12 +22,18 @@ import rospy
 
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float64MultiArray, String
 
 from lane_core import LaneControllerCore, clamp
 
 
 class LaneControllerV2Node(LaneControllerCore):
+
+    # state string -> numeric code for the additive /lane_controller/info topic
+    _STATE_CODE = {
+        "STOP": 0.0, "HOLD": 1.0, "TRACKING_CC": 2.0,
+        "SINGLE_L": 3.0, "SINGLE_R": 4.0, "DISABLED": 5.0,
+    }
 
     def __init__(self):
         rospy.init_node("lane_controller_v2", anonymous=False)
@@ -80,6 +86,7 @@ class LaneControllerV2Node(LaneControllerCore):
         self.cmd_topic    = rp("cmd_topic",    "/lane_controller/cmd_vel")
         self.debug_topic  = rp("debug_topic",  "/lane_debug/image")
         self.state_topic  = rp("state_topic",  "/lane_controller/state")
+        self.info_topic   = rp("info_topic",   "/lane_controller/info")
         self.enable_topic = rp("enable_topic", "/lane_controller/enable")
 
         self.drive_mode    = rp("drive_mode",    "classic")
@@ -98,6 +105,9 @@ class LaneControllerV2Node(LaneControllerCore):
         # -- Publishers / Subscribers -----------------------------------------
         self.cmd_pub   = rospy.Publisher(self.cmd_topic,   Twist,  queue_size=1)
         self.state_pub = rospy.Publisher(self.state_topic, String, queue_size=1, latch=True)
+        # Additive geometry topic for the orchestrator's roundabout guardrail.
+        # Purely informational — the cmd_vel/state path above is unchanged.
+        self.info_pub  = rospy.Publisher(self.info_topic,  Float64MultiArray, queue_size=1)
         if self.publish_debug:
             self.debug_pub = rospy.Publisher(self.debug_topic, Image, queue_size=1)
 
@@ -161,6 +171,81 @@ class LaneControllerV2Node(LaneControllerCore):
         if s != self.last_state:
             self.state_pub.publish(String(data=s))
             self.last_state = s
+
+    # -- Additive lane-geometry info (orchestrator roundabout guardrail) --------
+
+    @staticmethod
+    def _x_at_y(line, y):
+        """x of a fitted line [x_bot,y_bot,x_top,y_top] at row y (linear interp)."""
+        if line is None:
+            return None
+        x1, y1, x2, y2 = line
+        if y2 == y1:
+            return float(x1)
+        return x1 + float(y - y1) / float(y2 - y1) * (x2 - x1)
+
+    @staticmethod
+    def _lane_heading(left_line, right_line):
+        """Lane forward direction vs robot straight-ahead (rad). +ve bends right.
+
+        Averaged over whichever lines are present; 0.0 if none. This is the REAL
+        lane direction the orchestrator can use instead of the angular.z proxy.
+        """
+        def hdg(line):
+            if line is None:
+                return None
+            x1, y1, x2, y2 = line
+            # forward = from the near (larger y) to the far (smaller y) endpoint
+            if y1 >= y2:
+                dx, dyf = (x2 - x1), (y1 - y2)
+            else:
+                dx, dyf = (x1 - x2), (y2 - y1)
+            if dyf <= 1e-6:
+                return None
+            return math.atan2(dx, dyf)
+        vals = [h for h in (hdg(left_line), hdg(right_line)) if h is not None]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    def _publish_info(self, info=None, state="STOP"):
+        """Publish /lane_controller/info (Float64MultiArray). ADDITIVE / read-only.
+
+        Layout:
+          [0] state_code   [1] heading_rad
+          [2] left_valid   [3] right_valid
+          [4] left_offset  [5] right_offset   [6] center_offset   [7] lane_width
+        Offsets are normalized to half image width: (x - cx) / (W/2), so left is
+        ~negative, right ~positive, |.|~0 means the line is at the robot centre
+        (about to be crossed). lane_width is (rx-lx)/(W/2) (or dyn width) or 0.
+        Invalid/absent fields are 0.0; consumers must gate on the valid flags.
+        """
+        msg  = Float64MultiArray()
+        code = self._STATE_CODE.get(state, 0.0)
+        if info is None:
+            msg.data = [code, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            self.info_pub.publish(msg)
+            return
+        dst_h, dst_w = info["mask"].shape[:2]
+        half = max(dst_w / 2.0, 1.0)
+        cy   = info["center_y"]
+        vl, vr = bool(info["valid_l"]), bool(info["valid_r"])
+        lx = self._x_at_y(info["left_line"],  cy) if vl else None
+        rx = self._x_at_y(info["right_line"], cy) if vr else None
+        lc = info.get("lane_center")
+        left_off   = (lx - half) / half if lx is not None else 0.0
+        right_off  = (rx - half) / half if rx is not None else 0.0
+        center_off = (lc - half) / half if lc is not None else 0.0
+        if lx is not None and rx is not None:
+            width = (rx - lx) / half
+        elif info.get("dyn_lane_width"):
+            width = info["dyn_lane_width"] / half
+        else:
+            width = 0.0
+        heading = self._lane_heading(info["left_line"] if vl else None,
+                                     info["right_line"] if vr else None)
+        msg.data = [code, heading,
+                    1.0 if vl else 0.0, 1.0 if vr else 0.0,
+                    left_off, right_off, center_off, width]
+        self.info_pub.publish(msg)
 
     # -- Twist output ---------------------------------------------------------
 
@@ -279,10 +364,12 @@ class LaneControllerV2Node(LaneControllerCore):
 
         if not self.enabled:
             self._publish_state("DISABLED")
+            self._publish_info(None, "DISABLED")
             return
 
         if mask is None:
             self._publish_state("STOP")
+            self._publish_info(None, "STOP")
             return
 
         steering, _, state, info = self.step(mask)
@@ -290,6 +377,7 @@ class LaneControllerV2Node(LaneControllerCore):
         self._publish_state(state)
         twist = self._steering_to_twist(steering)
         self.cmd_pub.publish(twist)
+        self._publish_info(info, state)
 
         if self.publish_debug:
             self._publish_debug_image(info, steering, twist)

@@ -33,7 +33,7 @@ Lane vector `l` is a proxy reconstructed from the lane controller's `angular.z`
 
 States
 ------
-  IDLE · NAVIGATING · JUNCTION · ROUNDABOUT · FALLBACK · CONFLICT_STOP · DONE
+  IDLE · NAVIGATING · JUNCTION · ROUNDABOUT · FALLBACK · EMERGENCY_STOP · DONE
 
 This file is standalone: it imports the parent read-only (the parent only spins
 up a ROS node under its own `__main__`) and touches no other module.  Run it in
@@ -139,8 +139,8 @@ def _densify(p, q, res):
 class NewOrchestrator(Orchestrator):
 
     # Extra states beyond the parent's IDLE/NAVIGATING/JUNCTION/FALLBACK/DONE.
-    ROUNDABOUT    = "ROUNDABOUT"
-    CONFLICT_STOP = "CONFLICT_STOP"
+    ROUNDABOUT     = "ROUNDABOUT"
+    EMERGENCY_STOP = "EMERGENCY_STOP"   # terminal failsafe halt (ends navigation)
 
     def __init__(self):
         super(NewOrchestrator, self).__init__()
@@ -151,7 +151,7 @@ class NewOrchestrator(Orchestrator):
 
         # Off-route threshold t (m).  >= t -> FALLBACK ; >= 2t -> REPLAN.
         self._offroute_t   = float(rp("offroute_t", 0.40))
-        # Consecutive conflict ticks (c < 0) before CONFLICT_STOP (debounce).
+        # Consecutive conflict ticks (c < 0) before EMERGENCY_STOP (debounce).
         self._conflict_ticks = int(rp("conflict_ticks", 12))
         # angular.z -> implied heading proxy: full steer maps to this many deg.
         self._proxy_max    = math.radians(float(rp("proxy_max_deg", 80.0)))
@@ -160,7 +160,7 @@ class NewOrchestrator(Orchestrator):
         # in-place spin arms at junction_radius. With an imperfect map the robot may
         # never pass within junction_radius of the node, so this must be wide enough
         # to start the turn on its own — 0.30 (~= junction_radius) made it miss the
-        # turn entirely and then CONFLICT_STOP. Must comfortably exceed junction_radius.
+        # turn entirely and then EMERGENCY_STOP. Must comfortably exceed junction_radius.
         self._junction_influence_radius = float(rp("junction_influence_radius", 0.50))
         # Min seconds between GPS-style replans (avoid spamming the planner).
         self._replan_cooldown = float(rp("replan_cooldown", 3.0))
@@ -184,7 +184,7 @@ class NewOrchestrator(Orchestrator):
         self._round_lane_max     = float(rp("roundabout_lane_max",    0.50))
         # Roundabout off-reference failsafe: how far the robot may stray from its OWN
         # reference (the radial spline on the ring, or the path on the exit leg) before
-        # it trips the SHARED stop failsafe (CONFLICT_STOP). Debounced. Lane is
+        # it trips the SHARED stop failsafe (EMERGENCY_STOP). Debounced. Lane is
         # unreliable in the ring, so this geometric check — not a lane check — is the
         # only safety net here; without it a bad map/odom drive just runs away off-road
         # (the observed failure). Generous threshold so only a genuine excursion trips.
@@ -198,7 +198,7 @@ class NewOrchestrator(Orchestrator):
         self._offroute_ticks  = int (rp("offroute_ticks", 10))
 
         self._conflict_count   = 0      # consecutive conflict ticks
-        self._conflict_recover = 0      # consecutive recovered ticks in CONFLICT_STOP
+        self._emergency        = False  # terminal emergency-stop latch (cleared by a new goal)
         self._offroute_count   = 0      # consecutive off-route ticks
         self._round_offref_count = 0    # consecutive off-reference ticks (roundabout failsafe)
         self._round_offset       = 0.0  # latest robot distance to its roundabout reference (m)
@@ -309,15 +309,46 @@ class NewOrchestrator(Orchestrator):
             self._publish_orc_state(self.FALLBACK)
             rospy.loginfo("[new_orch] -> FALLBACK (%s)", why)
 
-    def _enter_conflict_stop(self, why="lane vs map conflict"):
-        self._state            = self.CONFLICT_STOP
-        self._conflict_recover = 0
-        self._publish_orc_state(self.CONFLICT_STOP)
-        rospy.logwarn("[new_orch] -> CONFLICT_STOP (%s)", why)
+    def _enter_emergency_stop(self, why="lane vs map conflict"):
+        """Terminal failsafe: halt the robot and END navigation (like arrival).
+
+        The debounce upstream already absorbs transient camera/segmentation noise, so a
+        trip here is a *sustained* fault that, in practice, never self-recovers. Instead
+        of a recoverable hold, we stop the wheels, disable the lane controller, and
+        CANCEL the active goal (empty goal -> waypoint_manager IDLE). The robot stays
+        stopped and the dashboard shows EMERGENCY_STOP until a NEW goal is issued
+        (cleared in _path_cb). The latch is honored at the top of _step.
+        """
+        self._emergency = True
+        self._state     = self.EMERGENCY_STOP
+        self._set_lane_enabled(False)              # stop the lane controller driving
+        self._cmd_pub.publish(Twist())             # halt the wheels
+        self._goal_pub.publish(Int32MultiArray())  # cancel navigation (empty goal)
+        self._publish_orc_state(self.EMERGENCY_STOP)
+        rospy.logwarn("[new_orch] EMERGENCY STOP: %s -- navigation halted; "
+                      "issue a new goal to resume", why)
+
+    def _path_cb(self, msg):
+        # A genuinely new goal (non-empty path) clears a latched emergency and resumes.
+        super(NewOrchestrator, self)._path_cb(msg)
+        if self._emergency and len(msg.data) > 0:
+            self._emergency = False
+            self._state     = self.NAVIGATING
+            rospy.loginfo("[new_orch] EMERGENCY cleared by new goal -> resuming")
 
     # --------------------------------------------------------------- main FSM
 
     def _step(self):
+        # Terminal emergency stop: hold the robot halted (lane off + zero cmd) and keep
+        # the dashboard informed until a NEW goal is issued (cleared in _path_cb). Sits
+        # ABOVE everything — including the inactive/DONE handler — so the nav cancel we
+        # publish on entry can't bounce us into IDLE and mask the EMERGENCY_STOP state.
+        if self._emergency:
+            self._set_lane_enabled(False)
+            self._cmd_pub.publish(Twist())
+            self._publish_orc_state(self.EMERGENCY_STOP)
+            return
+
         # --- snapshot shared state under one lock (mirrors parent) ---
         with self._lock:
             pose       = self._pose
@@ -401,16 +432,9 @@ class NewOrchestrator(Orchestrator):
             math.degrees(theta_m), c)
 
         # --- dispatch ---
-        # CONFLICT_STOP is the SINGLE shared failsafe halt and is checked FIRST so it
-        # is sticky everywhere: once stopped, _h_conflict_stop owns the robot until it
-        # clears, even inside the roundabout. (Previously the roundabout pre-empted it,
-        # so a stop entered in the ring never actually ran its handler — the state just
-        # flickered ROUNDABOUT<->CONFLICT_STOP. Ordering it first fixes that and lets
-        # the roundabout off-reference failsafe reuse the same stop.)
-        # Otherwise the roundabout pre-empts everything except an in-progress junction.
-        if self._state == self.CONFLICT_STOP:
-            self._h_conflict_stop(C)
-        elif in_roundabout and self._state != self.JUNCTION:
+        # (The terminal EMERGENCY_STOP is handled at the very top of _step, so it never
+        # reaches here.) The roundabout pre-empts everything except a junction spin.
+        if in_roundabout and self._state != self.JUNCTION:
             self._h_roundabout(C)
         elif self._state == self.JUNCTION:
             self._h_junction(C)
@@ -459,8 +483,7 @@ class NewOrchestrator(Orchestrator):
         if (C.lane_usable and C.next_id >= 0 and not C.is_junction and C.c < 0.0):
             self._conflict_count += 1
             if self._conflict_count >= self._conflict_ticks:
-                self._enter_conflict_stop()
-                self._cmd_pub.publish(Twist())
+                self._enter_emergency_stop()
                 return
         else:
             self._conflict_count = 0
@@ -684,8 +707,7 @@ class NewOrchestrator(Orchestrator):
         if C.lane_usable and C.next_id >= 0 and C.c < self._roundabout_conflict_c:
             self._conflict_count += 1
             if self._conflict_count >= self._conflict_ticks:
-                self._enter_conflict_stop()
-                self._cmd_pub.publish(Twist())
+                self._enter_emergency_stop()
                 return
         else:
             self._conflict_count = 0
@@ -719,19 +741,18 @@ class NewOrchestrator(Orchestrator):
             self._cmd_pub.publish(Twist())
             return
 
-        # Off-reference failsafe -> the SINGLE shared stop (CONFLICT_STOP).
+        # Off-reference failsafe -> the SINGLE shared terminal stop (EMERGENCY_STOP).
         # Lane is unreliable in the roundabout, so a geometric deviation from our own
         # reference (spline on the ring, path on the exit) is the only safety net. A
-        # sustained excursion means the map/odom drive has gone wrong; halt rather than
-        # keep driving off-road. Debounced; recovery is the shared lane/map-agreement
-        # gate in _h_conflict_stop (a stop that waits for a human is the safe default).
+        # sustained excursion means the map/odom drive has gone wrong; halt and END the
+        # run rather than keep driving off-road. Debounced (transient noise absorbed);
+        # no auto-recovery — resume only by issuing a new goal from the dashboard.
         if self._round_offset > self._round_offref_m:
             self._round_offref_count += 1
             if self._round_offref_count >= self._round_offref_ticks:
                 self._round_offref_count = 0
-                self._enter_conflict_stop("off-reference %.2fm (roundabout)"
-                                          % self._round_offset)
-                self._cmd_pub.publish(Twist())
+                self._enter_emergency_stop("off-reference %.2fm (roundabout)"
+                                           % self._round_offset)
                 return
         else:
             self._round_offref_count = 0
@@ -820,23 +841,9 @@ class NewOrchestrator(Orchestrator):
             self._publish_orc_state(self.FALLBACK)
         self._cmd_pub.publish(self._pursuit_twist((C.rx, C.ry, C.ryaw), C.path_ids))
 
-    # ----------------------------------------------------------- CONFLICT_STOP
-
-    def _h_conflict_stop(self, C):
-        # Hold a full stop until lane and map agree again for recovery_ticks.
-        self._publish_orc_state(self.CONFLICT_STOP)
-        if C.lane_usable and C.next_id >= 0 and C.c >= 0.0:
-            self._conflict_recover += 1
-            if self._conflict_recover >= self._recovery_ticks:
-                self._conflict_recover = 0
-                self._conflict_count   = 0
-                self._state = self.NAVIGATING
-                rospy.loginfo("[new_orch] CONFLICT_STOP -> NAVIGATING (agreement restored)")
-                self._h_navigating(C)
-                return
-        else:
-            self._conflict_recover = 0
-        self._cmd_pub.publish(Twist())
+    # EMERGENCY_STOP is terminal: entered via _enter_emergency_stop(), held at the top
+    # of _step(), and cleared only by a new goal (_path_cb). No per-tick handler / no
+    # auto-recovery — a sustained fault past the debounce ends the run by design.
 
 
 if __name__ == "__main__":

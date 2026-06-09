@@ -337,14 +337,19 @@ function renderMap() {
   const deg={};
   for(const e of mapData.edges){deg[e.from]=(deg[e.from]||0)+1;deg[e.to]=(deg[e.to]||0)+1;}
   // Background grid: mg=0.3 is the cell size → 14 cols × 11 rows
-  let html='';
+  let html=`<defs>
+    <marker id="arr" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="6" refX="4.5" refY="3" orient="auto">
+      <path d="M0,0 L9,3 L0,6 Z" fill="context-stroke" opacity="0.75"/>
+    </marker>
+  </defs>`;
   const nCols=Math.round(W/mg), nRows=Math.round(H/mg);
   for(let i=0;i<=nCols;i++){const sx=tx(minX+i*mg); html+=`<line class="grid-line" x1="${sx}" y1="0" x2="${sx}" y2="${SVG_H}"/>`;}
   for(let j=0;j<=nRows;j++){const sy=ty(minY+j*mg); html+=`<line class="grid-line" x1="0" y1="${sy}" x2="${SVG_W}" y2="${sy}"/>`;}
   for(const e of mapData.edges){
     const a=mapData.nodes[e.from],b=mapData.nodes[e.to];
     if(!a||!b) continue;
-    html+=`<line class="edge" data-from="${e.from}" data-to="${e.to}" x1="${tx(a.x)}" y1="${ty(a.y)}" x2="${tx(b.x)}" y2="${ty(b.y)}"/>`;
+    const mx=(tx(a.x)+tx(b.x))/2, my=(ty(a.y)+ty(b.y))/2;
+    html+=`<polyline class="edge" data-from="${e.from}" data-to="${e.to}" points="${tx(a.x)},${ty(a.y)} ${mx},${my} ${tx(b.x)},${ty(b.y)}"/>`;
   }
   for(const id of ids){
     const n=mapData.nodes[id], isJ=(deg[id]||0)>2;

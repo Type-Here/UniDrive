@@ -50,7 +50,7 @@ basato su segmentazione semantica (MobileNetV3 / TensorRT esterno).
 │ lane_  │    │ lane_controller_node               │
 │ follo- │--->│  └- lane_core (pura logica)        │
 │ wer.py │    │ + waypoint_manager_node            │
-│ (suo)  │    │ + map_follower_node (fallback BEV) │
+│ (suo)  │    │ + orchestrator (unico a guidare)   │
 │        │    │ + serve_dashboard                  │
 └--------┘    └------------------------------------┘
 Python 3.6.9       Python 2.7
@@ -65,15 +65,16 @@ e ambiente; comunicano solo via topic ROS.
 | File | Ruolo |
 |---|---|
 | `scripts/lane_controller_node.py` | Nodo ROS: wiring rosparam/pub/sub, gestisce stati TRACKING/SINGLE/STOP/DISABLED |
-| `scripts/lane_core.py` | Logica pura (no ROS): Hough, fit polinomiale, PD sterzata - importabile anche dall'offline tester |
-| `scripts/waypoint_manager_node.py` | Nodo ROS: Dijkstra + sequenza waypoint + controllo diretto agli incroci |
-| `scripts/map_follower_node.py` | Fallback pure-pursuit: guida sul grafo mappa quando le corsie spariscono |
+| `scripts/lane_core.py` | Logica pura (no ROS): Hough, fit polinomiale, sterzata con EMA adattivo - importabile anche dall'offline tester |
+| `scripts/waypoint_manager_node.py` | Nodo ROS: Dijkstra + sequenza waypoint; pubblica `nav_info` (pianifica, non guida) |
+| `scripts/orchestrator.py` | Nodo ROS: unico publisher di `cmd_vel`; FSM blend corsia/mappa, incroci, fallback pure-pursuit |
+| `scripts/new_orchestrator.py` | Variante sperimentale di orchestrator (blend disagreement, rotonde, EMERGENCY_STOP) |
 | `scripts/map_loader.py` | Caricamento YAML + grafo NetworkX, classificazione nodi |
 | `scripts/serve_dashboard.py` | Mini server HTTP standalone per la dashboard |
-| `config/lane_params.yaml` | Tutti i parametri (gain P, soglie, BEV, map_follower, ecc.) |
+| `config/lane_params.yaml` | Tutti i parametri (velocità, soglie Hough, BEV, orchestrator, ecc.) |
 | `web/dashboard.html` | UI: feed video + mappa SVG + controlli |
 | `maps/map_clean-edited_smooth.yaml` | La mappa della pista |
-| `start_all.sh` | Avvia tutto il sistema (8 processi) |
+| `start_all.sh` | Avvia tutto lo stack ROS (rosbridge, web_video, dashboard, lane_controller, waypoint_manager, orchestrator) |
 | `stop_all.sh` | Ferma tutto + pubblica zero Twist |
 
 ## Prerequisiti sul Jetson
@@ -130,9 +131,9 @@ Cosa lancia:
 2. `rosbridge_websocket` (porta 9090) - comunicazione WebSocket per la dashboard
 3. `web_video_server` (porta 8080) - streaming MJPEG dei topic immagine
 4. `serve_dashboard.py` (porta 8000) - server HTTP della dashboard
-5. `lane_controller_node.py` - controllo laterale
-6. `waypoint_manager_node.py` - gestione waypoint
-7. `map_follower_node.py` - fallback BEV (avviato sempre, attivo solo se `map_follower.enable: true`)
+5. `lane_controller_node.py` - controllo laterale (propone cmd_vel)
+6. `waypoint_manager_node.py` - gestione waypoint (pianifica, pubblica nav_info)
+7. `orchestrator.py` - unico publisher di `/jetauto_controller/cmd_vel` (FSM, blend, fallback)
 
 I log finiscono in `/tmp/jetauto_autonomous_logs/`.
 I PID dei processi in `/tmp/jetauto_autonomous.pids`.
@@ -150,7 +151,7 @@ python lane_follower.py [args che usa di solito]
 Verifica con:
 
 ```bash
-rostopic hz /lane_mask
+rostopic hz /lane_mask_bev
 ```
 
 ## Apri la dashboard
@@ -174,13 +175,6 @@ cd ~/jetauto_autonomous
 ./stop_all.sh
 ```
 
-## Override veloci
-
-```bash
-./start_all.sh --bev      # forza input_mode=bev_topic (usa /lane_mask_bev già warpato)
-./start_all.sh --camera   # forza input_mode=camera (default)
-```
-
 ## Tuning rapido
 
 Modifica `config/lane_params.yaml` direttamente sul Jetson (è puro YAML, non
@@ -198,8 +192,7 @@ Parametri che probabilmente vorrai toccare al primo test:
 | `max_angular_z` | sterzata massima (rad/s, drive=classic) | 0.80 | 0.4 - 1.2 |
 | `max_steering_angle` | angolo max mappato (gradi) | 48.0 | 30 - 60 |
 | `single_line_offset` | offset px stima centro con singola linea | 0 | 0 - 60 |
-| `hough_roi_top_frac` | porzione superiore BEV ignorata (use_bev=true) | 0.30 | 0.0 - 0.6 |
-| `no_bev_roi_top_frac` | porzione superiore ignorata (use_bev=false) | 0.45 | 0.3 - 0.6 |
+| `hough_roi_top_frac` | porzione superiore BEV ignorata (lontano dal robot) | 0.30 | 0.0 - 0.6 |
 | `hough_threshold` | voti minimi HoughLinesP | 50 | 30 - 80 |
 | `hough_max_gap_px` | gap max per unire segmenti Hough | 40 | 10 - 60 |
 | `hough_min_length_px` | lunghezza min linea validata | 20 | 10 - 40 |
@@ -211,7 +204,7 @@ Parametri che probabilmente vorrai toccare al primo test:
 Misura gli FPS del modello con:
 
 ```bash
-rostopic hz /lane_mask
+rostopic hz /lane_mask_bev
 ```
 
 E imposta `control_rate_hz` ≤ FPS_modello + 5 (vedi sezione "Tuning consigliato per Jetson Nano 4GB" più sotto).
@@ -227,8 +220,8 @@ corsia. Senza questo meccanismo, una `lane_width_px` errata di anche
 solo il 15% rispetto alla pista reale spinge il robot sistematicamente
 fuori centro.
 
-**Quando si attiva**: solo in modalità BEV (`use_bev: true`). Il primo
-frame con due linee valide fa il bootstrap. Ogni nuova misura entra
+**Quando si attiva**: il primo frame con due linee valide fa il
+bootstrap. Ogni nuova misura entra
 nell'EMA se passa due sanity-check:
 
 1. Range assoluto `[lane_width_min_px, lane_width_max_px]` (sempre).
@@ -251,50 +244,18 @@ comportamento statico (usa sempre `lane_width_px`).
 `lane_width_px`, `lane_width_min_px`, `lane_width_max_px`. Il nodo
 emette un warning a startup se i bound non comprendono `lane_width_px`.
 
-## map_follower_node - fallback BEV
+## Fallback su mappa (interno all'orchestrator)
 
-`map_follower_node.py` è un controller di fallback che guida il robot sul
-grafo della mappa quando le corsie non sono visibili (es. incroci privi di
-segnaletica, zone danneggiate della pista).
+Il fallback pure-pursuit non è più un nodo separato: vive dentro
+`orchestrator.py` come stato `FALLBACK` della FSM. Quando la corsia resta in
+`HOLD`/`STOP` per `hold_ramp_ticks` tick consecutivi durante la navigazione,
+l'orchestrator disabilita il lane controller e guida sul path calcolato da
+`waypoint_manager_node` finché la corsia non torna stabile (rientro in
+`NAVIGATING` dopo `recovery_ticks` tick OK e vicinanza a un nodo del path).
 
-**Quando si attiva** (tutte le condizioni devono essere vere):
-- `lane_controller/state == HOLD` per `hold_fallback_frames` tick consecutivi
-- `waypoint_manager/status == NAVIGATING`
-- NOT in stato JUNCTION
-
-**Cosa fa**: pure-pursuit sul path calcolato da `waypoint_manager_node`, usando
-l'odometria. Mentre è attivo pubblica `enable=False` su `/lane_controller/enable`
-(arbitration), e lo riabilita con `enable=True` una volta che la corsia è tornata
-stabile.
-
-**Abilitazione**: il nodo è sempre avviato da `start_all.sh` ma disabilitato di
-default. Per attivarlo:
-
-```yaml
-# config/lane_params.yaml
-map_follower:
-  enable: true
-```
-
-oppure a caldo (senza riavviare):
-
-```bash
-rosparam set /map_follower/enable true
-```
-
-**Parametri chiave**:
-
-| Parametro | Default | Effetto |
-|---|---|---|
-| `hold_fallback_frames` | 15 (= 1.5 s @ 10 Hz) | Tick in HOLD prima dell'attivazione |
-| `lane_recovery_frames` | 5 (= 0.5 s) | Tick di corsia stabile prima del ritorno |
-| `lookahead_m` | 0.50 m | Distanza pure-pursuit |
-| `map_drive_speed` | 0.04 m/s | Velocità in modalità mappa |
-| `angular_kp` | 1.2 | Guadagno P errore heading - angular.z |
-
-**Topic di debug**:
-- `/map_follower/state` - stato corrente: INACTIVE / ACTIVATING / ACTIVE / RECOVERING
-- `/map_follower/active` - Bool, latched
+I parametri stanno in `lane_params.yaml` sotto `orchestrator:`
+(`hold_ramp_ticks`, `recovery_ticks`, `lookahead_m`, `map_drive_speed`,
+`map_kp`, `map_max_angular`).
 
 ## Tuning consigliato per Jetson Nano 4GB
 
@@ -328,19 +289,15 @@ che lo startup-script finisca, oppure lancialo a mano: `roscore &`.
 **"dipendenze Python mancanti"** -> `sudo apt install python-yaml python-networkx`.
 
 **Robot non si muove dopo START** -> controlla:
-- `rostopic hz /lane_mask` deve dare frequenza > 0
+- `rostopic hz /lane_mask_bev` deve dare frequenza > 0
 - `rostopic echo /lane_controller/state` deve mostrare `TRACKING_*`, non `STOP`
 - `rostopic echo /jetauto_controller/cmd_vel` deve mostrare Twist non-zero
 
-**Robot si ferma in mezzo alla pista senza corsia visibile** - con
-`map_follower.enable: false` il sistema entra in HOLD e si ferma.
-Per attivare il fallback:
-
-```bash
-rosparam set /map_follower/enable true
-```
-
-oppure editare `config/lane_params.yaml` e riavviare.
+**Robot si ferma in mezzo alla pista senza corsia visibile** - con un goal
+attivo l'orchestrator passa in `FALLBACK` (pure-pursuit sul path) dopo
+`hold_ramp_ticks` tick di corsia persa. Se si ferma comunque, verifica che ci
+sia una navigazione attiva (`/waypoint_manager/status == NAVIGATING`) e che
+`/waypoint_manager/path` non sia vuoto.
 
 **Robot oscilla** -> abbassa `Kp_lat` a 0.002 o aumenta `smooth_alpha` a 0.6.
 

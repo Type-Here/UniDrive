@@ -14,6 +14,7 @@
 #        - serve_dashboard.py  (port 8000)
 #        - lane_controller_node.py
 #        - waypoint_manager_node.py
+#        - new_orchestrator.py  (sole cmd_vel publisher)
 #   4. Save PIDs to /tmp/jetauto_autonomous.pids
 #
 # WHAT IT DOES NOT DO:
@@ -23,8 +24,6 @@
 #
 # USAGE:
 #   ./start_all.sh                # start everything
-#   ./start_all.sh --camera       # input_mode camera (default)
-#   ./start_all.sh --bev          # force input_mode bev_topic
 #
 # To stop everything: ./stop_all.sh
 # =============================================================================
@@ -47,11 +46,8 @@ LOG_DIR="/tmp/jetauto_autonomous_logs"
 PY="python2"
 
 # ---- Argument parsing ----
-INPUT_MODE_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --camera) INPUT_MODE_OVERRIDE="camera"; shift ;;
-    --bev)    INPUT_MODE_OVERRIDE="bev_topic"; shift ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \?//' | head -40
       exit 0 ;;
@@ -107,11 +103,6 @@ mkdir -p "$LOG_DIR"
 # ---- 1. Load YAML parameters into rosparam ----
 echo "[1/7] rosparam load $PARAMS_FILE"
 rosparam load "$PARAMS_FILE"
-# Override input_mode if requested via CLI
-if [[ -n "$INPUT_MODE_OVERRIDE" ]]; then
-  rosparam set "lane_controller/input_mode" "$INPUT_MODE_OVERRIDE"
-  echo "       input_mode override -> $INPUT_MODE_OVERRIDE"
-fi
 
 # ---- Helper function to launch a background process + log + PID ----
 start_proc () {
@@ -159,9 +150,9 @@ echo "[6/7] waypoint_manager (path-tracker)"
 start_proc waypoint_manager \
   $PY "$SCRIPTS_DIR/waypoint_manager_node.py"
 
-echo "[7/7] orchestrator (sole cmd_vel publisher)"
+echo "[7/7] new_orchestrator (sole cmd_vel publisher)"
 start_proc orchestrator \
-  $PY "$SCRIPTS_DIR/orchestrator.py"
+  $PY "$SCRIPTS_DIR/new_orchestrator.py"
 
 # ---- Summary ----
 echo
@@ -182,9 +173,8 @@ echo "================================================="
 echo
 echo "REMINDER: lane_follower.py must be started separately"
 echo "          in its conda Python 3.6.9 environment."
-echo "          Without it, /lane_mask and /lane_mask_bev"
-echo "          is not published and lane_controller"
-echo "          stays in STOP state."
+echo "          Without it, /lane_mask_bev is not published"
+echo "          and lane_controller stays in STOP state."
 
 # Define colors using printf to ensure maximum compatibility on Zsh/Bash
 G=$(printf '\033[32m') # Green (Body)

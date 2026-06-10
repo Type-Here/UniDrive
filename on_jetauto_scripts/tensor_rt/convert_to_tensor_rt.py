@@ -212,8 +212,7 @@ def main():
 
     print()
     print("  Done. Test the engine with:")
-    print(f"    python3 lane_follower.py --model {engine_path} "
-          f"--bev bev_config.json --tensorrt --dry-run")
+    print(f"    python3 lane_follower.py --model {engine_path} --tensorrt")
     print()
 
 

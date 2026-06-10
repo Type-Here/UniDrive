@@ -153,6 +153,13 @@ class NewOrchestrator(Orchestrator):
         self._offroute_t   = float(rp("offroute_t", 0.40))
         # Consecutive conflict ticks (c < 0) before EMERGENCY_STOP (debounce).
         self._conflict_ticks = int(rp("conflict_ticks", 12))
+        # Conflict stop only counts while the robot is genuinely ON the planned
+        # path. Off-route (e.g. after cutting a corner) the bearing-to-next-node is
+        # large, so c collapses to cos(theta_m) and a straight, recovering lane reads
+        # as a >90deg "conflict" even though nothing is wrong-way — a recovery case
+        # FALLBACK owns. So only count the conflict when the cross-track to the path
+        # is small enough that the map heading is a trustworthy "this is the way".
+        self._conflict_onpath_m = float(rp("conflict_onpath_m", 0.35))
         # angular.z -> implied heading proxy: full steer maps to this many deg.
         self._proxy_max    = math.radians(float(rp("proxy_max_deg", 80.0)))
         # Distance over which the map progressively blends the robot INTO a junction
@@ -303,9 +310,10 @@ class NewOrchestrator(Orchestrator):
 
     def _enter_fallback(self, why):
         if self._state != self.FALLBACK:
-            self._state      = self.FALLBACK
-            self._hold_count = 0
-            self._recv_count = 0
+            self._state          = self.FALLBACK
+            self._hold_count     = 0
+            self._recv_count     = 0
+            self._conflict_count = 0   # off-path excursion is a recovery, not a conflict
             self._publish_orc_state(self.FALLBACK)
             rospy.loginfo("[new_orch] -> FALLBACK (%s)", why)
 
@@ -480,7 +488,16 @@ class NewOrchestrator(Orchestrator):
         #    signal, not a wrong-way conflict — counting it stops the robot dead in
         #    the middle of every sharp turn (observed). A genuine wrong-way is still
         #    caught once past the junction (is_junction clears -> counting resumes).
-        if (C.lane_usable and C.next_id >= 0 and not C.is_junction and C.c < 0.0):
+        #    ALSO gated on being ON the path: off-route (e.g. after cutting a corner)
+        #    the bearing-to-next-node is large, so c collapses to cos(theta_m) and a
+        #    straight, recovering lane reads as a >90deg conflict even though nothing
+        #    is wrong-way. That excursion is a recovery FALLBACK owns; counting it
+        #    here terminally stopped the robot mid-recovery (observed). When off the
+        #    path the map heading isn't a trustworthy "this is the way" signal, so we
+        #    only judge a conflict while the cross-track to the path is small.
+        on_path = self._offpath_dist(C.rx, C.ry, C.path_ids) <= self._conflict_onpath_m
+        if (C.lane_usable and C.next_id >= 0 and not C.is_junction
+                and on_path and C.c < 0.0):
             self._conflict_count += 1
             if self._conflict_count >= self._conflict_ticks:
                 self._enter_emergency_stop()

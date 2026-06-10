@@ -60,7 +60,8 @@ _Ctx = namedtuple(
 
 
 def decide_blend(lane_angular, theta_m, dist, in_junction,
-                 map_max_w, proxy_max, junction_influence_radius):
+                 map_max_w, proxy_max, junction_influence_radius,
+                 turn_full_rad):
     """Pure decision helper — no ROS, unit-testable.
 
     Returns (a_lane, c):
@@ -68,9 +69,23 @@ def decide_blend(lane_angular, theta_m, dist, in_junction,
       c      : cosine similarity between the lane proxy vector and the map vector
 
     On open road a_lane = 1 (pure lane; map influence comes from FALLBACK/REPLAN).
-    During a junction *approach* the weight is distance-gated: far from the node
-    we stay on lane (don't cut the corner early); as we close in AND the lane
-    disagrees with the map (the turn is appearing, c drops) the map takes over.
+    During a junction *approach* the map is blended in, distance-gated over
+    junction_influence_radius, by how strongly the map wants to turn OR how much
+    the lane disagrees with it:
+
+        approach = (infl - dist) / infl                     far=0 .. near=1
+        pull     = max( |theta_m| / turn_full ,  1 - c )    how much the map wins
+        a_lane   = 1 - approach * pull
+
+    The MAGNITUDE term (|theta_m|/turn_full) is the fix for a sharp ~90deg
+    crossway: there lane and map still *agree in direction* (c stays ~0.5), so the
+    old cosine-only pull barely engaged and the lane drove straight through. By also
+    pulling in proportion to how hard the map wants to turn, the robot arcs into the
+    turn progressively — and because it is gated on `dist <= infl` (now wide), it no
+    longer depends on `dist` ever reaching `junction_radius` (which a left-offset
+    mapped position can keep it from doing, so the in-place spin never armed).
+    The DISAGREEMENT term (1 - c) is preserved for the original "steering too soon"
+    case (gentle turns where lane and map point different ways).
     """
     mw = map_max_w if map_max_w > 1e-6 else 1.0
     theta_l = clamp(lane_angular / mw, -1.0, 1.0) * proxy_max
@@ -78,7 +93,9 @@ def decide_blend(lane_angular, theta_m, dist, in_junction,
     if in_junction:
         infl = junction_influence_radius
         approach = clamp((infl - dist) / infl, 0.0, 1.0) if infl > 1e-6 else 1.0
-        a_lane = 1.0 - approach * (1.0 - clamp(c, 0.0, 1.0))
+        tf       = turn_full_rad if turn_full_rad > 1e-6 else 1.0
+        pull     = max(clamp(abs(theta_m) / tf, 0.0, 1.0), 1.0 - clamp(c, 0.0, 1.0))
+        a_lane   = 1.0 - approach * pull
     else:
         a_lane = 1.0
     return a_lane, c
@@ -164,11 +181,47 @@ class NewOrchestrator(Orchestrator):
         self._proxy_max    = math.radians(float(rp("proxy_max_deg", 80.0)))
         # Distance over which the map progressively blends the robot INTO a junction
         # turn. This approach-blend is what actually curves the robot before the
-        # in-place spin arms at junction_radius. With an imperfect map the robot may
-        # never pass within junction_radius of the node, so this must be wide enough
-        # to start the turn on its own — 0.30 (~= junction_radius) made it miss the
-        # turn entirely and then EMERGENCY_STOP. Must comfortably exceed junction_radius.
+        # in-place spin arms at junction_radius. It is bounded ABOVE by the length of
+        # the segment leading into the junction node: too wide and the blend starts
+        # pulling toward the post-junction heading while the robot is still maneuvering
+        # the PREVIOUS node (e.g. node 6 is fed by the 0.75 m 5->6 segment with an 18deg
+        # bend at node 5 — 0.90 reached back past node 5 onto the opposite straight).
+        # The window WIDTH is not what makes the turn engage — the magnitude term in
+        # decide_blend is: within 0.50 m |theta_m| is already large so the pull is
+        # strong, where the old cosine-only blend gave ~1 weak tick. Keep < ~0.75 m.
         self._junction_influence_radius = float(rp("junction_influence_radius", 0.50))
+        # Map heading error at which the map fully takes over the approach blend (the
+        # magnitude term: |theta_m| >= this -> pull = 1). Sized below a 90deg crossway
+        # so a real turn pulls hard while a near-straight junction barely pulls.
+        self._junc_turn_full = math.radians(float(rp("junction_turn_full_deg", 50.0)))
+        # Junction anti-cut guardrail (camera-frame, NAVIGATING approach only): while
+        # the line on the INSIDE of the turn is still confidently seen near the robot
+        # centre, scale the turn command toward straight so the robot waits until that
+        # line clears (the intersection opens) before committing — your "go straight a
+        # bit until the left lane is no longer a problem". Returns scale 1.0 (no damp)
+        # unless a turn is actually intended and the inside line is close.
+        self._junc_lane_correct = bool (rp("junction_lane_correct", True))
+        self._junc_inside_clear = float(rp("junction_inside_clear", 0.30))
+        self._junc_lane_gain    = float(rp("junction_lane_gain",    1.0))
+        self._junc_lane_floor   = float(rp("junction_lane_floor",   0.0))
+        # Lateral map re-centering (idea 3): GPS-style. When the camera is confidently
+        # centred on a two-line lane on a STRAIGHT, the robot sits on the lane
+        # centreline = the map edge, so nudge the remap translation perpendicular onto
+        # the edge (EMA). Removes the lateral drift that skips junctions / inflates
+        # dist. Heavily gated to straights (off in turns/junctions/roundabout) so it
+        # can't pull a sparse-node curve onto a chord; lateral only, so along-track
+        # node advancement is untouched. Propagates to WM via /remap_transform.
+        self._lat_correct        = bool (rp("lateral_correct_enable", True))
+        # Run only every N NAVIGATING ticks (drift is slow; no need at 25 Hz). The
+        # per-correction step (alpha) is sized larger to compensate so net settling
+        # stays useful: 0.35 every 50 ticks (~2 s) ~= 35% of the remaining offset / 2 s.
+        self._lat_period         = int  (rp("lateral_correct_period", 50))
+        self._lat_alpha          = float(rp("lateral_correct_alpha",  0.35))
+        self._lat_centered_clear = float(rp("lateral_centered_clear", 0.15))
+        self._lat_align_deg      = float(rp("lateral_align_deg",      15.0))
+        self._lat_min_m          = float(rp("lateral_min_correct_m",  0.03))
+        self._lat_max_m          = float(rp("lateral_max_correct_m",  0.40))
+        self._lat_tick           = 0    # NAVIGATING-tick counter for the period gate
         # Min seconds between GPS-style replans (avoid spamming the planner).
         self._replan_cooldown = float(rp("replan_cooldown", 3.0))
         # Roundabout conflict is judged more leniently (lane is unreliable there).
@@ -273,6 +326,94 @@ class NewOrchestrator(Orchestrator):
                 best = d
             ax, ay = bx, by
         return best
+
+    def _nearest_segment_cross(self, rx, ry, path_ids):
+        """Perpendicular vector from (rx,ry) to the nearest path segment (map frame).
+
+        Returns (cross_dx, cross_dy, seg_yaw, cross_dist) for the nearest segment whose
+        perpendicular foot falls WITHIN the segment, else None. `cross` points from the
+        robot toward the segment line and is purely perpendicular to it (so applying it
+        shifts the position laterally only — never along-track). Used by the lateral
+        re-centering; foot-within-segment keeps it from grabbing a far node off the end.
+        """
+        if self._map is None or len(path_ids) < 2:
+            return None
+        best = None
+        ax, ay = self._map.node_xy(int(path_ids[0]))
+        for i in range(1, len(path_ids)):
+            bx, by = self._map.node_xy(int(path_ids[i]))
+            dx, dy = bx - ax, by - ay
+            seg2 = dx * dx + dy * dy
+            if seg2 > 1e-12:
+                t = ((rx - ax) * dx + (ry - ay) * dy) / seg2
+                if 0.0 <= t <= 1.0:                       # perpendicular foot in segment
+                    fx, fy = ax + t * dx, ay + t * dy
+                    cdx, cdy = fx - rx, fy - ry           # robot -> line (perpendicular)
+                    d = math.hypot(cdx, cdy)
+                    if best is None or d < best[3]:
+                        best = (cdx, cdy, math.atan2(dy, dx), d)
+            ax, ay = bx, by
+        return best
+
+    def _apply_lateral_correction(self, C):
+        """GPS-style lateral re-centering of the map frame (idea 3), straights only.
+
+        When the camera is confidently centred-tracking a two-line lane on a STRAIGHT
+        segment, the robot is on that lane's centreline = the map edge. If the mapped
+        position has drifted laterally off the edge, nudge the remap translation
+        perpendicular onto it (EMA) so dist/heading to the next node stay truthful and
+        the junction logic fires on time (the lateral drift is what skipped node 6 and
+        inflated dist). Heavily gated: NAVIGATING only, never in a junction/roundabout
+        or while approaching the next node (sparse nodes in turns would pull a curve
+        onto a chord), and only on a confident, centred, well-aligned two-line track.
+        Lateral ONLY (perpendicular), so along-track node advancement is untouched.
+        Runs only once every `lateral_correct_period` NAVIGATING ticks (drift is slow).
+        """
+        if not self._lat_correct:
+            return
+        self._lat_tick = (self._lat_tick + 1) % max(1, self._lat_period)
+        if self._lat_tick != 0:
+            return
+        if (self._map is None or C.lane_info is None
+                or self._state != self.NAVIGATING or C.in_roundabout or C.is_junction):
+            return
+        if C.dist <= self._junction_influence_radius:    # stay clear of the turn-in zone
+            return
+        li = C.lane_info
+        if (C.lane_state != "TRACKING_CC" or li[2] <= 0.5 or li[3] <= 0.5
+                or abs(li[6]) > self._lat_centered_clear):
+            return                                       # need a confident, centred track
+        seg = self._nearest_segment_cross(C.rx, C.ry, C.path_ids)
+        if seg is None:
+            return
+        cdx, cdy, seg_yaw, cross = seg
+        if abs(angle_diff(seg_yaw, C.ryaw)) > math.radians(self._lat_align_deg):
+            return                                       # not driving ALONG a straight
+        if cross < self._lat_min_m or cross > self._lat_max_m:
+            return                                       # noise floor / broken-localization reject
+        with self._lock:
+            odom = self._odom_pos
+        if odom is None:
+            return
+        # Target = the perpendicular FOOT on the segment (lateral only, never the node).
+        # Solve for the exact remap translation that maps the current ODOM point onto
+        # the foot, then EMA toward it — same convention as the parent's drift fix
+        # (map = R(-theta)/scale * (odom - t)  =>  t = odom - scale*R(theta)*map_pt).
+        # NOTE: t lives in the ODOM frame; the earlier version added a MAP-frame vector
+        # straight onto t (wrong frame AND sign), which injected along-track error and
+        # pushed AWAY from the path — the "thinks it's behind / never recovers" bug.
+        foot_x, foot_y = C.rx + cdx, C.ry + cdy
+        theta = self._remap_theta
+        scale = self._remap_scale if self._remap_scale != 0.0 else 1.0
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        tx_exact = odom[0] - scale * (cos_t * foot_x - sin_t * foot_y)
+        ty_exact = odom[1] - scale * (sin_t * foot_x + cos_t * foot_y)
+        self._remap_tx = (1.0 - self._lat_alpha) * self._remap_tx + self._lat_alpha * tx_exact
+        self._remap_ty = (1.0 - self._lat_alpha) * self._remap_ty + self._lat_alpha * ty_exact
+        self._publish_remap()
+        rospy.loginfo_throttle(
+            1.0, "[new_orch] lateral correction: cross=%.3fm -> tx=%.4f ty=%.4f",
+            cross, self._remap_tx, self._remap_ty)
 
     def _turn_angle(self, path_ids, idx, cur_id, next_id):
         """Absolute heading change at the current node (map edge directions)."""
@@ -434,9 +575,9 @@ class NewOrchestrator(Orchestrator):
 
         # Heartbeat: one line/sec so a misbehavior is traceable to its inputs.
         rospy.loginfo_throttle(
-            1.0, "[new_orch] st=%s lane=%s junc=%d round=%d dist=%.2f "
-            "hdg_err=%+.0fdeg c=%+.2f", self._state, lane_state,
-            int(is_junction), int(in_roundabout), dist,
+            1.0, "[new_orch] st=%s node=%d->%d lane=%s junc=%d round=%d dist=%.2f "
+            "hdg_err=%+.0fdeg c=%+.2f", self._state, cur_node_id, next_id,
+            lane_state, int(is_junction), int(in_roundabout), dist,
             math.degrees(theta_m), c)
 
         # --- dispatch ---
@@ -480,6 +621,11 @@ class NewOrchestrator(Orchestrator):
             self._set_lane_enabled(True)
             rospy.loginfo("[new_orch] -> NAVIGATING")
         self._publish_orc_state(self.NAVIGATING)
+
+        # GPS-style lateral re-centering of the map frame (idea 3). Gated to confident
+        # straights; lateral only. Done here (lane drives on a straight, a_lane=1) so a
+        # frame nudge causes no steering jerk while it makes dist/heading truthful.
+        self._apply_lateral_correction(C)
 
         # 1) Direct conflict (lane vs map > 90 deg apart) — debounced stop.
         #    SUPPRESSED while the current node is a junction: there the map heading
@@ -547,21 +693,26 @@ class NewOrchestrator(Orchestrator):
             in_approach = C.is_junction and C.next_id >= 0
             a_lane, _ = decide_blend(
                 C.lane_cmd.angular.z, C.theta_m, C.dist, in_approach,
-                self._map_max_w, self._proxy_max, self._junction_influence_radius)
+                self._map_max_w, self._proxy_max, self._junction_influence_radius,
+                self._junc_turn_full)
 
         lane_ang = C.lane_cmd.angular.z if C.lane_fresh else 0.0
         lane_lin = C.lane_cmd.linear.x  if C.lane_fresh else 0.0
         map_ang  = self._map_angular(C.heading_nxt, C.ryaw) if C.next_id >= 0 else 0.0
 
+        blended = a_lane * lane_ang + (1.0 - a_lane) * map_ang
+        # Anti-cut guardrail: hold the turn straighter until the inside line clears.
+        scale   = self._junction_anti_cut_scale(C)
+
         twist = Twist()
         twist.linear.x  = lane_lin
-        twist.angular.z = a_lane * lane_ang + (1.0 - a_lane) * map_ang
-        # Shows when the map is overriding the lane (a_lane low) and whether the
-        # output is a forward drive or a stationary spin (v~0, w large).
+        twist.angular.z = blended * scale
+        # Shows when the map is overriding the lane (a_lane low), when the guardrail is
+        # holding the turn (scale < 1), and the resulting drive/turn.
         rospy.loginfo_throttle(
-            1.0, "[new_orch] NAV a_lane=%.2f lane(v=%.2f w=%+.2f) map_w=%+.2f "
-            "-> v=%.2f w=%+.2f", a_lane, lane_lin, lane_ang, map_ang,
-            twist.linear.x, twist.angular.z)
+            1.0, "[new_orch] NAV a_lane=%.2f scale=%.2f lane(v=%.2f w=%+.2f) "
+            "map_w=%+.2f -> v=%.2f w=%+.2f", a_lane, scale, lane_lin, lane_ang,
+            map_ang, twist.linear.x, twist.angular.z)
         self._cmd_pub.publish(twist)
 
     def _junction_entry(self, C):
@@ -574,6 +725,37 @@ class NewOrchestrator(Orchestrator):
         if ta is not None and ta < math.radians(self._gentle_turn_deg):
             return False  # gentle turn — let the blend handle it
         return True
+
+    def _junction_anti_cut_scale(self, C):
+        """Scale (<=1) on the junction turn command to avoid cutting the inside line.
+
+        During a junction turn the painted line on the side we are turning TOWARD
+        (the inside line) is the one we would cut by turning too soon. While that
+        line is still confidently seen near the robot centre, scale the turn toward
+        straight (down to `_junc_lane_floor`) so the robot drives on until the line
+        clears — i.e. until the intersection opens — before committing the turn. Once
+        the inside line goes invalid or moves away from centre, scale returns to 1.0
+        and the blend's full turn-in takes over.
+
+        Returns 1.0 (no damping) when: disabled, no fresh lane info, not at a junction,
+        no real turn intended (map heading still ~forward), or the inside line is
+        already clear / not seen. Camera-frame, NAVIGATING approach only.
+        """
+        if (not self._junc_lane_correct or C.lane_info is None
+                or not C.is_junction or C.next_id < 0):
+            return 1.0
+        # Only damp once a genuine turn is intended; below this the lane is merely
+        # centering on the approach and must not be held back.
+        if abs(C.theta_m) < math.radians(20.0):
+            return 1.0
+        turn_left = C.theta_m > 0.0      # map wants left (+w) -> inside line is LEFT
+        li = C.lane_info
+        inside_valid = (li[2] > 0.5) if turn_left else (li[3] > 0.5)
+        inside_off   =  li[4]        if turn_left else  li[5]
+        if not inside_valid or abs(inside_off) >= self._junc_inside_clear:
+            return 1.0                   # inside line clear (or unseen) -> commit turn
+        sev = (self._junc_inside_clear - abs(inside_off)) / self._junc_inside_clear
+        return clamp(1.0 - self._junc_lane_gain * sev, self._junc_lane_floor, 1.0)
 
     # --------------------------------------------------------------- JUNCTION
 

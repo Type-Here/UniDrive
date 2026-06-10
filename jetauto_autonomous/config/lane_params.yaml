@@ -111,10 +111,19 @@ orchestrator:
 
   # ---- Junction rotation ----
   junction_radius: 0.30      # m — distance to trigger the in-place spin maneuver
-  junction_influence_radius: 0.50  # m — distance over which the map blends the robot INTO the turn (new_orchestrator only). MUST exceed junction_radius; too small (~0.30) and the turn is missed entirely on an imperfect map.
+  junction_influence_radius: 0.50  # m — distance over which the map blends the robot INTO the turn (new_orchestrator only). MUST exceed junction_radius, and stay BELOW the entry-segment length (e.g. node 6 fed by the 0.75m 5->6 segment) or the blend pulls toward the post-junction heading while still maneuvering the previous node (0.90 reached past node 5 onto the opposite straight). The magnitude term below — not the width — is what makes the turn engage.
+  junction_turn_full_deg: 50.0  # [new] map heading error at which the map fully takes over the approach blend (the magnitude term). Sized below a 90deg crossway so a real turn pulls hard while a near-straight junction barely pulls.
   junction_align_deg: 14.0   # deg — lower so the spin completes more of the turn before lane takeover (was 22, curved too soon)
   junction_spin_speed: 0.40  # rad/s cap for in-place rotation
   junction_alpha: 1.0        # spin blend weight on map heading: 1.0 = full map spin (lane hint off); <1.0 mixes in lane angular.z (0 if lane bad)
+  # Anti-cut guardrail ([new], NAVIGATING approach only): while the line on the INSIDE
+  # of the turn is still confidently seen near the robot centre, scale the turn command
+  # toward straight so the robot waits until that line clears (the intersection opens)
+  # before committing — avoids cutting the corner into FALLBACK. Camera-frame, additive.
+  junction_lane_correct: true   # [new] master enable for the junction anti-cut guardrail
+  junction_inside_clear: 0.30   # [new] normalized clearance to the INSIDE line below which we hold the turn straighter
+  junction_lane_gain:    1.0    # [new] damping strength: scale = 1 - gain*severity (1.0 -> full straighten when the inside line is at centre)
+  junction_lane_floor:   0.0    # [new] minimum turn scale (0.0 -> may fully straighten; raise to keep some turn-in)
 
   # ---- Drift auto-correction ----
   # Position fix fires once per node when dist < drift_trigger_radius (NAVIGATING only).
@@ -167,6 +176,21 @@ orchestrator:
   offroute_t:      0.40      # [new] m — off-route threshold (FALLBACK at >=t, REPLAN at >=2t)
   offroute_ticks:  10        # [new] consecutive off-route ticks before a replan (debounce)
   replan_cooldown: 3.0       # [new] s — minimum interval between replans (avoid spamming the planner)
+
+  # ---- Lateral map re-centering (idea 3, [new] new_orchestrator.py only) ----
+  # GPS-style: when the camera is confidently centred on a two-line lane on a STRAIGHT,
+  # the robot is on the lane centerline = the map edge, so nudge the map position
+  # perpendicular onto the edge. Removes the lateral drift that skips junctions (the
+  # node-6 failure) and inflates dist. Straights only (gated off in turns/junctions/
+  # roundabout) so it can't pull a sparse-node curve onto a chord; lateral only, so
+  # node advancement is untouched. Publishes /remap_transform (waypoint_manager syncs).
+  lateral_correct_enable: true   # [new] master enable
+  lateral_correct_period: 50     # [new] run only every N NAVIGATING ticks (~2 s at 25 Hz); drift is slow
+  lateral_correct_alpha:  0.35   # [new] EMA weight PER CORRECTION toward the edge (sized up to offset the period)
+  lateral_centered_clear: 0.15   # [new] max |center_offset| (normalized) to count as "centred"
+  lateral_align_deg:      15.0   # [new] max robot-yaw vs segment-heading to count as "on a straight"
+  lateral_min_correct_m:  0.03   # [new] ignore corrections below this (noise floor)
+  lateral_max_correct_m:  0.40   # [new] reject corrections above this (broken localization)
 
   # ---- Map pure-pursuit (FALLBACK state) ----
   lookahead_m: 0.50

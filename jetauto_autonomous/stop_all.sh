@@ -11,6 +11,7 @@ PID_FILE="/tmp/jetauto_autonomous.pids"
 if [[ ! -f "$PID_FILE" ]]; then
   echo "No PID file found at $PID_FILE."
   echo "Nothing to stop, or use pkill manually:"
+  echo "  pkill -f new_orchestrator.py"
   echo "  pkill -f lane_controller_node.py"
   echo "  pkill -f waypoint_manager_node.py"
   echo "  pkill -f serve_dashboard.py"

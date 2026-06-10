@@ -44,7 +44,8 @@ class LaneControllerCore(object):
         p = params
 
         # -- BEV mode ----------------------------------------------------------
-        self.use_bev   = bool( p.get("use_bev",   True))
+        # The controller is BEV-only: it consumes the BEV-warped mask published on
+        # /lane_mask_bev. The legacy raw-perspective path was removed.
         self.bev_scale = float(p.get("bev_scale", 1.0))
 
         # -- ROI Hough --------------------------------------------------------
@@ -84,11 +85,7 @@ class LaneControllerCore(object):
         self.cls_marking = int(p.get("class_lane_marking", 2))
         self.cls_dashed  = int(p.get("class_lane_dashed",  3))
 
-        # -- no-BEV parameters -------------------------------------------------
-        self.lane_width_bottom_frac = float(p.get("lane_width_bottom_frac", 0.55))
-        self.no_bev_roi_top_frac    = float(p.get("no_bev_roi_top_frac",    0.45))
-
-        # -- Dynamic lane width calibration (only with use_bev=True) -----------
+        # -- Dynamic lane width calibration -----------------------------------
         self.lane_width_dynamic_enable = bool( p.get("lane_width_dynamic_enable", True))
         self.lane_width_ema_alpha      = float(p.get("lane_width_ema_alpha",      0.10))
         self.lane_width_min_px         = float(p.get("lane_width_min_px",         180.0)) * s
@@ -192,29 +189,12 @@ class LaneControllerCore(object):
                 right_lines.append(line[0])
         return left_lines, right_lines
 
-    def _separate_lines_no_bev(self, lines, img_cx):
-        """no-BEV mode: classify by midpoint x position (slope not used)."""
-        if lines is None:
-            return [], []
-        left_lines, right_lines = [], []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            if (x1 + x2) / 2.0 < img_cx:
-                left_lines.append(line[0])
-            else:
-                right_lines.append(line[0])
-        return left_lines, right_lines
-
-    def _lane_width_at_y(self, y, dst_h, dst_w):
-        """Estimated lane width in px at height y.
-        BEV: dyn_lane_width if calibrated and enabled, otherwise static lane_width_px.
-        no-BEV: linear perspective model.
-        """
-        if self.use_bev:
-            if self.lane_width_dynamic_enable and self.dyn_lane_width is not None:
-                return self.dyn_lane_width
-            return self.lane_width_px
-        return self.lane_width_bottom_frac * float(dst_w) * (float(y) / max(float(dst_h), 1.0))
+    def _lane_width_at_y(self):
+        """Estimated lane width in px (BEV): dynamic estimate if calibrated and
+        enabled, otherwise the static lane_width_px fallback."""
+        if self.lane_width_dynamic_enable and self.dyn_lane_width is not None:
+            return self.dyn_lane_width
+        return self.lane_width_px
 
     def _update_dyn_lane_width(self, lx, rx):
         """Update self.dyn_lane_width via EMA with sanity-check.
@@ -365,17 +345,17 @@ class LaneControllerCore(object):
             rx = self._eval_line(poly_r, right_line, center_y)
             if lx is not None and rx is not None:
                 lane_center = 0.5 * (lx + rx)
-                if self.use_bev and self.lane_width_dynamic_enable:
+                if self.lane_width_dynamic_enable:
                     self._update_dyn_lane_width(lx, rx)
         elif valid_l:
             lx = self._eval_line(poly_l, left_line, center_y)
             if lx is not None:
-                half_w = self._lane_width_at_y(center_y, dst_h, dst_w) / 2.0
+                half_w = self._lane_width_at_y() / 2.0
                 lane_center = lx + half_w + self.single_line_offset
         elif valid_r:
             rx = self._eval_line(poly_r, right_line, center_y)
             if rx is not None:
-                half_w = self._lane_width_at_y(center_y, dst_h, dst_w) / 2.0
+                half_w = self._lane_width_at_y() / 2.0
                 lane_center = rx - half_w - self.single_line_offset
 
         if lane_center is None:
@@ -400,13 +380,12 @@ class LaneControllerCore(object):
         )
         steering = alpha * raw_angle + (1.0 - alpha) * self.prev_steering
 
-        if self.use_bev:
-            slope_l = self.last_slope_l if self.last_slope_l is not None else 0.0
-            slope_r = self.last_slope_r if self.last_slope_r is not None else 0.0
-            if steering > 30 and (slope_r < 2 or slope_l > -2):
-                self.single_line_offset = 30.0
-            else:
-                self.single_line_offset = 0.0
+        slope_l = self.last_slope_l if self.last_slope_l is not None else 0.0
+        slope_r = self.last_slope_r if self.last_slope_r is not None else 0.0
+        if steering > 30 and (slope_r < 2 or slope_l > -2):
+            self.single_line_offset = 30.0
+        else:
+            self.single_line_offset = 0.0
 
         self.prev_steering = steering
         self.dyn_cx_line   = lane_center
@@ -418,7 +397,7 @@ class LaneControllerCore(object):
 
     def step(self, mask):
         """
-        Process a uint8 mask with class IDs (BEV or raw, depending on use_bev).
+        Process a uint8 BEV mask with class IDs.
         Returns (steering_deg, angular_z, state, debug_info).
 
         debug_info keys:
@@ -445,17 +424,13 @@ class LaneControllerCore(object):
 
         dst_h, dst_w = mask.shape[:2]
         img_cx      = dst_w / 2.0
-        roi_top_frac = self.hough_roi_top_frac if self.use_bev else self.no_bev_roi_top_frac
-        roi_top_px  = int(dst_h * roi_top_frac)
+        roi_top_px  = int(dst_h * self.hough_roi_top_frac)
 
         bev_bin = self._get_binary(mask)
         bev_roi = bev_bin[roi_top_px:, :]
         lines   = self._offset_lines_y(self._detect_hough(bev_roi), roi_top_px)
 
-        if self.use_bev:
-            left_lines, right_lines = self._separate_lines(lines, img_cx)
-        else:
-            left_lines, right_lines = self._separate_lines_no_bev(lines, img_cx)
+        left_lines, right_lines = self._separate_lines(lines, img_cx)
 
         left_line,  poly_l = self._fit_line(left_lines,  dst_h)
         right_line, poly_r = self._fit_line(right_lines, dst_h)

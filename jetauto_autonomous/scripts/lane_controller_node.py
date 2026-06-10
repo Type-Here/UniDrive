@@ -6,7 +6,7 @@ lane_controller_node.py - ROS node for JetAuto lateral control.
 All pure logic (Hough, fit, steering) is in lane_core.py.
 This file only adds ROS wiring: rosparam, pub/sub.
 
-Input:  /lane_mask_bev  (use_bev=true)  or  /lane_mask  (use_bev=false)
+Input:  /lane_mask_bev  (BEV-warped class mask, mono8)
 Output: /lane_controller/cmd_vel  (Twist, proposed — forwarded to hardware by orchestrator)
         /lane_debug/image         (Image, if publish_debug=true)
         /lane_controller/state    (String)
@@ -44,11 +44,7 @@ class LaneControllerV2Node(LaneControllerCore):
             return rospy.get_param(ns + key, default)
 
         # -- Build params dict and initialise LaneControllerCore -------------
-        # use_bev is read first to set the default topic
-        use_bev = bool(rp("use_bev", True))
-
         params = {
-            "use_bev":                  use_bev,
             "bev_scale":                rp("bev_scale",                1.0),
             "hough_roi_top_frac":       rp("hough_roi_top_frac",       0.0),
             "hough_threshold":          rp("hough_threshold",          50),
@@ -69,8 +65,6 @@ class LaneControllerV2Node(LaneControllerCore):
             "linear_x_speed":           rp("linear_x_speed",          0.05),
             "class_lane_marking":       rp("class_lane_marking",         2),
             "class_lane_dashed":        rp("class_lane_dashed",          3),
-            "lane_width_bottom_frac":   rp("lane_width_bottom_frac",  0.55),
-            "no_bev_roi_top_frac":      rp("no_bev_roi_top_frac",     0.45),
             "lane_width_dynamic_enable": rp("lane_width_dynamic_enable", True),
             "lane_width_ema_alpha":      rp("lane_width_ema_alpha",      0.10),
             "lane_width_min_px":         rp("lane_width_min_px",        180.0),
@@ -81,8 +75,7 @@ class LaneControllerV2Node(LaneControllerCore):
         LaneControllerCore.__init__(self, params)
 
         # -- ROS-only parameters -----------------------------------------------
-        _default_mask = "/lane_mask" if not use_bev else "/lane_mask_bev"
-        self.mask_topic   = rp("mask_topic",   _default_mask)
+        self.mask_topic   = rp("mask_topic",   "/lane_mask_bev")
         self.cmd_topic    = rp("cmd_topic",    "/lane_controller/cmd_vel")
         self.debug_topic  = rp("debug_topic",  "/lane_debug/image")
         self.state_topic  = rp("state_topic",  "/lane_controller/state")
@@ -116,14 +109,12 @@ class LaneControllerV2Node(LaneControllerCore):
 
         if self.enable_log:
             rospy.loginfo("[lane_ctrl_v2] started. mask=%s  drive=%s  max_steer=%.1f  "
-                          "use_bev=%s  bev_scale=%.1f  roi_top=%.0f%%  rate=%.0fHz",
+                          "bev_scale=%.1f  roi_top=%.0f%%  rate=%.0fHz",
                           self.mask_topic, self.drive_mode, self.max_steer_angle,
-                          self.use_bev, self.bev_scale,
-                          (self.hough_roi_top_frac if self.use_bev
-                           else self.no_bev_roi_top_frac) * 100,
+                          self.bev_scale, self.hough_roi_top_frac * 100,
                           self.rate_hz)
 
-        if self.use_bev and self.lane_width_dynamic_enable:
+        if self.lane_width_dynamic_enable:
             if self.enable_log:
                 rospy.loginfo("[lane_ctrl_v2] dyn lane width: ENABLED  alpha=%.2f  "
                               "range=[%.0f,%.0f]px  band=%.0f%%  reset_after=%d",

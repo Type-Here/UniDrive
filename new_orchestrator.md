@@ -51,11 +51,36 @@ exactly those failures.
 4. else (on route):
      a_lane = 1 on open road (pure lane).
      If the current node is a junction, a_lane is distance-gated over
-     junction_influence_radius so the map starts pulling into the turn before
-     the node (far = trust lane, near + lane disagrees = map takes over).
+     junction_influence_radius and driven by how hard the MAP wants to turn:
+        approach = (infl - dist)/infl
+        pull     = max( |theta_m| / turn_full ,  1 - c )
+        a_lane   = 1 - approach * pull
+     The magnitude term (|theta_m|/turn_full) is what carries a sharp ~90deg
+     crossway: there lane and map agree in *direction* (c stays ~0.5) so the old
+     cosine-only pull barely engaged and the robot drove straight through. The
+     disagreement term (1-c) is kept for the gentle "steering too soon" case.
+     A camera anti-cut guardrail then scales this turn toward straight while the
+     INSIDE line is still seen near centre (see ROUNDABOUT-style note below), so
+     the robot waits until the intersection opens before committing the turn.
+     NOTE junction_influence_radius must stay BELOW the entry-segment length or the
+     blend pulls toward the post-junction heading while still maneuvering the
+     previous node (0.90 reached past node 5 onto the opposite straight; 0.50 ok).
 ```
 *(An opt-in off-route REPLAN exists — `offroute_enable`, default `False` — that only
 republishes the goal for a fresh Dijkstra; it never seizes steering. Left off by default.)*
+
+**Lateral map re-centering (idea 3, `_apply_lateral_correction`).** GPS-style frame fix.
+When the camera is confidently centred on a two-line lane on a STRAIGHT, the robot is on the
+lane centreline = the map edge — so if the mapped position has drifted laterally off the edge,
+the remap translation is nudged **perpendicular** onto it (EMA, `lateral_correct_alpha`), and
+re-published on `/remap_transform` so the waypoint manager syncs. This removes the lateral
+drift that (a) skips a junction via the dot-product advance and (b) inflates `dist` so the
+turn-in never arms. It is **not** a node-snap (that "proved wrong often"); it targets the EDGE,
+**lateral only**, so along-track node advancement is untouched. Heavily gated so it can never
+pull a sparse-node curve onto a chord: NAVIGATING only, never in a junction / roundabout, never
+within `junction_influence_radius` of the next node, only on a confident centred `TRACKING_CC`
+two-line track whose segment heading is aligned with the robot (`lateral_align_deg`), and only
+for corrections in `[lateral_min_correct_m, lateral_max_correct_m]`. Default ON.
 
 ### JUNCTION (in-place spin)
 `m` targets the node *after* the junction. The robot rotates toward `heading_to_next`; when
@@ -132,7 +157,19 @@ disabled, the drive indicator also flips to FERMA.
 | `conflict_ticks` | 12 | consecutive `c<0` ticks before EMERGENCY_STOP |
 | `conflict_onpath_m` | 0.35 m | only judge a conflict while cross-track to the path is below this (off-route, `c` collapses to `cos(theta_m)` and false-trips on a recovering lane) |
 | `proxy_max_deg` | 80 | full lane steer → this implied heading offset |
-| `junction_influence_radius` | 0.50 m | distance over which the map blends into a turn; MUST exceed `junction_radius` (0.30 missed turns on an imperfect map) |
+| `junction_influence_radius` | 0.50 m | distance over which the map blends into a turn; must exceed `junction_radius` AND stay below the entry-segment length (0.90 reached past the previous node onto the opposite straight) |
+| `junction_turn_full_deg` | 50 | map heading error at which the map fully takes over the approach blend (the magnitude term) |
+| `junction_lane_correct` | True | master enable for the junction anti-cut guardrail |
+| `junction_inside_clear` | 0.30 | normalized clearance to the INSIDE line below which the turn is held straighter |
+| `junction_lane_gain` | 1.0 | anti-cut damping strength: `scale = 1 - gain*severity` |
+| `junction_lane_floor` | 0.0 | minimum turn scale (0 = may fully straighten until the inside line clears) |
+| `lateral_correct_enable` | True | master enable for the GPS-style lateral re-centering |
+| `lateral_correct_period` | 50 | run only every N NAVIGATING ticks (~2 s at 25 Hz); drift is slow |
+| `lateral_correct_alpha` | 0.35 | EMA weight per *correction* of the perpendicular nudge (sized up to offset the period) |
+| `lateral_centered_clear` | 0.15 | max normalized `center_offset` to count as "centred in the lane" |
+| `lateral_align_deg` | 15 | max robot-yaw vs segment-heading to count as "on a straight" |
+| `lateral_min_correct_m` | 0.03 | ignore corrections below this (noise floor) |
+| `lateral_max_correct_m` | 0.40 | reject corrections above this (broken localization) |
 | `roundabout_drive_speed` | 0.10 m/s | map-following speed inside the roundabout |
 | `roundabout_lookahead_m` | 0.25 | carrot lookahead along the ring spline (exit uses `lookahead_m`=0.50) |
 | `roundabout_spline_res_m` | 0.03 | sample spacing of the dense ring curve |

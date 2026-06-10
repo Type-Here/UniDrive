@@ -205,14 +205,28 @@ class WaypointManagerNode(object):
     def _advance_past_nodes(self, rx, ry, path, idx):
         """Advance idx past nodes the robot has already passed (dot-product test).
 
-        Applies to all nodes including junctions — junction rotation is now
-        handled by the orchestrator, which creeps forward after aligning, so
-        the dot-product test advances naturally.
+        The test asks "have we traveled THROUGH node[idx]?" measured along the
+        direction we ENTER it (the incoming edge prev->cur), NOT the direction we
+        leave it (cur->next). The outgoing edge skips a junction prematurely on a
+        sharp turn: at node 6 the outgoing 6->30 edge points west, so the test is
+        `(rx-3.9)*(-0.75) > 0` i.e. `rx < 3.9` — any small westward map error (the
+        blue dot mapped a little left) satisfies it and the target jumps to node 30
+        BEFORE the robot reaches node 6. is_junction then never latches, the turn-in
+        never arms, and the robot drives straight through (the observed failure).
+        The incoming edge is the robot's approach axis, so a lateral error no longer
+        triggers an advance — the test fires only once the robot has actually moved
+        through the node. Junction rotation is handled by the orchestrator (it creeps
+        forward after aligning), so this still advances naturally afterwards.
         """
         while idx < len(path) - 1:
-            nx,  ny  = self.map.node_xy(path[idx])
-            nx2, ny2 = self.map.node_xy(path[idx + 1])
-            if (rx - nx) * (nx2 - nx) + (ry - ny) * (ny2 - ny) > 0:
+            nx, ny = self.map.node_xy(path[idx])
+            if idx > 0:                       # incoming edge prev -> cur (approach axis)
+                px, py = self.map.node_xy(path[idx - 1])
+                dx, dy = nx - px, ny - py
+            else:                             # first node: no predecessor -> cur -> next
+                nx2, ny2 = self.map.node_xy(path[idx + 1])
+                dx, dy = nx2 - nx, ny2 - ny
+            if (rx - nx) * dx + (ry - ny) * dy > 0:
                 idx += 1
             else:
                 break
@@ -256,14 +270,27 @@ class WaypointManagerNode(object):
         cur_xy = self.map.node_xy(cur_id)
         dist   = math.hypot(pose[0] - cur_xy[0], pose[1] - cur_xy[1])
 
-        # Final waypoint distance-based stop
-        if idx == len(path) - 1 and dist <= self.tol:
-            with self.lock:
-                self.state = self.DONE
-            self.status_pub.publish(String(data=self.DONE))
-            self._publish_nav_info()
-            rospy.loginfo("[waypoint_manager] GOAL reached (dist=%.3fm).", dist)
-            return
+        # Final waypoint stop: within tolerance OR having PASSED the goal along the
+        # approach (incoming edge). The "passed" test makes arrival robust to a lateral
+        # map offset: the goal (node 2) is a junction, so the through-road continues
+        # straight past it; a slightly-offset robot never gets dist <= tol, so without
+        # this it sails through and the lane follower drives it on down the road, never
+        # stopping (observed). Passing the node's perpendicular plane = arrived.
+        if idx == len(path) - 1:
+            reached = dist <= self.tol
+            if not reached and idx > 0:
+                px, py = self.map.node_xy(path[idx - 1])
+                nx, ny = cur_xy
+                if (pose[0] - nx) * (nx - px) + (pose[1] - ny) * (ny - py) > 0:
+                    reached = True
+                    rospy.loginfo("[waypoint_manager] GOAL passed (dist=%.3fm > tol).", dist)
+            if reached:
+                with self.lock:
+                    self.state = self.DONE
+                self.status_pub.publish(String(data=self.DONE))
+                self._publish_nav_info()
+                rospy.loginfo("[waypoint_manager] GOAL reached (dist=%.3fm).", dist)
+                return
 
         next_id = path[idx + 1] if idx + 1 < len(path) else -1
         is_junc = self.map.is_junction(cur_id)

@@ -25,18 +25,11 @@ lane_controller:
   drive_mode: "classic"  # "mecanum" -> linear.y | "classic" -> angular.z
 
   # ---- BEV mode ----
-  use_bev: true     # false = use raw perspective mask (no BEV calibration required)
   bev_scale: 2.0    # BEV mask upscaling (1.0=320×128, 2.0=640×256, 2.5=800×320)
                     # all pixel params are scaled automatically
 
-  # ---- no-BEV parameters (used only if use_bev: false) ----
-  # Also set: mask_topic: "/lane_mask"  and  lane_fit_mode: "quadratic"
-  lane_width_bottom_frac: 0.55  # lane width as fraction of dst_w (no-BEV)
-  no_bev_roi_top_frac: 0.10     # ignore top X% of the mask (no-BEV)
-
   # ---- ROI Hough ----
-  # BEV mode:    ignores the top portion of the BEV mask (far from robot). Must be < center_y_ratio.
-  # no-BEV mode: overridden by no_bev_roi_top_frac (above).
+  # Ignores the top portion of the BEV mask (far from robot). Must be < center_y_ratio.
   hough_roi_top_frac: 0.3  # [0-1]; orange line in the debug image
 
   # ---- HoughLinesP - values at bev_scale=1.0, auto-scaled by the code ----
@@ -55,7 +48,7 @@ lane_controller:
   min_right_margin_px: 0.0
   min_left_margin_px:  0.0
 
-  # ---- Dynamic lane width calibration (only with use_bev=true) ----
+  # ---- Dynamic lane width calibration ----
   # When both lines are visible, |rx-lx| at center_y updates the current estimate via EMA.
   # Used for single-line estimation.
   # Values at bev_scale=1.0, auto-scaled by the code.
@@ -99,6 +92,11 @@ waypoint_manager:
 # =============================================================================
 # orchestrator — sole publisher of /jetauto_controller/cmd_vel
 # Owns: junction rotation, map fallback, lane/map blending
+#
+# Both orchestrator.py (classic) and new_orchestrator.py (experimental) read from
+# this same `orchestrator/` namespace — run one or the other, never both (same
+# node name). Most keys are shared; keys marked [new] are read ONLY by
+# new_orchestrator.py and are harmlessly ignored by the classic node.
 # =============================================================================
 orchestrator:
   rate_hz: 25.0
@@ -116,7 +114,7 @@ orchestrator:
   junction_influence_radius: 0.50  # m — distance over which the map blends the robot INTO the turn (new_orchestrator only). MUST exceed junction_radius; too small (~0.30) and the turn is missed entirely on an imperfect map.
   junction_align_deg: 14.0   # deg — lower so the spin completes more of the turn before lane takeover (was 22, curved too soon)
   junction_spin_speed: 0.40  # rad/s cap for in-place rotation
-  junction_alpha: 1       # spin blend: 90% map heading, 10% lane hint (0 if lane bad)
+  junction_alpha: 1.0        # spin blend weight on map heading: 1.0 = full map spin (lane hint off); <1.0 mixes in lane angular.z (0 if lane bad)
 
   # ---- Drift auto-correction ----
   # Position fix fires once per node when dist < drift_trigger_radius (NAVIGATING only).
@@ -131,23 +129,44 @@ orchestrator:
   gentle_turn_deg: 20.0      # junctions with turn angle below this skip the rotation maneuver
 
   # ---- Roundabout ----
+  # The classic node uses only roundabout_drive_speed (pure node pure-pursuit at
+  # this speed). All other roundabout keys below are [new] (radial curve, camera
+  # guardrail, off-reference failsafe) and ignored by the classic node.
   roundabout_drive_speed: 0.10  # m/s — map-following speed inside roundabout
-  # Curve following (item 1): per-segment radial arc through the ring nodes.
-  roundabout_lookahead_m:  0.25 # carrot lookahead along the curve (smaller = hugs tighter, larger = smoother / less spin-in-place)
-  roundabout_spline_res_m: 0.03 # dense-curve sample spacing (m)
+  # Curve following (item 1): per-segment radial arc through the ring nodes. [new]
+  roundabout_lookahead_m:  0.25 # [new] carrot lookahead along the curve (smaller = hugs tighter, larger = smoother / less spin-in-place)
+  roundabout_spline_res_m: 0.03 # [new] dense-curve sample spacing (m)
   # Lane guardrail (item 2): camera-frame nudge AWAY from a road edge we're about
   # to cross. NOT lane-following — does nothing unless a line is confidently seen.
-  roundabout_lane_correct: true # master enable for the guardrail nudge
-  roundabout_outer_clear:  0.25 # normalized clearance to OUTER (road-edge) line below which we nudge inward
-  roundabout_inner_clear:  0.20 # normalized clearance to INNER (island) line below which we nudge outward
-  roundabout_lane_gain:    0.40 # rad/s per unit severity of the edge proximity
-  roundabout_lane_max:     0.50 # rad/s cap on the guardrail nudge
+  roundabout_lane_correct: true # [new] master enable for the guardrail nudge
+  roundabout_outer_clear:  0.25 # [new] normalized clearance to OUTER (road-edge) line below which we nudge inward
+  roundabout_inner_clear:  0.20 # [new] normalized clearance to INNER (island) line below which we nudge outward
+  roundabout_lane_gain:    0.40 # [new] rad/s per unit severity of the edge proximity
+  roundabout_lane_max:     0.50 # [new] rad/s cap on the guardrail nudge
   # Off-reference failsafe: deviation from our own reference (spline on the ring,
   # path on the exit) that trips the terminal EMERGENCY_STOP. Lane is unreliable
   # here, so this geometric check is the only roundabout safety net. Generous +
   # debounced so only a genuine off-road excursion stops the robot.
-  roundabout_offref_m:     0.40 # m of deviation before tripping the stop
-  roundabout_offref_ticks: 10   # consecutive off-reference ticks (debounce)
+  roundabout_offref_m:     0.40 # [new] m of deviation before tripping the stop
+  roundabout_offref_ticks: 10   # [new] consecutive off-reference ticks (debounce)
+  roundabout_conflict_c:   -0.5 # [new] lenient lane/map cosine-similarity threshold below which a roundabout conflict is counted (lane is unreliable here)
+
+  # ---- Disagreement blend + conflict stop ([new] — new_orchestrator.py only) ----
+  # new_orchestrator blends lane vs map by the cosine similarity c between the
+  # lane steering proxy and the map heading, and trips a terminal EMERGENCY_STOP
+  # when they sustainedly point >90 deg apart (c < 0). See new_orchestrator.md.
+  conflict_ticks: 12         # [new] consecutive c<0 ticks before EMERGENCY_STOP (debounce)
+  conflict_onpath_m: 0.35    # [new] m — only judge a conflict while cross-track to the path is below this. Off-route (e.g. after cutting a corner) the bearing-to-next is large and c collapses to cos(theta_m), so a straight recovering lane would false-trip the stop; that excursion is a recovery FALLBACK owns, not a wrong-way.
+  proxy_max_deg:  80.0       # [new] full lane steer (angular.z) maps to this implied heading offset
+
+  # ---- Off-route GPS-style replan ([new] — new_orchestrator.py only, opt-in) ----
+  # OFF by default: localization-dependent and must never preempt a healthy lane.
+  # When enabled it only republishes the goal for a fresh Dijkstra; it never seizes
+  # steering. Trips after offroute_ticks ticks beyond 2*offroute_t of cross-track error.
+  offroute_enable: false     # [new] master enable for the off-route replan
+  offroute_t:      0.40      # [new] m — off-route threshold (FALLBACK at >=t, REPLAN at >=2t)
+  offroute_ticks:  10        # [new] consecutive off-route ticks before a replan (debounce)
+  replan_cooldown: 3.0       # [new] s — minimum interval between replans (avoid spamming the planner)
 
   # ---- Map pure-pursuit (FALLBACK state) ----
   lookahead_m: 0.50

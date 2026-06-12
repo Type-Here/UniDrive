@@ -161,7 +161,7 @@ start_proc waypoint_manager \
 
 echo "[7/7] orchestrator (sole cmd_vel publisher)"
 start_proc orchestrator \
-  $PY "$SCRIPTS_DIR/orchestrator.py"
+  $PY "$SCRIPTS_DIR/new_orchestrator.py"
 
 # ---- Summary ----
 echo

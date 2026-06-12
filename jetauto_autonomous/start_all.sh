@@ -40,6 +40,7 @@ WEB_DIR="$SCRIPT_DIR/web"
 SCRIPTS_DIR="$SCRIPT_DIR/scripts"
 PID_FILE="/tmp/jetauto_autonomous.pids"
 LOG_DIR="/tmp/jetauto_autonomous_logs"
+ORCHESTRATOR_NAME="n_orchestrator.py"
 
 # Python interpreter: python2 because ROS Melodic lives there
 # (Python 3.13 conda is the SegFormer setup and is separate)
@@ -188,7 +189,7 @@ start_proc waypoint_manager \
 
 echo "[7/7] new_orchestrator (sole cmd_vel publisher)"
 start_proc orchestrator \
-  $PY "$SCRIPTS_DIR/new_orchestrator.py"
+  $PY "$SCRIPTS_DIR/$ORCHESTRATOR_NAME"
 
 # ---- Summary ----
 echo

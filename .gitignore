@@ -230,3 +230,12 @@ maps/
 
 # MacOS
 .DS_Store
+
+# Reports and Interna Docs
+**/report/
+**/reports/
+**/internal_docs/
+
+# Outputs
+testing/sim/output/
+testing/sim/out/

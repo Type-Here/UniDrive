@@ -86,6 +86,42 @@ if ! pgrep -f rosmaster > /dev/null; then
 fi
 echo "[ok] roscore running"
 
+# ---- Pre-check: leftover node processes from a previous run ----
+# stop_all.sh only kills PIDs recorded in $PID_FILE; if start_all.sh is run
+# twice (PID file overwritten) or a node was started by hand, orphans survive
+# and two orchestrators publishing cmd_vel fight each other. Sweep them here.
+# Patterns are python-prefixed so an editor with the file open is not killed;
+# "orchestrator.py" matches orchestrator/new_orchestrator/nn_orchestrator.
+ZOMBIE_PATTERNS=(
+  "python.*orchestrator\.py"
+  "python.*lane_controller_node\.py"
+  "python.*waypoint_manager_node\.py"
+  "python.*serve_dashboard\.py"
+  "rosbridge_websocket"
+  "web_video_server"
+)
+FOUND_ZOMBIES=0
+for pat in "${ZOMBIE_PATTERNS[@]}"; do
+  if pgrep -f "$pat" > /dev/null 2>&1; then
+    FOUND_ZOMBIES=1
+    echo "[warn] leftover process(es) matching '$pat':"
+    pgrep -af "$pat" | sed 's/^/         /'
+    pkill -f "$pat" 2>/dev/null || true
+  fi
+done
+if [[ "$FOUND_ZOMBIES" == "1" ]]; then
+  sleep 1
+  for pat in "${ZOMBIE_PATTERNS[@]}"; do
+    if pgrep -f "$pat" > /dev/null 2>&1; then
+      echo "[warn] SIGKILL survivors of '$pat'"
+      pkill -9 -f "$pat" 2>/dev/null || true
+    fi
+  done
+  echo "[ok] leftover processes cleaned up"
+else
+  echo "[ok] no leftover processes"
+fi
+
 # ---- Pre-check: Python has cv_bridge, rospy, yaml, networkx ----
 if ! $PY -c "import rospy, cv_bridge, yaml, networkx" 2>/dev/null; then
   echo "ERROR: missing Python dependencies on $PY."

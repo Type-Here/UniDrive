@@ -750,6 +750,16 @@ class NewOrchestrator(Orchestrator):
             self._is_exit_stub(cur_node_id, cur_path_idx, path_ids)))
         if in_roundabout != self._in_roundabout:
             self._in_roundabout = in_roundabout
+            if in_roundabout:
+                # Fresh traversal: a new goal over the SAME ring keeps the cached
+                # spline (key = ring ids, unchanged), but the forward-only progress
+                # index is still parked at the previous traversal's tail — the
+                # nearest-point search then reads the distance to the FAR side of
+                # the ring (~0.7 m here) and the off-reference failsafe trips as
+                # soon as the spline branch engages (observed on lap 2 and on every
+                # retry). Restart progress + debounce at the window edge.
+                self._round_i = 0
+                self._round_offref_count = 0
             rospy.loginfo("[nn_orch] roundabout: %s (node=%d)",
                           "ENTER" if in_roundabout else "EXIT", cur_node_id)
 
@@ -1182,8 +1192,18 @@ class NewOrchestrator(Orchestrator):
             self._conflict_count = 0
 
         # Carrot source.
-        #   - Ring (next target still a ring node): follow the smooth radial curve
-        #     through the ring nodes (built for >=3 ring nodes).
+        #   - Ring (current target IS a ring node, next still in the ring): follow
+        #     the smooth radial curve through the ring nodes (built for >=3 ring
+        #     nodes).
+        #   - ENTRY approach (window opened because `next` is a ring node, but the
+        #     robot is still on the segment INTO the ring, e.g. 30->29 with
+        #     next=24): plain path pursuit + path cross-track. The spline only
+        #     starts at the ring's entry neighbor (path[first-1], node 29), so on
+        #     this segment its nearest point measures the ALONG-TRACK distance to
+        #     that node (~0.7 m at node 30) and the off-reference failsafe tripped
+        #     right there (observed). The path polyline DOES cover this segment, so
+        #     it is the truthful reference; the spline takes over once `cur` is a
+        #     ring node (its lead-in covers the handover segment).
         #   - EXIT approach (next target has LEFT the ring, e.g. 28->23->2): drop the
         #     spline and use plain pure-pursuit straight at the exit node — the user's
         #     "map, pure-pursuit, no radial between 28-23". Why: the spline's tangent
@@ -1197,13 +1217,16 @@ class NewOrchestrator(Orchestrator):
         # when `next` leaves the ring, both the radial AND the guardrail give way.
         exiting = (C.next_id < 0 or (self._map is not None
                    and not self._map.is_roundabout_node(C.next_id)))
-        poly = None if exiting else self._ensure_round_spline(C.path_ids)
+        on_ring = (self._map is not None
+                   and self._map.is_roundabout_node(C.cur_node_id))
+        poly = (self._ensure_round_spline(C.path_ids)
+                if on_ring and not exiting else None)
         if poly:
             carrot = self._spline_carrot(C.rx, C.ry, poly)  # sets self._round_offset
             src    = "curve"
         else:
             carrot = self._carrot(C.rx, C.ry, C.path_ids)
-            src    = "exit" if exiting else "nodes"
+            src    = "exit" if exiting else ("approach" if not on_ring else "nodes")
             # No spline here, so measure deviation against the path the pursuit follows.
             self._round_offset = self._offpath_dist(C.rx, C.ry, C.path_ids)
         if carrot is None:

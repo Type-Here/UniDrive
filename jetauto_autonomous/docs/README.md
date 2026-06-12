@@ -1,16 +1,16 @@
-# JetAuto Autonomous - Guida laterale + waypoint navigation
+# JetAuto Autonomous - Lane following + waypoint navigation
 
-Pacchetto standalone di guida autonoma per JetAuto (Mecanum + Jetson Nano)
-basato su segmentazione semantica (MobileNetV3 / TensorRT esterno).
+Standalone autonomous-driving package for JetAuto (Mecanum + Jetson Nano)
+based on semantic segmentation (MobileNetV3 / external TensorRT).
 
-**NON usa catkin_ws.** Tutti gli script si lanciano direttamente con
-`python2` (interprete di sistema dove ROS Melodic è installato).
+**It does NOT use catkin_ws.** All scripts are launched directly with
+`python2` (the system interpreter where ROS Melodic is installed).
 
-## Piattaforma
+## Platform
 
 ### Hardware
 
-| Voce | Valore |
+| Item | Value |
 |---|---|
 | Board | NVIDIA Jetson Nano Developer Kit |
 | Module | NVIDIA Jetson Nano (16 GB eMMC) |
@@ -21,11 +21,11 @@ basato su segmentazione semantica (MobileNetV3 / TensorRT esterno).
 
 ### Software
 
-| Voce | Valore |
+| Item | Value |
 |---|---|
 | OS | Ubuntu 18.04 Bionic Beaver |
 | Kernel | 4.9.337-tegra |
-| Python (sistema / ROS) | 2.7 |
+| Python (system / ROS) | 2.7 |
 | Python (lane follower, conda) | 3.6.9 |
 | ROS | Melodic |
 | CUDA | 10.2.300 |
@@ -34,11 +34,11 @@ basato su segmentazione semantica (MobileNetV3 / TensorRT esterno).
 | OpenCV | 4.5.5 (CUDA: YES) |
 | VPI / Vulkan | 1.2.3 / 1.2.70 |
 
-## Architettura
+## Architecture
 
 ```
-                roscore + driver Hiwonder
-                (avviati allo startup)
+                roscore + Hiwonder driver
+                (started at boot)
                        │
     ┌------------------┼------------------┐
     ↓                  ↓                  ↓
@@ -48,125 +48,126 @@ basato su segmentazione semantica (MobileNetV3 / TensorRT esterno).
     │                  │ Twist
 ┌--------┐    ┌------------------------------------┐
 │ lane_  │    │ lane_controller_node               │
-│ follo- │--->│  └- lane_core (pura logica)        │
+│ follo- │--->│  └- lane_core (pure logic)         │
 │ wer.py │    │ + waypoint_manager_node            │
-│ (suo)  │    │ + orchestrator (unico a guidare)   │
-│        │    │ + serve_dashboard                  │
+│ (own   │    │ + n_orchestrator (sole driver)     │
+│  env)  │    │ + serve_dashboard                  │
 └--------┘    └------------------------------------┘
 Python 3.6.9       Python 2.7
- conda env          sistema
+ conda env          system
 ```
 
-I due "blocchi" Python sono completamente separati a livello di processo
-e ambiente; comunicano solo via topic ROS.
+The two Python "blocks" are completely separate at the process and
+environment level; they communicate only via ROS topics.
 
-## File del pacchetto
+## Package files
 
-| File | Ruolo |
+| File | Role |
 |---|---|
-| `scripts/lane_controller_node.py` | Nodo ROS: wiring rosparam/pub/sub, gestisce stati TRACKING/SINGLE/STOP/DISABLED |
-| `scripts/lane_core.py` | Logica pura (no ROS): Hough, fit polinomiale, sterzata con EMA adattivo - importabile anche dall'offline tester |
-| `scripts/waypoint_manager_node.py` | Nodo ROS: Dijkstra + sequenza waypoint; pubblica `nav_info` (pianifica, non guida) |
-| `scripts/orchestrator.py` | Nodo ROS: unico publisher di `cmd_vel`; FSM blend corsia/mappa, incroci, fallback pure-pursuit |
-| `scripts/new_orchestrator.py` | Variante sperimentale di orchestrator (blend disagreement, rotonde, EMERGENCY_STOP) |
-| `scripts/map_loader.py` | Caricamento YAML + grafo NetworkX, classificazione nodi |
-| `scripts/serve_dashboard.py` | Mini server HTTP standalone per la dashboard |
-| `config/lane_params.yaml` | Tutti i parametri (velocità, soglie Hough, BEV, orchestrator, ecc.) |
-| `web/dashboard.html` | UI: feed video + mappa SVG + controlli |
-| `maps/map_clean-edited_smooth.yaml` | La mappa della pista |
-| `start_all.sh` | Avvia tutto lo stack ROS (rosbridge, web_video, dashboard, lane_controller, waypoint_manager, orchestrator) |
-| `stop_all.sh` | Ferma tutto + pubblica zero Twist |
+| `scripts/lane_controller_node.py` | ROS node: rosparam/pub/sub wiring, handles TRACKING/SINGLE/STOP/DISABLED states |
+| `scripts/lane_core.py` | Pure logic (no ROS): Hough, polynomial fit, steering with adaptive EMA - also importable from the offline tester |
+| `scripts/waypoint_manager_node.py` | ROS node: Dijkstra + waypoint sequencing; publishes `nav_info` (plans, does not drive) |
+| `scripts/n_orchestrator.py` | ROS node: sole publisher of `cmd_vel`; lane/map disagreement blend, junctions, roundabout, drift corrections, fallback pure-pursuit, terminal EMERGENCY_STOP |
+| `scripts/old/orchestrator.py` | Base class of `n_orchestrator` (remap, drift fix, pure-pursuit, junction spin) - imported as a library, no longer run as a node |
+| `scripts/old/new_orchestrator.py` | Superseded experimental orchestrator (kept for reference) |
+| `scripts/map_loader.py` | YAML loading + NetworkX graph, node classification |
+| `scripts/serve_dashboard.py` | Standalone mini HTTP server for the dashboard |
+| `config/lane_params.yaml` | All parameters (speeds, Hough thresholds, BEV, orchestrator, etc.) |
+| `web/dashboard.html` | UI: video feed + SVG map + controls |
+| `maps/map_clean-edited_smooth.yaml` | The track map (32 nodes, 36 directed edges) |
+| `start_all.sh` | Starts the whole ROS stack (rosbridge, web_video, dashboard, lane_controller, waypoint_manager, orchestrator) |
+| `stop_all.sh` | Stops everything + publishes a zero Twist |
 
-## Prerequisiti sul Jetson
+## Prerequisites on the Jetson
 
-Lo confermi con questi comandi:
+Confirm them with these commands:
 
 ```bash
-# 1) roscore deve essere attivo (lo è già all'avvio del Jetson)
+# 1) roscore must be running (it already is after Jetson boot)
 pgrep -af rosmaster
 
-# 2) Python 2 con tutte le dipendenze
+# 2) Python 2 with all dependencies
 python2 -c "import rospy, cv_bridge, yaml, networkx; print('OK')"
 
-# 3) rosbridge_server e web_video_server installati
+# 3) rosbridge_server and web_video_server installed
 rospack find rosbridge_server
 rospack find web_video_server
 ```
 
-Se manca `yaml` o `networkx` per Python 2:
+If `yaml` or `networkx` are missing for Python 2:
 
 ```bash
 sudo apt install python-yaml python-networkx
 ```
 
-## Installazione
+## Installation
 
-Il pacchetto va in una directory qualunque (consigliato: `~/jetauto_autonomous`).
+The package goes in any directory (recommended: `~/jetauto_autonomous`).
 
-Da PC sviluppo, via scp:
+From the development PC, via scp:
 
 ```bash
 cd ~/path/to/UniDrive
-scp -r jetauto_autonomous jetauto@<IP_JETSON>:~/jetauto_autonomous
+scp -r jetauto_autonomous jetauto@<JETSON_IP>:~/jetauto_autonomous
 ```
 
-Sul Jetson:
+On the Jetson:
 
 ```bash
 cd ~/jetauto_autonomous
 chmod +x start_all.sh stop_all.sh scripts/*.py
 ```
 
-## Avvio
+## Start
 
-In un terminale, sul Jetson:
+In a terminal on the Jetson:
 
 ```bash
 cd ~/jetauto_autonomous
 ./start_all.sh
 ```
 
-Cosa lancia:
-1. Carica `config/lane_params.yaml` in `rosparam`
-2. `rosbridge_websocket` (porta 9090) - comunicazione WebSocket per la dashboard
-3. `web_video_server` (porta 8080) - streaming MJPEG dei topic immagine
-4. `serve_dashboard.py` (porta 8000) - server HTTP della dashboard
-5. `lane_controller_node.py` - controllo laterale (propone cmd_vel)
-6. `waypoint_manager_node.py` - gestione waypoint (pianifica, pubblica nav_info)
-7. `orchestrator.py` - unico publisher di `/jetauto_controller/cmd_vel` (FSM, blend, fallback)
+What it launches:
+1. Loads `config/lane_params.yaml` into `rosparam`
+2. `rosbridge_websocket` (port 9090) - WebSocket bridge for the dashboard
+3. `web_video_server` (port 8080) - MJPEG streaming of image topics
+4. `serve_dashboard.py` (port 8000) - dashboard HTTP server
+5. `lane_controller_node.py` - lateral control (proposes cmd_vel)
+6. `waypoint_manager_node.py` - waypoint management (plans, publishes nav_info)
+7. `n_orchestrator.py` - sole publisher of `/jetauto_controller/cmd_vel` (FSM, blend, roundabout, fallback)
 
-I log finiscono in `/tmp/jetauto_autonomous_logs/`.
-I PID dei processi in `/tmp/jetauto_autonomous.pids`.
+Logs go to `/tmp/jetauto_autonomous_logs/`.
+Process PIDs to `/tmp/jetauto_autonomous.pids`.
 
-## In un altro terminale: avvia il lane follower
+## In another terminal: start the lane follower
 
-In **un terminale separato** (perché vive in un altro ambiente Python):
+In a **separate terminal** (it lives in a different Python environment):
 
 ```bash
 conda activate <env_name>
 cd ~/path/to/UniDrive/on_jetauto_scripts/drive_segm
-python lane_follower.py [args che usa di solito]
+python lane_follower.py [usual args]
 ```
 
-Verifica con:
+Verify with:
 
 ```bash
 rostopic hz /lane_mask_bev
 ```
 
-## Apri la dashboard
+## Open the dashboard
 
-Da qualunque PC sulla stessa rete (o dallo stesso Jetson via NoMachine):
+From any PC on the same network (or from the Jetson itself via NoMachine):
 
 ```
-http://<IP_JETSON>:8000/
+http://<JETSON_IP>:8000/
 ```
 
-Devi vedere:
-- pallino "Connected" verde in alto a destra
-- feed video con maschera colorata
-- mappa SVG con i 156 nodi della pista
-- controlli Start/End, START, STOP
+You should see:
+- a green "Connected" dot at the top right
+- the video feed with the colored mask
+- the SVG map with the track nodes
+- Start/End controls, START, STOP
 
 ## Stop
 
@@ -175,99 +176,101 @@ cd ~/jetauto_autonomous
 ./stop_all.sh
 ```
 
-## Tuning rapido
+## Quick tuning
 
-Modifica `config/lane_params.yaml` direttamente sul Jetson (è puro YAML, non
-serve ricompilare niente). Riavvia con:
+Edit `config/lane_params.yaml` directly on the Jetson (it is plain YAML,
+nothing needs recompiling). Restart with:
 
 ```bash
 ./stop_all.sh && ./start_all.sh
 ```
 
-Parametri che probabilmente vorrai toccare al primo test:
+Parameters you will probably want to touch at the first test:
 
-| Parametro | Effetto | Default | Range tipico |
+| Parameter | Effect | Default | Typical range |
 |---|---|---|---|
-| `linear_x_speed` | velocità di crociera (m/s) | 0.05 | 0.03 - 0.15 |
-| `max_angular_z` | sterzata massima (rad/s, drive=classic) | 0.80 | 0.4 - 1.2 |
-| `max_steering_angle` | angolo max mappato (gradi) | 48.0 | 30 - 60 |
-| `single_line_offset` | offset px stima centro con singola linea | 0 | 0 - 60 |
-| `hough_roi_top_frac` | porzione superiore BEV ignorata (lontano dal robot) | 0.30 | 0.0 - 0.6 |
-| `hough_threshold` | voti minimi HoughLinesP | 50 | 30 - 80 |
-| `hough_max_gap_px` | gap max per unire segmenti Hough | 40 | 10 - 60 |
-| `hough_min_length_px` | lunghezza min linea validata | 20 | 10 - 40 |
-| `center_y_ratio` | quota di misura del centro corsia [0=top,1=bot] | 0.50 | 0.3 - 0.7 |
-| `angle_smooth_alpha_base` | base EMA sull'angolo (più basso = più smooth) | 0.50 | 0.3 - 0.8 |
-| `lane_width_px` | larghezza corsia in BEV (fallback statico) | 280 | 200 - 350 |
-| `control_rate_hz` | frequenza loop controllo (Hz) | 20 | regola sui FPS del modello |
+| `linear_x_speed` | cruise speed (m/s) | 0.05 | 0.03 - 0.15 |
+| `max_angular_z` | max steering rate (rad/s, drive=classic) | 0.80 | 0.4 - 1.2 |
+| `max_steering_angle` | max mapped angle (degrees) | 48.0 | 30 - 60 |
+| `single_line_offset` | px offset for the centre estimate with a single line | 0 | 0 - 60 |
+| `hough_roi_top_frac` | top portion of the BEV ignored (far from the robot) | 0.30 | 0.0 - 0.6 |
+| `hough_threshold` | minimum HoughLinesP votes | 50 | 30 - 80 |
+| `hough_max_gap_px` | max gap to join Hough segments | 40 | 10 - 60 |
+| `hough_min_length_px` | min validated line length | 20 | 10 - 40 |
+| `center_y_ratio` | lane-centre measurement height [0=top,1=bottom] | 0.50 | 0.3 - 0.7 |
+| `angle_smooth_alpha_base` | EMA base on the angle (lower = smoother) | 0.50 | 0.3 - 0.8 |
+| `lane_width_px` | lane width in BEV px (static fallback) | 280 | 200 - 350 |
+| `control_rate_hz` | control loop rate (Hz) | 20 | match the model FPS |
 
-Misura gli FPS del modello con:
+Measure the model FPS with:
 
 ```bash
 rostopic hz /lane_mask_bev
 ```
 
-E imposta `control_rate_hz` ≤ FPS_modello + 5 (vedi sezione "Tuning consigliato per Jetson Nano 4GB" più sotto).
+And set `control_rate_hz` ≤ model_FPS + 5 (see the "Recommended tuning for
+Jetson Nano 4GB" section below).
 
-## Calibrazione dinamica della larghezza corsia
+## Dynamic lane-width calibration
 
-Il controller misura continuamente la distanza fra linea sinistra e destra
-quando entrambe sono visibili e mantiene una stima EMA della larghezza
-corsia in pixel BEV. Quando poi il robot vede una sola linea (es. è
-sbilanciato lateralmente e l'altra esce dal frame), usa la stima
-dinamica al posto di `lane_width_px` statico per ricostruire il centro
-corsia. Senza questo meccanismo, una `lane_width_px` errata di anche
-solo il 15% rispetto alla pista reale spinge il robot sistematicamente
-fuori centro.
+The controller continuously measures the distance between the left and
+right line whenever both are visible and keeps an EMA estimate of the
+lane width in BEV pixels. When the robot then sees a single line (e.g.
+it is laterally offset and the other line leaves the frame), it uses the
+dynamic estimate instead of the static `lane_width_px` to reconstruct
+the lane centre. Without this mechanism, a `lane_width_px` wrong by even
+15% with respect to the real track pushes the robot systematically off
+centre.
 
-**Quando si attiva**: il primo frame con due linee valide fa il
-bootstrap. Ogni nuova misura entra
-nell'EMA se passa due sanity-check:
+**When it activates**: the first frame with two valid lines bootstraps
+it. Every new measurement enters the EMA if it passes two sanity checks:
 
-1. Range assoluto `[lane_width_min_px, lane_width_max_px]` (sempre).
-2. Banda relativa `lane_width_sanity_band` rispetto al valore corrente (solo dopo il bootstrap).
+1. Absolute range `[lane_width_min_px, lane_width_max_px]` (always).
+2. Relative band `lane_width_sanity_band` around the current value (only after bootstrap).
 
-**Disabilitazione**: `lane_width_dynamic_enable: false` -> torna al
-comportamento statico (usa sempre `lane_width_px`).
+**Disabling**: `lane_width_dynamic_enable: false` -> back to the static
+behavior (always uses `lane_width_px`).
 
-**Verifica dal debug image** (`/lane_debug/image`):
-- In basso a sinistra appare `W=...` (giallo): valore EMA corrente in px.
-- Sotto: `Wm=...` ultima misura grezza, **verde** se accettata nell'EMA, **rosso** se scartata.
-- Sulla riga magenta (quota `center_y`), due tick arancioni a `±W/2` dal centro corsia stimato.
+**Verification from the debug image** (`/lane_debug/image`):
+- Bottom left shows `W=...` (yellow): current EMA value in px.
+- Below it: `Wm=...` last raw measurement, **green** if accepted into the EMA, **red** if rejected.
+- On the magenta line (`center_y` height), two orange ticks at `±W/2` from the estimated lane centre.
 
 **Tuning**:
-- Se `W` oscilla di ±20px frame su frame -> abbassa `lane_width_ema_alpha` (es. 0.05).
-- Se `Wm` è spesso rosso anche su pista buona -> allarga `lane_width_sanity_band` (es. 0.35) o ricontrolla i bound assoluti.
-- Se `W=--` permanente -> nessuna misura ha mai passato i sanity-check; controlla `lane_width_min_px` / `lane_width_max_px` (sono in pixel **post-`bev_scale`**).
+- If `W` oscillates by ±20px frame to frame -> lower `lane_width_ema_alpha` (e.g. 0.05).
+- If `Wm` is often red even on a good track -> widen `lane_width_sanity_band` (e.g. 0.35) or re-check the absolute bounds.
+- If `W=--` permanently -> no measurement ever passed the sanity checks; check `lane_width_min_px` / `lane_width_max_px` (they are in **post-`bev_scale`** pixels).
 
-**Scaling con bev_scale**: se imposti `bev_scale: 2.0`, raddoppia
-`lane_width_px`, `lane_width_min_px`, `lane_width_max_px`. Il nodo
-emette un warning a startup se i bound non comprendono `lane_width_px`.
+**Scaling with bev_scale**: if you set `bev_scale: 2.0`, double
+`lane_width_px`, `lane_width_min_px`, `lane_width_max_px`. The node
+prints a startup warning if the bounds do not contain `lane_width_px`.
 
-## Fallback su mappa (interno all'orchestrator)
+## Map fallback (inside the orchestrator)
 
-Il fallback pure-pursuit non è più un nodo separato: vive dentro
-`orchestrator.py` come stato `FALLBACK` della FSM. Quando la corsia resta in
-`HOLD`/`STOP` per `hold_ramp_ticks` tick consecutivi durante la navigazione,
-l'orchestrator disabilita il lane controller e guida sul path calcolato da
-`waypoint_manager_node` finché la corsia non torna stabile (rientro in
-`NAVIGATING` dopo `recovery_ticks` tick OK e vicinanza a un nodo del path).
+The pure-pursuit fallback is no longer a separate node: it lives inside
+the orchestrator as the `FALLBACK` FSM state. When the lane stays in
+`HOLD`/`STOP` for `hold_ramp_ticks` consecutive ticks during navigation,
+the orchestrator disables the lane controller and drives on the path
+computed by `waypoint_manager_node` until the lane is stable again
+(back to `NAVIGATING` after `recovery_ticks` OK ticks near a path node).
+FALLBACK is bounded: a sustained cross-track excursion or a timeout trips
+the terminal `EMERGENCY_STOP` instead of wandering off-road.
 
-I parametri stanno in `lane_params.yaml` sotto `orchestrator:`
+Parameters live in `lane_params.yaml` under `orchestrator:`
 (`hold_ramp_ticks`, `recovery_ticks`, `lookahead_m`, `map_drive_speed`,
 `map_kp`, `map_max_angular`).
 
-## Tuning consigliato per Jetson Nano 4GB
+## Recommended tuning for Jetson Nano 4GB
 
-Con MobileNetV3 + TensorRT esterno il modello produce 20-30 FPS sul
-Jetson Nano 4GB. Valori suggeriti per `lane_params.yaml`:
+With MobileNetV3 + external TensorRT the model produces 20-30 FPS on the
+Jetson Nano 4GB. Suggested values for `lane_params.yaml`:
 
 ```yaml
-control_rate_hz: 15        # margine su latenza ROS Melodic (Python 2)
-bev_scale: 1.0             # alzare a 2.0 solo se il Jetson regge ed è davvero utile
+control_rate_hz: 15        # margin for ROS Melodic latency (Python 2)
+bev_scale: 1.0             # raise to 2.0 only if the Jetson copes and it actually helps
 hough_threshold: 50
 hough_min_line_px: 20
-hough_max_gap_px: 20       # su BEV 320×128 un gap di 40 unisce segmenti distanti
+hough_max_gap_px: 20       # on a 320×128 BEV a gap of 40 joins distant segments
 hough_min_length_px: 20
 hough_roi_top_frac: 0.30
 center_y_ratio: 0.50
@@ -276,33 +279,39 @@ angle_smooth_alpha_base: 0.50
 lane_width_ema_alpha: 0.10
 ```
 
-Note:
-- `control_rate_hz` deve essere ≤ `FPS_modello`. Con 25 FPS reali, 15 Hz lascia margine alla latenza ROS Melodic su Python 2.
-- `hough_max_gap_px=40` (default storico) su BEV 320×128 può unire segmenti che appartengono a linee diverse: con linee tratteggiate e rumore, 20 è più conservativo.
-- Se la CPU del Jetson è satura, abbassa `publish_debug: false` o `debug_scale: 0.4`.
+Notes:
+- `control_rate_hz` must be ≤ model FPS. With a real 25 FPS, 15 Hz leaves margin for ROS Melodic latency on Python 2.
+- `hough_max_gap_px=40` (historic default) on a 320×128 BEV can join segments belonging to different lines: with dashed lines and noise, 20 is more conservative.
+- If the Jetson CPU is saturated, set `publish_debug: false` or `debug_scale: 0.4`.
 
 ## Troubleshooting
 
-**"roscore/rosmaster NON è attivo"** -> il sistema non è ancora pronto. Aspetta
-che lo startup-script finisca, oppure lancialo a mano: `roscore &`.
+**"roscore/rosmaster is NOT running"** -> the system is not ready yet. Wait
+for the startup script to finish, or launch it manually: `roscore &`.
 
-**"dipendenze Python mancanti"** -> `sudo apt install python-yaml python-networkx`.
+**"missing Python dependencies"** -> `sudo apt install python-yaml python-networkx`.
 
-**Robot non si muove dopo START** -> controlla:
-- `rostopic hz /lane_mask_bev` deve dare frequenza > 0
-- `rostopic echo /lane_controller/state` deve mostrare `TRACKING_*`, non `STOP`
-- `rostopic echo /jetauto_controller/cmd_vel` deve mostrare Twist non-zero
+**Robot does not move after START** -> check:
+- `rostopic hz /lane_mask_bev` must report a rate > 0
+- `rostopic echo /lane_controller/state` must show `TRACKING_*`, not `STOP`
+- `rostopic echo /jetauto_controller/cmd_vel` must show a non-zero Twist
 
-**Robot si ferma in mezzo alla pista senza corsia visibile** - con un goal
-attivo l'orchestrator passa in `FALLBACK` (pure-pursuit sul path) dopo
-`hold_ramp_ticks` tick di corsia persa. Se si ferma comunque, verifica che ci
-sia una navigazione attiva (`/waypoint_manager/status == NAVIGATING`) e che
-`/waypoint_manager/path` non sia vuoto.
+**Robot stops mid-track with no visible lane** - with an active goal the
+orchestrator switches to `FALLBACK` (pure-pursuit on the path) after
+`hold_ramp_ticks` ticks of lost lane. If it still stops, verify that a
+navigation is active (`/waypoint_manager/status == NAVIGATING`) and that
+`/waypoint_manager/path` is not empty.
 
-**Robot oscilla** -> abbassa `Kp_lat` a 0.002 o aumenta `smooth_alpha` a 0.6.
+**Robot stopped with a red EMERGENCY STOP banner** - a failsafe tripped
+(lane/map conflict or sustained off-reference excursion; the reason is in
+the orchestrator log). It does not auto-recover by design: inspect the
+log line `EMERGENCY STOP: <why>`, fix/recalibrate if needed, and issue a
+new goal from the dashboard to resume.
 
-**Dashboard "Disconnected"** -> verifica che la porta 9090 sia raggiungibile
-dal browser: `curl http://<IP>:9090/` deve dare almeno una risposta HTTP.
+**Robot oscillates** -> lower `Kp_lat` to 0.002 or raise `smooth_alpha` to 0.6.
 
-**Feed video grigio** -> `tail -f /tmp/jetauto_autonomous_logs/web_video_server.log`
-per capire se ci sono errori. Verifica `rostopic hz /lane_debug/image`.
+**Dashboard "Disconnected"** -> verify port 9090 is reachable from the
+browser: `curl http://<IP>:9090/` must return at least an HTTP response.
+
+**Gray video feed** -> `tail -f /tmp/jetauto_autonomous_logs/web_video_server.log`
+to look for errors. Check `rostopic hz /lane_debug/image`.

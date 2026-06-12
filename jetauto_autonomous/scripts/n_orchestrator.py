@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-nn_orchestrator.py — sandbox for the next new_orchestrator iteration
---------------------------------------------------------------------
-Copy of `new_orchestrator.py` carrying the fixes for the error-accumulation
-issues; once validated it replaces `new_orchestrator.py`. Same node name as
-the others — run exactly one orchestrator.
+n_orchestrator.py — the production orchestrator (sole cmd_vel publisher)
+------------------------------------------------------------------------
+Validated successor of `old/new_orchestrator.py`; it subclasses the base
+`old/orchestrator.py` (kept as a library, no longer run as a node). Same node
+name as the legacy files — run exactly one orchestrator.
 
 On top of the new_orchestrator design (disagreement blend, radial roundabout,
-terminal EMERGENCY_STOP — see new_orchestrator.md), this sandbox adds:
+terminal EMERGENCY_STOP), this version adds:
 
   1. Real lane heading.  `theta_l` comes from /lane_controller/info[1]
      (`heading_rad`, +ve bends right in image coords -> negated to standard
@@ -46,20 +46,24 @@ States
 ------
   IDLE · NAVIGATING · JUNCTION · ROUNDABOUT · FALLBACK · EMERGENCY_STOP · DONE
 
-This file is standalone: it imports the parent read-only (the parent only spins
-up a ROS node under its own `__main__`) and touches no other module.  Run it in
-place of `orchestrator.py` (never both at once — same node name).
+This file imports the parent read-only (the parent only spins up a ROS node
+under its own `__main__`) and touches no other module.
 """
 
 from __future__ import print_function
 import math
+import os
+import sys
 from collections import namedtuple
 
 import rospy
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float64MultiArray, Int32MultiArray, String  # noqa: F401 (String kept for parity)
 
-from orchestrator import Orchestrator, angle_diff, clamp
+# The base class lives in old/ (superseded as a runnable node, still the
+# library this subclass builds on).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "old"))
+from orchestrator import Orchestrator, angle_diff, clamp  # noqa: E402
 
 
 # Per-tick snapshot passed to the state handlers (immutable, no re-locking).

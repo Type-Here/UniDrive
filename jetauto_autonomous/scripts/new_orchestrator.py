@@ -91,6 +91,7 @@ class NewOrchestrator(Orchestrator):
     ROUNDABOUT    = "ROUNDABOUT"
     CONFLICT_STOP = "CONFLICT_STOP"
     TRAFFIC_STOP  = "TRAFFIC_STOP"   # held at a red light (object-detection override)
+    STOP_SIGN      = "STOP_SIGN"     # held at a stop sign (object-detection override)
 
     def __init__(self):
         super(NewOrchestrator, self).__init__()
@@ -135,9 +136,14 @@ class NewOrchestrator(Orchestrator):
         self._tl_topic  = rp("traffic_light_topic", "/object_detection/drive")
         self._tl_red    = rp("traffic_light_red_label",   "red_TL")
         self._tl_green  = rp("traffic_light_green_label", "green_TL")
+        self._stop_sign = rp("stop_sign", "stop_s")
         # Current light: "GREEN" (go) until a red is detected. Default GREEN so a
         # silent/absent detection topic never blocks driving.
         self._traffic_light = "GREEN"
+        self._stop_s = False
+        # How many seconds to hold the stop after the last stop-sign detection.
+        self._stop_sign_hold = float(rp("stop_sign_hold", 3.0))
+        self._stop_s_until   = rospy.Time(0)
 
         if self._tl_enable:
             rospy.Subscriber(self._tl_topic, String, self._traffic_cb, queue_size=1)
@@ -181,6 +187,12 @@ class NewOrchestrator(Orchestrator):
             if self._traffic_light != "GREEN":
                 rospy.loginfo("[new_orch] GREEN light detected -> GO")
             self._traffic_light = "GREEN"
+        elif self._stop_sign in labels or "stop_s" in labels:
+            if not self._stop_s:
+                rospy.logwarn("[new_orch] STOP sign detected -> STOP")
+            self._stop_s      = True
+            self._stop_s_until = rospy.Time.now() + rospy.Duration(self._stop_sign_hold)
+        # else: keep latched; auto-cleared by timer in _step
         # neither seen this frame: keep the latched state
 
     # ------------------------------------------------------------ small helpers
@@ -272,6 +284,15 @@ class NewOrchestrator(Orchestrator):
             self._publish_orc_state(self.TRAFFIC_STOP)
             self._cmd_pub.publish(Twist())
             return
+
+        if self._tl_enable and self._stop_s:
+            if rospy.Time.now() >= self._stop_s_until:
+                self._stop_s = False
+                rospy.loginfo("[new_orch] STOP sign hold expired -> GO")
+            else:
+                self._publish_orc_state(self.STOP_SIGN)
+                self._cmd_pub.publish(Twist())
+                return
 
         # --- snapshot shared state under one lock (mirrors parent) ---
         with self._lock:

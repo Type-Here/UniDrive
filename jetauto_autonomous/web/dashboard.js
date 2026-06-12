@@ -12,7 +12,7 @@ ros.on('connection', () => {
   switchTopic(currentTopicMode);
 });
 ros.on('error', () => { connEl.classList.remove('ok'); connEl.children[1].textContent = 'Error'; });
-ros.on('close', () => { connEl.classList.remove('ok'); connEl.children[1].textContent = 'Disconnected'; });
+ros.on('close', () => { connEl.classList.remove('ok'); connEl.children[1].textContent = 'Disconnected: ' + CONFIG.rosbridge_url; });
 
 // --- Video feed ---------------------------------------------------------------
 let currentTopicMode = 'camera';

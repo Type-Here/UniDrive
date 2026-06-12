@@ -40,8 +40,8 @@ Camera
                     │          /odom
                     │            │
                     ▼            ▼
-             orchestrator.py  ── Python 2.7
-             (FSM + blending + junction + fallback)
+             n_orchestrator.py  ── Python 2.7
+             (FSM + blending + junction + roundabout + fallback)
                     │
                     ├──► /lane_controller/enable    (enable/disable Hough loop)
                     └──► /jetauto_controller/cmd_vel  ◄── sole hardware output
@@ -59,7 +59,9 @@ Camera
         └──► /waypoint_manager/status    ──► dashboard
 ```
 
-**Key design principle:** `orchestrator.py` is the *sole* publisher of `/jetauto_controller/cmd_vel`. No other node touches the hardware command topic. This eliminates the race condition that previously occurred when `lane_controller_node` and `waypoint_manager_node` both published simultaneously during state transitions.
+**Key design principle:** the orchestrator (`n_orchestrator.py`) is the *sole* publisher of `/jetauto_controller/cmd_vel`. No other node touches the hardware command topic. This eliminates the race condition that previously occurred when `lane_controller_node` and `waypoint_manager_node` both published simultaneously during state transitions.
+
+The legacy `orchestrator.py` (base class, still imported as a library) and `new_orchestrator.py` (superseded experiment) live in `scripts/old/`; only `n_orchestrator.py` is launched.
 
 ---
 
@@ -116,7 +118,7 @@ Pure path-tracker. Knows the map but makes no driving decisions.
 
 **Each tick:**
 1. Read current robot pose (MAP frame, via odom + remap transform)
-2. Dot-product test on path segments: if `(robot - node_i) · (node_{i+1} - node_i) > 0`, the robot has passed `node_i` → advance idx
+2. Dot-product test on path segments, measured along the **incoming** edge: if `(robot - node_i) · (node_i - node_{i-1}) > 0`, the robot has traveled *through* `node_i` → advance idx. (The outgoing edge was used originally, but at a sharp junction it points sideways, so a small lateral map error advanced the target before the robot ever reached the node and the turn never armed.)
 3. Final node: stop if distance < `waypoint_tolerance`
 4. Publish `/waypoint_manager/nav_info` (8-element Float64MultiArray):
 
@@ -135,13 +137,14 @@ The **remap transform** (theta, scale, tx, ty) converts odom coordinates to the 
 
 ---
 
-### 3.4 `orchestrator.py` (Python 2.7)
+### 3.4 `n_orchestrator.py` (Python 2.7)
 
-The brain of the driving system. It is the only node that publishes to `/jetauto_controller/cmd_vel`.
+The brain of the driving system. It is the only node that publishes to `/jetauto_controller/cmd_vel`. It subclasses the base `scripts/old/orchestrator.py` (which provides the remap machinery, drift correction, pure-pursuit and the junction spin) and overrides the per-tick decision logic — see the dedicated orchestrator doc for the full algorithm (blend, roundabout phases, failsafes).
 
 **Inputs:**
 - `/lane_controller/cmd_vel` — what lane detection wants to do
 - `/lane_controller/state` — how confident lane detection is
+- `/lane_controller/info` — camera-frame lane geometry (heading, per-line offsets/validity, dashed flags)
 - `/waypoint_manager/nav_info` — where on the map we are
 - `/waypoint_manager/path` — full path node IDs (for pure-pursuit)
 - `/odom` — robot pose (converted to MAP frame internally)
@@ -150,46 +153,57 @@ The brain of the driving system. It is the only node that publishes to `/jetauto
 **Outputs:**
 - `/jetauto_controller/cmd_vel` — the actual motor command
 - `/lane_controller/enable` — controls whether lane_controller runs its Hough loop
+- `/orchestrator/state` — FSM state for the dashboard (incl. `EMERGENCY_STOP`)
+- `/orchestrator/diag` — 13-field per-tick diagnostics (cross-track, blend, remap, …)
+- `/remap_transform` — re-published when the drift/straight corrections adjust the frame
+- `/waypoint_manager/goal` — empty goal to cancel navigation on emergency stop (and opt-in replan)
 
 ---
 
 ## 4. Orchestrator FSM
 
 ```
-         ┌──────────────────────────────────────────┐
-         │  nav_info.is_active = False              │
-         ▼                                          │
-     ┌──────┐    new goal (is_active = True)   ┌───────────┐
-     │ IDLE │ ────────────────────────────────► │ NAVIGATING│
-     └──────┘                                  └─────┬─────┘
-                                                     │
-              ┌──────────────────────────────────────┤
-              │                                      │
-              │  is_junction AND dist ≤ radius       │  HOLD ticks ≥ hold_ramp
-              ▼                                      ▼
-        ┌──────────┐                          ┌──────────┐
-        │ JUNCTION │                          │ FALLBACK │
-        └────┬─────┘                          └────┬─────┘
-             │                                     │
-             │ aligned AND creep done              │ OK ticks ≥ recovery_ticks
-             └──────────────┐  ┌──────────────────┘
-                            ▼  ▼
-                       ┌───────────┐
-                       │ NAVIGATING│
-                       └─────┬─────┘
-                             │
-                             │  nav_info.is_active = False (goal reached or canceled)
-                             ▼
-                          ┌──────┐
-                          │ DONE │
-                          └──────┘
+     ┌──────┐    new goal (is_active = True)    ┌───────────┐
+     │ IDLE │ ─────────────────────────────────► │ NAVIGATING│
+     └──────┘                                   └─────┬─────┘
+                                                      │
+         ┌──────────────────────┬─────────────────────┤
+         │ sharp junction AND   │ cur/next is a ring  │ HOLD/STOP ticks
+         │ dist ≤ radius        │ node (or exit stub) │ ≥ hold_ramp
+         ▼                      ▼                     ▼
+   ┌──────────┐          ┌────────────┐         ┌──────────┐
+   │ JUNCTION │          │ ROUNDABOUT │         │ FALLBACK │
+   └────┬─────┘          └─────┬──────┘         └────┬─────┘
+        │ aligned              │ window closed       │ lane OK near path
+        └──────────────────────┴─────────────────────┘
+                               │
+                               ▼  back to NAVIGATING
+                               │
+                               │ nav_info.is_active = False (goal reached or canceled)
+                               ▼
+                            ┌──────┐
+                            │ DONE │
+                            └──────┘
+
+   any sustained failsafe ──────────────────► ┌────────────────┐
+   (lane/map conflict, roundabout or          │ EMERGENCY_STOP │
+    fallback off-reference, fallback timeout) └────────────────┘
+                                              terminal: halts, cancels the goal;
+                                              cleared only by a NEW goal
 ```
 
 ---
 
 ## 5. Driving decisions in detail
 
-### 5.1 NAVIGATING — blended lane + map
+> **Note** — this section describes the *base-class* logic (`scripts/old/orchestrator.py`)
+> that the FSM is built on. The running `n_orchestrator.py` replaces the alpha blend of §5.1
+> with a disagreement-driven `a_lane` blend, adds the ROUNDABOUT state (radial ring curve +
+> camera guardrail), the EMERGENCY_STOP failsafes, and continuous map-frame drift corrections.
+> See the dedicated orchestrator doc for the current algorithm; the JUNCTION and FALLBACK
+> mechanics below still apply.
+
+### 5.1 NAVIGATING — blended lane + map (base class)
 
 This is the default state. The orchestrator computes a blended command:
 
@@ -272,7 +286,7 @@ Both `waypoint_manager_node` and `orchestrator` apply this transform independent
 4. `serve_dashboard.py :8000` — HTTP dashboard server
 5. `lane_controller_node.py` — starts in DISABLED state (enable not yet published)
 6. `waypoint_manager_node.py` — starts in IDLE, publishes `nav_info.is_active=False`
-7. `orchestrator.py` — starts in IDLE, immediately publishes `enable=False` to lane_controller
+7. `n_orchestrator.py` — starts in IDLE, immediately publishes `enable=False` to lane_controller
 
 Then, separately, in a conda terminal:
 ```bash
@@ -298,10 +312,13 @@ python3 lane_follower.py --model model.engine --tensorrt
 | `/lane_controller/cmd_vel` | Twist | lane_controller | orchestrator | **proposed only, never to hardware** |
 | `/lane_controller/state` | String | lane_controller | orchestrator | OK/HOLD/STOP/DISABLED |
 | `/lane_controller/enable` | Bool (latched) | orchestrator | lane_controller | sole enable publisher |
+| `/lane_controller/info` | Float64MultiArray | lane_controller | orchestrator | 10-field lane geometry (heading, line offsets/validity, dashed flags) |
 | `/lane_debug/image` | Image | lane_controller | dashboard | debug overlay |
 | `/odom` | Odometry | hardware | waypoint_manager, orchestrator | robot pose |
-| `/remap_transform` | Float64MultiArray | dashboard | waypoint_manager, orchestrator | live frame update |
-| `/waypoint_manager/goal` | Int32MultiArray | dashboard | waypoint_manager | [start_id, end_id] |
+| `/remap_transform` | Float64MultiArray | dashboard, orchestrator | waypoint_manager, orchestrator | live frame update (orchestrator republishes its drift corrections) |
+| `/waypoint_manager/goal` | Int32MultiArray | dashboard, orchestrator | waypoint_manager | [start_id, end_id]; **empty = cancel** (used by the emergency stop) |
+| `/orchestrator/state` | String (latched) | orchestrator | dashboard | FSM state, incl. `EMERGENCY_STOP` |
+| `/orchestrator/diag` | Float64MultiArray | orchestrator | logging / plots | 13-field per-tick diagnostics (25 Hz) |
 | `/waypoint_manager/path` | Int32MultiArray (latched) | waypoint_manager | orchestrator | node IDs for pure-pursuit |
 | `/waypoint_manager/nav_info` | Float64MultiArray | waypoint_manager | orchestrator | 8-element, 25 Hz |
 | `/waypoint_manager/status` | String (latched) | waypoint_manager | dashboard | IDLE/NAVIGATING/GOAL_REACHED/ERROR |
@@ -341,6 +358,8 @@ python3 lane_follower.py --model model.engine --tensorrt
 ## 10. Known limitations and discussion points
 
 - **Junction advancement race:** after the orchestrator completes rotation and creeps forward, the waypoint_manager's dot-product test advances `idx` past the junction node. There is a brief period (~1–3 ticks) where `idx` still points at the junction node while the robot is already moving away. The `junction_radius` check in the orchestrator has a sticky `self._state == JUNCTION` guard that prevents re-triggering, so this is safe.
+
+- **Junction passing deadlock (open issue):** the advancement test measures progress along the *incoming* edge. If the junction turn happens *before* the node's perpendicular plane (the spin arms up to `junction_radius` early, or the blend cuts the corner), all subsequent travel is perpendicular to the test axis and a small lateral map offset can keep the test from ever firing — `idx` then stays parked on the junction node (observed at node 6: target stuck at `6->30`, `dist` growing, `c → -1` once past node 30). While stuck, the conflict stop is suppressed (`is_junction`) and the straight-line corrections are gated off, so the condition cannot self-heal. A related trigger: a lateral map offset can keep `dist` above `junction_radius` so the in-place spin never arms and the blend alone cuts the turn.
 
 - **Roundabout tuning:** `alpha_near_junction` applies whenever `is_junction=True`, which depends on the node degree in the map graph. If the roundabout arc nodes are degree-2 (in/out only), they are not flagged as junctions and α stays at 0. In that case the blend only helps at the entry/exit nodes. The fix is to mark arc nodes differently in the map, or add a dedicated node type.
 

@@ -197,6 +197,36 @@ class LaneControllerV2Node(LaneControllerCore):
         vals = [h for h in (hdg(left_line), hdg(right_line)) if h is not None]
         return sum(vals) / len(vals) if vals else 0.0
 
+    def _line_is_dashed(self, mask, line):
+        """True if a fitted line lies on lane_dashed pixels rather than solid marking.
+
+        Samples the CLASS mask (post-bev_scale, INTER_NEAREST — same coordinate
+        space as the line) in a +/-3 px window at 8 rows between the line's
+        endpoints, and votes dashed vs solid class counts. A dashed line has
+        gaps, so a small absolute minimum is required besides the majority.
+        """
+        if line is None:
+            return False
+        h, w = mask.shape[:2]
+        x1, y1, x2, y2 = line
+        y_lo, y_hi = (float(min(y1, y2)), float(max(y1, y2)))
+        n_dash = n_solid = 0
+        for i in range(8):
+            y = int(round(y_lo + (y_hi - y_lo) * i / 7.0))
+            if y < 0 or y >= h:
+                continue
+            x = self._x_at_y(line, y)
+            if x is None:
+                continue
+            xa = max(int(round(x)) - 3, 0)
+            xb = min(int(round(x)) + 4, w)
+            if xa >= xb:
+                continue
+            seg = mask[y, xa:xb]
+            n_dash  += int(np.count_nonzero(seg == self.cls_dashed))
+            n_solid += int(np.count_nonzero(seg == self.cls_marking))
+        return n_dash >= 4 and n_dash > n_solid
+
     def _publish_info(self, info=None, state="STOP"):
         """Publish /lane_controller/info (Float64MultiArray). ADDITIVE / read-only.
 
@@ -204,15 +234,18 @@ class LaneControllerV2Node(LaneControllerCore):
           [0] state_code   [1] heading_rad
           [2] left_valid   [3] right_valid
           [4] left_offset  [5] right_offset   [6] center_offset   [7] lane_width
+          [8] left_is_dashed   [9] right_is_dashed
         Offsets are normalized to half image width: (x - cx) / (W/2), so left is
         ~negative, right ~positive, |.|~0 means the line is at the robot centre
         (about to be crossed). lane_width is (rx-lx)/(W/2) (or dyn width) or 0.
+        [8]/[9] are 1.0 when the corresponding valid line sits on lane_dashed
+        class pixels (a legally crossable separator) rather than solid marking.
         Invalid/absent fields are 0.0; consumers must gate on the valid flags.
         """
         msg  = Float64MultiArray()
         code = self._STATE_CODE.get(state, 0.0)
         if info is None:
-            msg.data = [code, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            msg.data = [code, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
             self.info_pub.publish(msg)
             return
         dst_h, dst_w = info["mask"].shape[:2]
@@ -233,9 +266,12 @@ class LaneControllerV2Node(LaneControllerCore):
             width = 0.0
         heading = self._lane_heading(info["left_line"] if vl else None,
                                      info["right_line"] if vr else None)
+        left_dash  = 1.0 if (vl and self._line_is_dashed(info["mask"], info["left_line"]))  else 0.0
+        right_dash = 1.0 if (vr and self._line_is_dashed(info["mask"], info["right_line"])) else 0.0
         msg.data = [code, heading,
                     1.0 if vl else 0.0, 1.0 if vr else 0.0,
-                    left_off, right_off, center_off, width]
+                    left_off, right_off, center_off, width,
+                    left_dash, right_dash]
         self.info_pub.publish(msg)
 
     # -- Twist output ---------------------------------------------------------

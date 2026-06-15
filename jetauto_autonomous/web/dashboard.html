@@ -29,6 +29,7 @@
         <button class="topic-btn active" id="btnCamera"  onclick="switchTopic('camera')">📷 Camera raw</button>
         <button class="topic-btn" id="btnDebug"   onclick="switchTopic('debug')">🔍 Controller (mask+linea)</button>
         <button class="topic-btn" id="btnLfDebug" onclick="switchTopic('lfDebug')">🛤 Follower (BEV+err)</button>
+        <button class="topic-btn" id="btnObjDet"  onclick="switchTopic('objDet')">🎯 Object Detection</button>
       </div>
 
       <!-- Drive enable/disable -->
@@ -135,6 +136,7 @@ const CONFIG = {
   topic_camera:     '/depth_cam/rgb/image_raw',
   topic_debug:      '/lane_debug/image',
   topic_lfDebug:    '/lane_follower/debug_image',
+  topic_objDet:     '/object_detection/video',
 };
 
 const NAV_CONFIRM_DIST = 0.30;  // m — below this, proceed silently

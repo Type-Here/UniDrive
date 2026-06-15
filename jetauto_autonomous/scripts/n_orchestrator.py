@@ -3,11 +3,12 @@
 """
 n_orchestrator.py — the production orchestrator (sole cmd_vel publisher)
 ------------------------------------------------------------------------
-Validated successor of `old/new_orchestrator.py`; it subclasses the base
-`old/orchestrator.py` (kept as a library, no longer run as a node). Same node
-name as the legacy files — run exactly one orchestrator.
+Self-contained: the base `Orchestrator` class (remap, drift correction,
+pure-pursuit, in-place junction spin, and the IDLE/NAVIGATING/JUNCTION/FALLBACK/
+DONE FSM) is defined inline below; `NewOrchestrator` extends it. Same node name
+as the legacy files — run exactly one orchestrator.
 
-On top of the new_orchestrator design (disagreement blend, radial roundabout,
+On top of the original disagreement-blend design (radial roundabout,
 terminal EMERGENCY_STOP), this version adds:
 
   1. Real lane heading.  `theta_l` comes from /lane_controller/info[1]
@@ -46,24 +47,42 @@ States
 ------
   IDLE · NAVIGATING · JUNCTION · ROUNDABOUT · FALLBACK · EMERGENCY_STOP · DONE
 
-This file imports the parent read-only (the parent only spins up a ROS node
-under its own `__main__`) and touches no other module.
+This file is fully self-contained: the base `Orchestrator` is defined inline
+below and `NewOrchestrator` extends it; it touches no other module besides
+`map_loader`.
 """
 
 from __future__ import print_function
+import json
 import math
 import os
-import sys
+import threading
 from collections import namedtuple
 
 import rospy
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Float64MultiArray, Int32MultiArray, String  # noqa: F401 (String kept for parity)
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Bool, Float64MultiArray, Int32MultiArray, String
 
-# The base class lives in old/ (superseded as a runnable node, still the
-# library this subclass builds on).
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "old"))
-from orchestrator import Orchestrator, angle_diff, clamp  # noqa: E402
+from map_loader import MapLoader
+
+
+def yaw_from_quat(q):
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
+
+
+def angle_diff(a, b):
+    """Signed shortest angular difference (a - b) wrapped to (-pi, pi]."""
+    d = a - b
+    while d >  math.pi: d -= 2.0 * math.pi
+    while d < -math.pi: d += 2.0 * math.pi
+    return d
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
 # Per-tick snapshot passed to the state handlers (immutable, no re-locking).
@@ -170,6 +189,338 @@ def _densify(p, q, res):
     steps = max(1, int(math.ceil(d / max(res, 1e-3))))
     return [(p[0] + (q[0] - p[0]) * s / float(steps),
              p[1] + (q[1] - p[1]) * s / float(steps)) for s in range(steps)]
+
+
+class Orchestrator(object):
+
+    IDLE       = "IDLE"
+    NAVIGATING = "NAVIGATING"
+    JUNCTION   = "JUNCTION"
+    FALLBACK   = "FALLBACK"
+    DONE       = "DONE"
+
+    _LANE_BAD   = frozenset(("HOLD", "STOP", "DISABLED"))  # used for freerun / recovery gates
+    _LANE_LOST  = frozenset(("HOLD", "STOP"))               # only these ramp toward FALLBACK
+
+    # nav_info Float64MultiArray slot indices
+    _NI_NODE   = 0
+    _NI_NEXT   = 1
+    _NI_DIST   = 2
+    _NI_JUNC   = 3
+    _NI_HDG    = 4
+    _NI_IDX    = 5
+    _NI_LEN    = 6
+    _NI_ACTIVE = 7
+
+    def __init__(self):
+        rospy.init_node("orchestrator", anonymous=False)
+
+        ns = "orchestrator/"
+        def rp(k, d):
+            return rospy.get_param(ns + k, d)
+
+        self._rate_hz        = float(rp("rate_hz",            25.0))
+        self._stale_timeout  = float(rp("stale_timeout",       0.5))
+        self._hold_ramp      = int  (rp("hold_ramp_ticks",     15))
+        self._recovery_ticks = int  (rp("recovery_ticks",       5))
+        self._junc_radius    = float(rp("junction_radius",     0.30))
+        self._junc_align     = float(rp("junction_align_deg",  22.0))
+        self._junc_spin      = float(rp("junction_spin_speed",       0.40))
+        self._alpha_junc     = float(rp("junction_alpha",            0.9))
+        self._lookahead      = float(rp("lookahead_m",               0.50))
+        self._recovery_radius = float(rp("fallback_recovery_radius", 0.50))
+        self._map_speed      = float(rp("map_drive_speed",      0.04))
+        self._map_kp         = float(rp("map_kp",               1.2))
+        self._map_max_w      = float(rp("map_max_angular",      0.80))
+        # Drift auto-correction (EMA applied at each confirmed node passage / junction)
+        self._drift_pos_alpha    = float(rp("drift_pos_alpha",       0.35))
+        self._drift_theta_alpha  = float(rp("drift_theta_alpha",     0.30))
+        self._drift_min_m        = float(rp("drift_min_correct_m",   0.03))
+        self._drift_max_m        = float(rp("drift_max_correct_m",   0.50))
+        self._drift_trigger_r    = float(rp("drift_trigger_radius",  0.20))
+        # Turn-angle-aware junction: skip full rotation for gentle heading changes
+        self._gentle_turn_deg   = float(rp("gentle_turn_deg",    20.0))
+        # Roundabout: pure map following at this speed (lane detection unreliable)
+        self._roundabout_speed  = float(rp("roundabout_drive_speed", 0.10))
+
+        # Remap transform (odom -> map frame), mirrors waypoint_manager
+        self._remap_theta = 0.0
+        self._remap_scale = 1.0
+        self._remap_tx    = 0.0
+        self._remap_ty    = 0.0
+        self._load_remap_params()
+
+        # Map loader for pure-pursuit coordinate lookup
+        self._map = None
+        map_file  = rospy.get_param("waypoint_manager/map_file", "")
+        if map_file and map_file != "/tmp/UNSET_MAP_FILE":
+            try:
+                rospy.loginfo("[orchestrator] loading map: %s", map_file)
+                self._map = MapLoader(map_file)
+            except Exception as e:
+                rospy.logwarn("[orchestrator] map load failed (%s); pure-pursuit disabled", e)
+        else:
+            rospy.logwarn("[orchestrator] map_file not set; pure-pursuit disabled")
+
+        # Shared state — protected by _lock (written by callbacks, read by _step)
+        self._lock           = threading.Lock()
+        self._pose           = None     # (x, y, yaw) in MAP frame
+        self._odom_pos       = None     # raw (x, y) in ODOM frame — for drift correction
+        self._odom_yaw       = 0.0      # raw yaw in ODOM frame — for theta correction
+        self._lane_cmd       = Twist()
+        self._lane_state     = "STOP"
+        self._nav_info       = None     # latest data list
+        self._path_ids       = []       # current path node IDs
+        self._lane_cmd_stamp = None
+        self._nav_info_stamp = None
+
+        # FSM state — written only from _step() (no lock needed)
+        self._state             = self.IDLE
+        self._hold_count        = 0
+        self._recv_count        = 0
+        self._freerun           = False  # True while passing lane cmds through in no-nav mode
+        self._handled_junction    = -1   # node ID of last completed junction; blocks re-trigger
+        self._node_corrected      = False  # True once drift correction fired for current node
+        self._last_corrected_node = -1     # node ID that was last drift-corrected
+        self._in_roundabout       = False  # True while navigating through roundabout nodes
+
+        # Publishers
+        self._cmd_pub    = rospy.Publisher(
+            "/jetauto_controller/cmd_vel", Twist, queue_size=1)
+        self._enable_pub = rospy.Publisher(
+            "/lane_controller/enable", Bool, queue_size=1, latch=True)
+        self._state_pub      = rospy.Publisher(
+            "/orchestrator/state", String, queue_size=1, latch=True)
+        self._last_orc_state = ""
+        self._remap_pub  = rospy.Publisher(
+            "/remap_transform", Float64MultiArray, queue_size=1)
+
+        # Subscribers
+        rospy.Subscriber("/lane_controller/cmd_vel",   Twist,
+                         self._lane_cmd_cb,   queue_size=1)
+        rospy.Subscriber("/lane_controller/state",     String,
+                         self._lane_state_cb, queue_size=1)
+        rospy.Subscriber("/waypoint_manager/nav_info", Float64MultiArray,
+                         self._nav_info_cb,   queue_size=1)
+        rospy.Subscriber("/waypoint_manager/path",     Int32MultiArray,
+                         self._path_cb,       queue_size=1)
+        rospy.Subscriber("/odom",                      Odometry,
+                         self._odom_cb,       queue_size=10)
+        rospy.Subscriber("/remap_transform",           Float64MultiArray,
+                         self._remap_cb,      queue_size=1)
+
+        self._set_lane_enabled(False)
+        rospy.loginfo(
+            "[orchestrator] ready. rate=%.0fHz  hold_ramp=%d  "
+            "recovery=%d  junc_align=%.0fdeg",
+            self._rate_hz, self._hold_ramp,
+            self._recovery_ticks, self._junc_align)
+
+    # ------------------------------------------------------------------ remap
+
+    def _load_remap_params(self):
+        here  = os.path.dirname(os.path.abspath(__file__))
+        fpath = os.path.join(here, "..", "web", "remap_params.json")
+        try:
+            with open(fpath) as f:
+                p = json.load(f)
+            self._remap_theta = float(p.get("theta", 0.0))
+            self._remap_scale = float(p.get("scale", 1.0))
+            self._remap_tx    = float(p.get("tx",    0.0))
+            self._remap_ty    = float(p.get("ty",    0.0))
+            rospy.loginfo(
+                "[orchestrator] remap loaded: theta=%.3f scale=%.3f tx=%.3f ty=%.3f",
+                self._remap_theta, self._remap_scale,
+                self._remap_tx, self._remap_ty)
+        except Exception as e:
+            rospy.loginfo("[orchestrator] no remap_params.json (%s), using identity", e)
+
+    def _remap_cb(self, msg):
+        if len(msg.data) < 4:
+            return
+        self._remap_theta = float(msg.data[0])
+        self._remap_scale = float(msg.data[1])
+        self._remap_tx    = float(msg.data[2])
+        self._remap_ty    = float(msg.data[3])
+
+    def _odom_to_map(self, x, y):
+        """Inverse similarity transform: map = R(-theta)/scale * (odom - t)."""
+        theta = self._remap_theta
+        scale = self._remap_scale if self._remap_scale != 0.0 else 1.0
+        cos_t = math.cos(-theta)
+        sin_t = math.sin(-theta)
+        dx = x - self._remap_tx
+        dy = y - self._remap_ty
+        return (cos_t * dx - sin_t * dy) / scale, (sin_t * dx + cos_t * dy) / scale
+
+    # ---------------------------------------------------------------- callbacks
+
+    def _odom_cb(self, msg):
+        p   = msg.pose.pose.position
+        yaw = yaw_from_quat(msg.pose.pose.orientation)
+        mx, my  = self._odom_to_map(p.x, p.y)
+        map_yaw = angle_diff(yaw, self._remap_theta)
+        with self._lock:
+            self._pose     = (mx, my, map_yaw)
+            self._odom_pos = (p.x, p.y)
+            self._odom_yaw = yaw
+
+    def _lane_cmd_cb(self, msg):
+        with self._lock:
+            self._lane_cmd       = msg
+            self._lane_cmd_stamp = rospy.Time.now()
+
+    def _lane_state_cb(self, msg):
+        with self._lock:
+            self._lane_state = msg.data
+
+    def _nav_info_cb(self, msg):
+        if len(msg.data) < 8:
+            return
+        with self._lock:
+            self._nav_info       = list(msg.data)
+            self._nav_info_stamp = rospy.Time.now()
+
+    def _path_cb(self, msg):
+        with self._lock:
+            self._path_ids = list(msg.data)
+        self._handled_junction    = -1   # new path resets junction history
+        self._node_corrected      = False
+        self._last_corrected_node = -1
+
+    # ----------------------------------------------------------------- helpers
+
+    def _set_lane_enabled(self, on):
+        self._enable_pub.publish(Bool(data=bool(on)))
+
+    def _publish_orc_state(self, s):
+        if s != self._last_orc_state:
+            self._state_pub.publish(String(data=s))
+            self._last_orc_state = s
+
+    def _fresh(self, stamp):
+        return (stamp is not None and
+                (rospy.Time.now() - stamp).to_sec() < self._stale_timeout)
+
+    def _map_angular(self, heading_to_next, robot_yaw):
+        """P-controller toward map heading, clamped."""
+        err = angle_diff(heading_to_next, robot_yaw)
+        return clamp(self._map_kp * err, -self._map_max_w, self._map_max_w)
+
+    # --------------------------------------------------- drift auto-correction
+
+    def _publish_remap(self):
+        """Broadcast current remap params so waypoint_manager stays in sync."""
+        msg = Float64MultiArray()
+        msg.data = [self._remap_theta, self._remap_scale,
+                    self._remap_tx,    self._remap_ty]
+        self._remap_pub.publish(msg)
+
+    def _apply_drift_correction(self, node_id, ox, oy):
+        """EMA-correct tx/ty using a confirmed node passage as a position fix point."""
+        if self._map is None:
+            return
+        try:
+            nx, ny = self._map.node_xy(node_id)
+        except Exception:
+            return
+        mx, my    = self._odom_to_map(ox, oy)
+        pos_error = math.hypot(mx - nx, my - ny)
+        if pos_error < self._drift_min_m or pos_error > self._drift_max_m:
+            return
+        # Compute exact (tx, ty) that would map (ox, oy) to (nx, ny)
+        theta = self._remap_theta
+        scale = self._remap_scale if self._remap_scale != 0.0 else 1.0
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        tx_exact = ox - scale * (cos_t * nx - sin_t * ny)
+        ty_exact = oy - scale * (sin_t * nx + cos_t * ny)
+        self._remap_tx = ((1.0 - self._drift_pos_alpha) * self._remap_tx
+                          + self._drift_pos_alpha * tx_exact)
+        self._remap_ty = ((1.0 - self._drift_pos_alpha) * self._remap_ty
+                          + self._drift_pos_alpha * ty_exact)
+        self._publish_remap()
+        rospy.loginfo(
+            "[orchestrator] drift pos correction: node=%d err=%.3fm"
+            "  tx=%.4f ty=%.4f", node_id, pos_error,
+            self._remap_tx, self._remap_ty)
+
+    def _apply_theta_correction(self, heading_nxt, odom_yaw):
+        """EMA-correct remap_theta using a completed junction alignment as a heading fix."""
+        # After JUNCTION spin, robot faces heading_nxt in map frame.
+        # Exact remap_theta: odom_yaw - heading_nxt = remap_theta  =>  map_yaw = heading_nxt
+        theta_exact = angle_diff(odom_yaw, heading_nxt)
+        delta = angle_diff(theta_exact, self._remap_theta)
+        self._remap_theta = self._remap_theta + self._drift_theta_alpha * delta
+        self._publish_remap()
+        rospy.loginfo(
+            "[orchestrator] drift theta correction: delta=%.2fdeg  theta=%.4f",
+            math.degrees(delta), self._remap_theta)
+
+    # -------------------------------------------------------- pure-pursuit
+
+    def _carrot(self, rx, ry, path_ids):
+        """Find lookahead point on path (MAP frame)."""
+        if not path_ids or self._map is None:
+            return None
+
+        # Closest node on path
+        best_idx, best_dist = 0, float("inf")
+        for i, nid in enumerate(path_ids):
+            nx, ny = self._map.node_xy(nid)
+            d = math.hypot(rx - nx, ry - ny)
+            if d < best_dist:
+                best_dist, best_idx = d, i
+
+        # If robot has passed best_idx toward best_idx+1, advance
+        if best_idx < len(path_ids) - 1:
+            ax, ay = self._map.node_xy(path_ids[best_idx])
+            bx, by = self._map.node_xy(path_ids[best_idx + 1])
+            if (rx - ax) * (bx - ax) + (ry - ay) * (by - ay) > 0:
+                best_idx += 1
+
+        # Walk forward until lookahead distance is accumulated
+        accum  = 0.0
+        px, py = self._map.node_xy(path_ids[best_idx])
+        for i in range(best_idx + 1, len(path_ids)):
+            nx, ny = self._map.node_xy(path_ids[i])
+            seg    = math.hypot(nx - px, ny - py)
+            if accum + seg >= self._lookahead:
+                frac = (self._lookahead - accum) / max(seg, 1e-9)
+                return px + frac * (nx - px), py + frac * (ny - py)
+            accum += seg
+            px, py = nx, ny
+        return self._map.node_xy(path_ids[-1])
+
+    def _pursuit_twist(self, pose_map, path_ids):
+        """Compute pure-pursuit Twist (all in MAP frame)."""
+        rx, ry, ryaw = pose_map
+        carrot = self._carrot(rx, ry, path_ids)
+        if carrot is None:
+            return Twist()
+        heading = math.atan2(carrot[1] - ry, carrot[0] - rx)
+        err     = angle_diff(heading, ryaw)
+        t = Twist()
+        t.linear.x  = self._map_speed
+        t.angular.z = clamp(self._map_kp * err, -self._map_max_w, self._map_max_w)
+        return t
+
+    # The control-loop FSM (_step + per-state handlers) is provided by the
+    # NewOrchestrator subclass — the only class instantiated. The base class
+    # contributes the shared machinery above (remap, callbacks, drift fix,
+    # pure-pursuit, _map_angular) plus run() below.
+
+    def run(self):
+        rate = rospy.Rate(self._rate_hz)
+        while not rospy.is_shutdown():
+            try:
+                self._step()
+            except Exception as e:
+                rospy.logerr_throttle(2.0, "[orchestrator] step err: %s", e)
+            rate.sleep()
+        # Clean shutdown
+        self._cmd_pub.publish(Twist())
+        self._set_lane_enabled(False)
 
 
 class NewOrchestrator(Orchestrator):
@@ -1066,6 +1417,16 @@ class NewOrchestrator(Orchestrator):
 
     # ------------------------------------------------------------- ROUNDABOUT
 
+    def _next_left_ring(self, C):
+        """True when the next target node is outside the ring (the exit leg).
+
+        Shared by _h_roundabout (drop the radial spline for plain pure-pursuit at
+        the exit) and _round_lane_nudge (disable the guardrail so the robot can
+        cross the outer boundary to leave) — the two must stay on the same boundary.
+        """
+        return (C.next_id < 0 or (self._map is not None
+                and not self._map.is_roundabout_node(C.next_id)))
+
     def _is_exit_stub(self, cur_id, idx, path_ids):
         """True when the current target is the first non-ring node right after the
         ring on the path (the exit stub, e.g. 23 reached from 28).
@@ -1080,20 +1441,28 @@ class NewOrchestrator(Orchestrator):
             return False
         return self._map.is_roundabout_node(int(path_ids[idx - 1]))
 
-    def _ring_ids(self, path_ids):
-        """Ordered ring node ids on the path (first..last tagged-roundabout span).
+    def _ring_span(self, path_ids):
+        """(first, last) path indices of the roundabout-tagged span, or None.
 
-        Takes the contiguous span between the first and last roundabout-tagged
-        nodes so the spline covers the whole ring portion of the route, tolerant
-        of an untagged node slipping in between.
+        The contiguous span between the first and last roundabout-tagged nodes, so
+        callers cover the whole ring portion of the route, tolerant of an untagged
+        node slipping in between. Shared by _ring_ids and _build_round_curve.
         """
         if self._map is None or not path_ids:
-            return []
+            return None
         ridx = [i for i, nid in enumerate(path_ids)
                 if self._map.is_roundabout_node(int(nid))]
         if not ridx:
+            return None
+        return ridx[0], ridx[-1]
+
+    def _ring_ids(self, path_ids):
+        """Ordered ring node ids on the path (first..last tagged-roundabout span)."""
+        span = self._ring_span(path_ids)
+        if span is None:
             return []
-        return [int(path_ids[i]) for i in range(ridx[0], ridx[-1] + 1)]
+        first, last = span
+        return [int(path_ids[i]) for i in range(first, last + 1)]
 
     def _build_round_curve(self, path_ids, center):
         """Per-segment radial-arc polyline through the ring nodes (MAP frame).
@@ -1104,13 +1473,10 @@ class NewOrchestrator(Orchestrator):
         the entry/exit neighbors so the curve joins the rest of the path.  Returns
         the dense polyline, or None for < 3 ring nodes (caller falls back to nodes).
         """
-        if self._map is None or not path_ids:
+        span = self._ring_span(path_ids)
+        if span is None:
             return None
-        ridx = [i for i, nid in enumerate(path_ids)
-                if self._map.is_roundabout_node(int(nid))]
-        if not ridx:
-            return None
-        first, last = ridx[0], ridx[-1]
+        first, last = span
         nodes = [self._map.node_xy(int(path_ids[i])) for i in range(first, last + 1)]
         if len(nodes) < 3:
             return None
@@ -1219,8 +1585,7 @@ class NewOrchestrator(Orchestrator):
         #     can never latch onto a stale curve endpoint and run away off-road.
         # Same boundary as the guardrail-off test in _round_lane_nudge (kept in sync):
         # when `next` leaves the ring, both the radial AND the guardrail give way.
-        exiting = (C.next_id < 0 or (self._map is not None
-                   and not self._map.is_roundabout_node(C.next_id)))
+        exiting = self._next_left_ring(C)
         on_ring = (self._map is not None
                    and self._map.is_roundabout_node(C.cur_node_id))
         poly = (self._ensure_round_spline(C.path_ids)
@@ -1285,8 +1650,7 @@ class NewOrchestrator(Orchestrator):
         # blocking the exit (observed -> went off-road). Within the roundabout window
         # the next target is outside the ring only on the exit leg, so disable the
         # guardrail there and let the radial lead-out + map drive the robot out.
-        if C.next_id < 0 or (self._map is not None
-                             and not self._map.is_roundabout_node(C.next_id)):
+        if self._next_left_ring(C):
             rospy.loginfo_throttle(1.0, "[nn_orch] ROUND guardrail OFF (exit leg)")
             return 0.0
         li = C.lane_info

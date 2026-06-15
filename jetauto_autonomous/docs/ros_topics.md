@@ -30,7 +30,7 @@ All topics currently active in the autonomous driving stack.
 - **LF** — `lane_follower.py` (Python 3, conda env)
 - **LC** — `lane_controller_node.py` (Python 2.7)
 - **WM** — `waypoint_manager_node.py` (Python 2.7)
-- **ORC** — `orchestrator.py` *or* `new_orchestrator.py` (Python 2.7; run one, never both — same node name). The sole node that drives the robot.
+- **ORC** — `n_orchestrator.py` (Python 2.7; run exactly one — same node name). The sole node that drives the robot.
 - **DB** — `dashboard.html` via rosbridge WebSocket
 
 **Topics removed vs. previous architecture:**
@@ -109,7 +109,7 @@ WM  (Python 2.7)
   ├── /waypoint_manager/path  ────────────────────► ORC, dashboard
   └── /waypoint_manager/status  ──────────────────► dashboard
 
-ORC  (orchestrator.py | new_orchestrator.py)  ← THE ONLY NODE THAT DRIVES THE ROBOT
+ORC  (n_orchestrator.py)  ← THE ONLY NODE THAT DRIVES THE ROBOT
   ├── /lane_controller/enable  ────────────────────► LC
   ├── /orchestrator/state  ────────────────────────► dashboard  (badges + EMERGENCY banner)
   ├── /waypoint_manager/goal  (empty = cancel on EMERGENCY_STOP)  ► WM

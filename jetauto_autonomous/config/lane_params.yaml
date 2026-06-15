@@ -215,3 +215,15 @@ orchestrator:
   fallback_offref_m:     0.60   # [new] m of cross-track from the pursued path before the stop
   fallback_offref_ticks: 25     # [new] consecutive off-reference ticks (debounce, ~1 s at 25 Hz)
   fallback_timeout_s:    60.0   # [new] max seconds in FALLBACK before the stop (0 = no timeout)
+
+  # ---- Object detection: traffic lights / STOP signs ([new]) ----
+  # Consumes the perception node's JSON detections on traffic_light_topic and
+  # overrides all driving with a full stop: a red light holds until a green is
+  # seen; a stop sign holds for stop_sign_hold seconds. Set enable=false to run
+  # the driving stack on its own (detections ignored).
+  traffic_light_enable:     true                       # [new] false = driving-only
+  traffic_light_topic:      "/object_detection/drive"  # [new] perception node output
+  traffic_light_red_label:  "red_TL"                   # [new] class name for red light
+  traffic_light_green_label: "green_TL"                # [new] class name for green light
+  stop_sign:                "stop_s"                    # [new] class name for stop sign
+  stop_sign_hold:           3.0                         # [new] seconds to hold at a stop sign

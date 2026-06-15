@@ -65,6 +65,7 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Float64MultiArray, Int32MultiArray, String
 
 from map_loader import MapLoader
+from object_detection.traffic_sign_handler import TrafficSignHandler
 
 
 def yaw_from_quat(q):
@@ -528,6 +529,11 @@ class NewOrchestrator(Orchestrator):
     # Extra states beyond the parent's IDLE/NAVIGATING/JUNCTION/FALLBACK/DONE.
     ROUNDABOUT     = "ROUNDABOUT"
     EMERGENCY_STOP = "EMERGENCY_STOP"   # terminal failsafe halt (ends navigation)
+    # Object-detection overrides (transient; published but never stored in
+    # self._state, so navigation resumes once the override clears). The strings
+    # match the object_detection.traffic_sign_handler constants of the same name.
+    TRAFFIC_STOP   = "TRAFFIC_STOP"     # held at a red light
+    STOP_SIGN      = "STOP_SIGN"        # held at a stop sign
 
     def __init__(self):
         super(NewOrchestrator, self).__init__()
@@ -688,6 +694,18 @@ class NewOrchestrator(Orchestrator):
         # GPS-style replan goes out on the existing goal topic (no other file changes).
         self._goal_pub = rospy.Publisher(
             "/waypoint_manager/goal", Int32MultiArray, queue_size=1)
+
+        # Object-detection override (traffic lights / STOP signs). Consumes the
+        # perception node's JSON detections and, when a red light is latched or a
+        # stop sign is active, seizes cmd_vel with a full stop (see _step). Set
+        # traffic_light_enable=false to develop/test the driving stack on its own.
+        self._obj_det = TrafficSignHandler(
+            enable      = bool(rp("traffic_light_enable", True)),
+            topic       = rp("traffic_light_topic", "/object_detection/drive"),
+            red_label   = rp("traffic_light_red_label", "red_TL"),
+            green_label = rp("traffic_light_green_label", "green_TL"),
+            stop_label  = rp("stop_sign", "stop_s"),
+            stop_hold_s = float(rp("stop_sign_hold", 3.0)))
 
         # Per-tick diagnostics (Float64MultiArray) — the camera-vs-drift separator.
         # Layout (fixed):
@@ -1055,6 +1073,17 @@ class NewOrchestrator(Orchestrator):
                 self._set_lane_enabled(False)
                 self._cmd_pub.publish(Twist())
             self._publish_orc_state(self.EMERGENCY_STOP)
+            return
+
+        # --- object-detection override (traffic light / STOP sign) ---
+        # Highest priority after the terminal emergency latch: while a red light
+        # is latched or a stop-sign hold is active, seize the cmd_vel bus with a
+        # full stop. We return BEFORE touching self._state, so navigation resumes
+        # exactly where it left off once the light turns green / the hold expires.
+        decision = self._obj_det.evaluate()
+        if decision.stop:
+            self._publish_orc_state(decision.state)   # TRAFFIC_STOP / STOP_SIGN
+            self._cmd_pub.publish(Twist())            # full stop
             return
 
         # --- snapshot shared state under one lock (mirrors parent) ---

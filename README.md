@@ -28,7 +28,7 @@ in **Python 3** (conda, ONNX Runtime or TensorRT), all control nodes run in **Py
 | `jetauto_autonomous/` | The on-robot control stack: lane controller, waypoint manager, orchestrator, web dashboard, track map, `start_all.sh`/`stop_all.sh` |
 | `jetauto_autonomous/docs/` | [Architecture](jetauto_autonomous/docs/architecture.md), [setup/usage README](jetauto_autonomous/docs/README.md), ROS topic reference, LaTeX report |
 | `on_jetauto_scripts/drive_segm/` | The segmentation node `lane_follower.py` (Python 3) + BEV auto-calibration |
-| `pipeline/` | Model training: LabelMe → dataset → SegFormer training → evaluation → ONNX export |
+| `pipeline/` | Model training: LabelMe → dataset → MobileNetV3/SegFormer training → evaluation → ONNX export |
 | `testing/` | `offline_tester.py` (run the full vision/control pipeline on a video, no ROS) and `sim/` (closed-loop orchestrator simulation against a ROS stub) |
 | `new_orchestrator.md` | Detailed design doc of the orchestrator (blend, roundabout, failsafes, parameters) |
 
@@ -58,7 +58,7 @@ prerequisites, installation, tuning and troubleshooting.
 ```bash
 cd pipeline                       # edit config.yaml first
 python3 1_prepare_dataset.py --config config.yaml --preview 10
-python3 3_train.py --config config.yaml          # SegFormer (mit-b1; use --model nvidia/mit-b0 for speed)
+python3 3_train.py --config config.yaml          # default MobileNetV3+LR-ASPP; --model segformer-b0|segformer-b1|fastscnn to switch
 python3 4_evaluate.py --checkpoint checkpoints/best.pth
 python3 5_export.py --checkpoint checkpoints/best.pth --simplify --verify
 # on the Jetson:
@@ -87,7 +87,8 @@ the bottom 55% of the camera frame. See [`pipeline/README.md`](pipeline/README.m
 ## Platform
 
 Jetson Nano (JetPack 4.6 / L4T 32.7), Ubuntu 18.04, ROS Melodic, CUDA 10.2, TensorRT 8.2,
-OpenCV 4.5 with CUDA. Model: SegFormer (mit-b0/b1) exported to ONNX/TensorRT, 20–30 FPS.
+OpenCV 4.5 with CUDA. Model: MobileNetV3-Large + LR-ASPP (default; SegFormer B0/B1 optional)
+exported to ONNX/TensorRT, 20–30 FPS.
 
 ## License
 

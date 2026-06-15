@@ -116,12 +116,13 @@ orchestrator:
   junction_spin_speed: 0.40  # rad/s cap for in-place rotation
   junction_alpha: 1.0        # spin blend weight on map heading: 1.0 = full map spin (lane hint off); <1.0 mixes in lane angular.z (0 if lane bad)
   # Anti-cut guardrail ([new], NAVIGATING approach only): while the line on the INSIDE
-  # of the turn is still confidently seen near the robot centre, scale the turn command
-  # toward straight so the robot waits until that line clears (the intersection opens)
-  # before committing — avoids cutting the corner into FALLBACK. Camera-frame, additive.
+  # of the turn is still validly SEEN ahead (the intersection has not opened yet), scale
+  # the turn command toward straight so the robot drives up to the node before committing
+  # — avoids cutting the corner (wide node-6 left turn). Releases when the inside line
+  # goes invalid (mouth opens) or is a dashed legal crossing. Camera-frame, additive.
   junction_lane_correct: true   # [new] master enable for the junction anti-cut guardrail
-  junction_inside_clear: 0.30   # [new] normalized clearance to the INSIDE line below which we hold the turn straighter
-  junction_lane_gain:    1.0    # [new] damping strength: scale = 1 - gain*severity (1.0 -> full straighten when the inside line is at centre)
+  junction_inside_clear: 0.30   # [new] anti-cut now HOLDS the turn straight while the inside line is still seen (intersection not yet open); this is the normalized band beyond the line's nominal lane-edge offset over which the hold eases off as the line recedes/drops out
+  junction_lane_gain:    1.0    # [new] damping strength: scale = 1 - gain*severity (1.0 -> full straighten while the inside line is at/inside its nominal position)
   junction_lane_floor:   0.0    # [new] minimum turn scale (0.0 -> may fully straighten; raise to keep some turn-in)
 
   # ---- Dashed-separator lane change ([new]) ----

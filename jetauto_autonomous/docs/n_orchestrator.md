@@ -95,9 +95,14 @@ resumes from wherever it was the instant the override clears.
 republishes the goal for a fresh Dijkstra; it never seizes steering.)*
 
 **Anti-cut guardrail (`_junction_anti_cut_scale`).** While a real turn is intended
-(`|theta_m| ≥ 20°`) and the line on the INSIDE of the turn is still confidently seen near the
-robot centre, the turn is scaled toward straight so the robot waits until the intersection
-opens. The scale applies **only to the map term**:
+(`|theta_m| ≥ 20°`) and the line on the INSIDE of the turn is still validly **seen ahead**
+(the intersection has not opened yet), the turn is scaled toward straight so the robot drives
+up to the node before committing. The release cue is the inside line going **invalid** (the
+intersection mouth opens), *not* its offset shrinking — a correctly-centred inside line sits a
+full lane half-width (~0.79) off centre, so the old `|inside_off| ≥ 0.30 → commit` test fired
+on every normal approach and the guard only woke after the robot had already cut a half-lane in
+(the wide node-6 left turn). The hold eases over `junction_inside_clear` as the line recedes
+past nominal. The scale applies **only to the map term**:
 
 ```
 w = a_lane*lane_w + (1 - a_lane)*map_w*scale
@@ -321,7 +326,7 @@ Marked **[code]** = in-code default only, not yet in `lane_params.yaml`.
 | `junction_influence_radius` | 0.50 m | map blend-in distance; must exceed `junction_radius` AND stay below the entry-segment length |
 | `junction_turn_full_deg` | 50 | map heading error at which the map fully takes over the approach blend |
 | `junction_lane_correct` | True | master enable for the junction anti-cut guardrail |
-| `junction_inside_clear` | 0.30 | normalized clearance to the INSIDE line below which the turn is held straighter |
+| `junction_inside_clear` | 0.30 | anti-cut holds the turn straight while the inside line is still seen; normalized band beyond its nominal lane-edge offset over which the hold eases off as the line recedes/drops out |
 | `junction_lane_gain` | 1.0 | anti-cut damping strength: `scale = 1 - gain*severity` |
 | `junction_lane_floor` | 0.0 | minimum turn scale |
 | `dash_cross_enable` | `true` | dashed-separator crossing hold |

@@ -30,7 +30,7 @@ in **Python 3** (conda, ONNX Runtime or TensorRT), all control nodes run in **Py
 | `on_jetauto_scripts/drive_segm/` | The segmentation node `lane_follower.py` (Python 3) + BEV auto-calibration |
 | `pipeline/` | Model training: LabelMe → dataset → SegFormer training → evaluation → ONNX export |
 | `testing/` | `offline_tester.py` (run the full vision/control pipeline on a video, no ROS) and `sim/` (closed-loop orchestrator simulation against a ROS stub) |
-| `new_orchestrator.md` | Detailed design doc of the orchestrator (blend, roundabout, failsafes, parameters) |
+| [`jetauto_autonomous/docs/n_orchestrator.md`](jetauto_autonomous/docs/n_orchestrator.md) | Detailed design doc of the orchestrator (blend, roundabout, failsafes, parameters) |
 
 ## Quick start (on the robot)
 

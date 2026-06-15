@@ -61,7 +61,7 @@ Camera
 
 **Key design principle:** the orchestrator (`n_orchestrator.py`) is the *sole* publisher of `/jetauto_controller/cmd_vel`. No other node touches the hardware command topic. This eliminates the race condition that previously occurred when `lane_controller_node` and `waypoint_manager_node` both published simultaneously during state transitions.
 
-The legacy `orchestrator.py` (base class, still imported as a library) and `new_orchestrator.py` (superseded experiment) live in `scripts/old/`; only `n_orchestrator.py` is launched.
+`n_orchestrator.py` is self-contained: the former base class `Orchestrator` (remap, drift fix, pure-pursuit, junction spin) is defined inline in the same file and `NewOrchestrator` extends it. The legacy `orchestrator.py` and `new_orchestrator.py` (superseded experiment) have been removed.
 
 ---
 
@@ -139,7 +139,7 @@ The **remap transform** (theta, scale, tx, ty) converts odom coordinates to the 
 
 ### 3.4 `n_orchestrator.py` (Python 2.7)
 
-The brain of the driving system. It is the only node that publishes to `/jetauto_controller/cmd_vel`. It subclasses the base `scripts/old/orchestrator.py` (which provides the remap machinery, drift correction, pure-pursuit and the junction spin) and overrides the per-tick decision logic — see the dedicated orchestrator doc for the full algorithm (blend, roundabout phases, failsafes).
+The brain of the driving system. It is the only node that publishes to `/jetauto_controller/cmd_vel`. It is self-contained: it defines a base `Orchestrator` class inline (the remap machinery, drift correction, pure-pursuit and the junction spin) and `NewOrchestrator` extends it, overriding the per-tick decision logic — see the dedicated orchestrator doc for the full algorithm (blend, roundabout phases, failsafes).
 
 **Inputs:**
 - `/lane_controller/cmd_vel` — what lane detection wants to do
@@ -196,8 +196,9 @@ The brain of the driving system. It is the only node that publishes to `/jetauto
 
 ## 5. Driving decisions in detail
 
-> **Note** — this section describes the *base-class* logic (`scripts/old/orchestrator.py`)
-> that the FSM is built on. The running `n_orchestrator.py` replaces the alpha blend of §5.1
+> **Note** — this section describes the *base-class* logic (the `Orchestrator` class now
+> defined inline in `scripts/n_orchestrator.py`) that the FSM is built on. The running
+> `NewOrchestrator` in the same file replaces the alpha blend of §5.1
 > with a disagreement-driven `a_lane` blend, adds the ROUNDABOUT state (radial ring curve +
 > camera guardrail), the EMERGENCY_STOP failsafes, and continuous map-frame drift corrections.
 > See the dedicated orchestrator doc for the current algorithm; the JUNCTION and FALLBACK

@@ -232,9 +232,10 @@ function updateOdom(msg) {
   const siny = 2*(q.w*q.z + q.x*q.y);
   const cosy = 1 - 2*(q.y*q.y + q.z*q.z);
 
-  // save raw position for calibration
+  // save raw position + yaw for calibration / quick remap
   lastRawOdom.x = p.x;
   lastRawOdom.y = p.y;
+  lastRawYaw    = Math.atan2(siny, cosy);   // gyro-fused odom heading (rad)
 
   // transform raw odom -> map frame using current calibration/remap transform
   const mapped = odomToMap(p.x, p.y);
@@ -243,6 +244,7 @@ function updateOdom(msg) {
   document.getElementById('odomY').textContent   = mapped.y.toFixed(3);
   document.getElementById('odomYaw').textContent = (Math.atan2(siny,cosy)*180/Math.PI).toFixed(1);
   document.getElementById('odomVx').textContent  = Math.hypot(v.x, v.y).toFixed(3);
+  document.getElementById('remapTheta').textContent = (mapTransform.theta*180/Math.PI).toFixed(1);
   updateRobot(mapped.x, mapped.y);
 
   // Show nearest node estimate — helps user choose correct start before NAVIGA
@@ -417,6 +419,7 @@ function renderMap() {
 // inverse (odomToMap):                   map  = R(-θ) / scale * (odom - t)
 let mapTransform = { theta: 0, scale: 1, tx: 0, ty: 0 };
 let lastRawOdom  = { x: 0, y: 0 };   // last raw position received from /odom
+let lastRawYaw   = 0;                 // last raw odom heading (rad), for quick remap
 let currentPath  = [];                // active path received from /waypoint_manager/path
 
 // --- Route snapping ----------------------------------------------------------
@@ -625,6 +628,53 @@ document.getElementById('calibBtn').onclick = () => {
     btn.style.color = '';
     btn.style.borderColor = '';
   }, 2000);
+};
+
+// --- Quick Remap (static single-pose alignment, no driving) -------------------
+// Solve the FULL remap (theta + tx/ty) from the robot's current odom pose alone,
+// assuming it is placed AT the Start node and facing along the Start->next-node
+// edge. Unlike the drive-based Remap it needs no motion, so it is immune to the
+// short-baseline angle amplification and odom drift that a brief measured drive
+// suffers; theta comes straight from the gyro-fused odom yaw. Scale is preserved
+// from the existing transform (odom is already metric + correction-factored).
+//   map_yaw = odom_yaw - theta, and we want map_yaw = heading(Start->next), so
+//   theta = odom_yaw - heading;  then t solved so the Start node maps to the
+//   current odom position (same convention as Remap/Calibra).
+document.getElementById('quickRemapBtn').onclick = () => {
+  if (!mapData) { alert('Mappa non caricata'); return; }
+  const startId = +document.getElementById('startInput').value;
+  const nodeA   = mapData.nodes[startId];
+  if (!nodeA) { alert('Nodo Start non valido'); return; }
+
+  const fwd = findForwardPath(startId, 1);
+  if (fwd.path.length < 2) {
+    alert('Nessun nodo in avanti dalla Start per definire la direzione. Controlla la mappa.');
+    return;
+  }
+  const nodeB = mapData.nodes[fwd.path[1]];
+  const heading = Math.atan2(nodeB.y - nodeA.y, nodeB.x - nodeA.x);  // map-frame dir Start->next
+
+  const scale = mapTransform.scale || 1;                 // keep existing scale
+  const theta = lastRawYaw - heading;                    // odom_yaw - heading
+  const cosT  = Math.cos(theta), sinT = Math.sin(theta);
+  mapTransform = {
+    theta, scale,
+    tx: lastRawOdom.x - scale * (cosT * nodeA.x - sinT * nodeA.y),
+    ty: lastRawOdom.y - scale * (sinT * nodeA.x + cosT * nodeA.y)
+  };
+  publishAndSaveTransform();
+  document.getElementById('mapFrame').textContent = (mapData.frame || 'odom') + ' ✓remapped';
+
+  const btn = document.getElementById('quickRemapBtn');
+  const orig = btn.textContent;
+  btn.textContent = '✓ Quick remap';
+  btn.style.background  = 'rgba(54,211,153,.18)';
+  btn.style.color       = 'var(--green)';
+  btn.style.borderColor = 'var(--green)';
+  setTimeout(() => {
+    btn.textContent = orig;
+    btn.style.background = btn.style.color = btn.style.borderColor = '';
+  }, 3000);
 };
 
 // --- Remap (auto-drive similarity transform) ----------------------------------

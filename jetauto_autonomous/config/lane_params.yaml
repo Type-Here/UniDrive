@@ -19,7 +19,7 @@ lane_controller:
   # ---- Velocity ---- Validated Velocity linear_x_speed 0.10/0.15 m/s, max_angular_z 0.80/1.20 rad/s
   linear_x_speed: 0.15   # m/s forward
   max_linear_y:   0.08   # m/s strafe (mecanum)
-  max_angular_z:  0.90   # rad/s (classic)
+  max_angular_z:  0.50   # rad/s (classic)
 
   # ---- Drive mode ----
   drive_mode: "classic"  # "mecanum" -> linear.y | "classic" -> angular.z
@@ -98,7 +98,7 @@ waypoint_manager:
 # [new] drive those extensions.
 # =============================================================================
 orchestrator:
-  rate_hz: 25.0
+  rate_hz: 30.0
   stale_timeout: 0.5         # seconds before a stale proposal is treated as zero
 
   # ---- Fallback blending (lane=primary; map only when lane lost) ----
@@ -204,9 +204,9 @@ orchestrator:
 
   # ---- Map pure-pursuit (FALLBACK state) ----
   lookahead_m: 0.50
-  map_drive_speed: 0.04      # m/s (slower than lane speed)
+  map_drive_speed: 0.10      # m/s (slower than lane speed)
   map_kp: 1.2                # angular.z = kp * heading_error
-  map_max_angular: 0.80      # rad/s clamp
+  map_max_angular: 0.50      # rad/s clamp
 
   # ---- FALLBACK failsafe ([new]) ----
   # FALLBACK is pure-pursuit on a localization that already proved doubtful (lane lost) —

@@ -1,12 +1,13 @@
 # n_orchestrator — disagreement-driven blend, map-aware roundabout, drift-corrected localization
 
 The production control logic in `jetauto_autonomous/scripts/n_orchestrator.py` — the **sole
-publisher of `/jetauto_controller/cmd_vel`**. It is a **subclass** of the base
-`scripts/old/orchestrator.py` (kept as a library: remap, drift correction, pure-pursuit
-`_carrot`/`_pursuit_twist`, callbacks, publishers, in-place junction spin) and overrides the
-per-tick decision logic. It supersedes both `old/orchestrator.py` and
-`old/new_orchestrator.py` as a runnable node — `start_all.sh` launches it via
-`ORCHESTRATOR_NAME`. Never run two orchestrators at once (same node name).
+publisher of `/jetauto_controller/cmd_vel`**. It is **self-contained**: the base
+`Orchestrator` class (remap, drift correction, pure-pursuit `_carrot`/`_pursuit_twist`,
+callbacks, publishers, in-place junction spin) is defined **inline in the same file**, and
+`NewOrchestrator` extends it, overriding the per-tick decision logic. It supersedes and
+replaces the former `old/orchestrator.py` and `old/new_orchestrator.py` (both removed) —
+`start_all.sh` launches it via `ORCHESTRATOR_NAME`. Never run two orchestrators at once (same
+node name).
 
 New parameters all have in-code defaults; most are also exposed in `lane_params.yaml` under
 `orchestrator:` (the ones that are **in-code only** are marked in the table below).
@@ -278,7 +279,7 @@ Marked **[code]** = in-code default only, not yet in `lane_params.yaml`.
 
 | Param | Default | Meaning |
 |---|---|---|
-| `use_lane_heading` **[code]** | `true` | `theta_l` from the real lane heading; `false` = old proxy (A/B switch) |
+| `use_lane_heading` | `true` | `theta_l` from the real lane heading; `false` = old proxy (A/B switch) |
 | `conflict_ticks` | 12 | consecutive `c<0` ticks before EMERGENCY_STOP |
 | `conflict_onpath_m` | 0.35 m | only judge a conflict while cross-track to the path is below this |
 | `proxy_max_deg` | 80 | full lane steer → this implied heading offset (proxy fallback only) |
@@ -288,8 +289,8 @@ Marked **[code]** = in-code default only, not yet in `lane_params.yaml`.
 | `junction_inside_clear` | 0.30 | normalized clearance to the INSIDE line below which the turn is held straighter |
 | `junction_lane_gain` | 1.0 | anti-cut damping strength: `scale = 1 - gain*severity` |
 | `junction_lane_floor` | 0.0 | minimum turn scale |
-| `dash_cross_enable` **[code]** | `true` | dashed-separator crossing hold |
-| `dash_cross_hold_ticks` **[code]** | 75 | hold budget (~3 s at 25 Hz) |
+| `dash_cross_enable` | `true` | dashed-separator crossing hold |
+| `dash_cross_hold_ticks` | 75 | hold budget (~3 s at 25 Hz) |
 | `lateral_correct_enable` | True | master enable for the straight-line re-centering |
 | `lateral_correct_period` | 50 | run only every N NAVIGATING ticks (~2 s at 25 Hz) |
 | `lateral_correct_alpha` | 0.35 | EMA weight per correction of the perpendicular nudge |
@@ -297,8 +298,8 @@ Marked **[code]** = in-code default only, not yet in `lane_params.yaml`.
 | `lateral_align_deg` | 15 | max **lane** heading `\|heading_rad\|` to count as "on a straight" (the mapped yaw keeps a fixed 45° sanity bound) |
 | `lateral_min_correct_m` | 0.03 | ignore position corrections below this (noise floor) |
 | `lateral_max_correct_m` | 0.40 | reject position corrections above this (broken localization) |
-| `lateral_theta_alpha` **[code]** | 0.25 | EMA weight of the straight-line yaw fix (0 = off) |
-| `lateral_theta_max_deg` **[code]** | 10 | reject yaw deltas above this (transient/broken geometry) |
+| `lateral_theta_alpha` | 0.25 | EMA weight of the straight-line yaw fix (0 = off) |
+| `lateral_theta_max_deg` | 10 | reject yaw deltas above this (transient/broken geometry) |
 | `roundabout_drive_speed` | 0.10 m/s | map-following speed inside the roundabout window |
 | `roundabout_lookahead_m` | 0.25 | carrot lookahead along the ring spline (approach/exit use `lookahead_m` = 0.50) |
 | `roundabout_spline_res_m` | 0.03 | sample spacing of the dense ring curve |
@@ -310,9 +311,9 @@ Marked **[code]** = in-code default only, not yet in `lane_params.yaml`.
 | `roundabout_lane_max` | 0.50 | rad/s cap on the guardrail nudge |
 | `roundabout_offref_m` | 0.40 m | deviation from the phase reference before EMERGENCY_STOP |
 | `roundabout_offref_ticks` | 10 | consecutive off-reference ticks (debounce) |
-| `fallback_offref_m` **[code]** | 0.60 m | FALLBACK cross-track before EMERGENCY_STOP |
-| `fallback_offref_ticks` **[code]** | 25 | debounce (~1 s at 25 Hz) |
-| `fallback_timeout_s` **[code]** | 60 | max time in FALLBACK (0 = no timeout) |
+| `fallback_offref_m` | 0.60 m | FALLBACK cross-track before EMERGENCY_STOP |
+| `fallback_offref_ticks` | 25 | debounce (~1 s at 25 Hz) |
+| `fallback_timeout_s` | 60 | max time in FALLBACK (0 = no timeout) |
 | `offroute_enable` | False | opt-in debounced REPLAN (never seizes steering) |
 
 Reused from the base class: `junction_radius`, `junction_align_deg`, `junction_spin_speed`,
@@ -329,7 +330,8 @@ cd jetauto_autonomous && ./start_all.sh
 python2 scripts/n_orchestrator.py
 ```
 
-The base class is imported from `scripts/old/` (the file adds it to `sys.path` itself).
+The base `Orchestrator` class is defined inline in the same file — no external imports
+beyond `map_loader`.
 
 ## Offline simulation
 

@@ -93,10 +93,9 @@ waypoint_manager:
 # orchestrator — sole publisher of /jetauto_controller/cmd_vel
 # Owns: junction rotation, map fallback, lane/map blending
 #
-# Both orchestrator.py (classic) and new_orchestrator.py (experimental) read from
-# this same `orchestrator/` namespace — run one or the other, never both (same
-# node name). Most keys are shared; keys marked [new] are read ONLY by
-# new_orchestrator.py and are harmlessly ignored by the classic node.
+# n_orchestrator.py reads from this `orchestrator/` namespace. It bundles the base
+# Orchestrator (classic keys) plus the disagreement-blend extensions; keys marked
+# [new] drive those extensions.
 # =============================================================================
 orchestrator:
   rate_hz: 25.0
@@ -111,7 +110,7 @@ orchestrator:
 
   # ---- Junction rotation ----
   junction_radius: 0.30      # m — distance to trigger the in-place spin maneuver
-  junction_influence_radius: 0.50  # m — distance over which the map blends the robot INTO the turn (new_orchestrator only). MUST exceed junction_radius, and stay BELOW the entry-segment length (e.g. node 6 fed by the 0.75m 5->6 segment) or the blend pulls toward the post-junction heading while still maneuvering the previous node (0.90 reached past node 5 onto the opposite straight). The magnitude term below — not the width — is what makes the turn engage.
+  junction_influence_radius: 0.50  # m — distance over which the map blends the robot INTO the turn ([new]). MUST exceed junction_radius, and stay BELOW the entry-segment length (e.g. node 6 fed by the 0.75m 5->6 segment) or the blend pulls toward the post-junction heading while still maneuvering the previous node (0.90 reached past node 5 onto the opposite straight). The magnitude term below — not the width — is what makes the turn engage.
   junction_turn_full_deg: 50.0  # [new] map heading error at which the map fully takes over the approach blend (the magnitude term). Sized below a 90deg crossway so a real turn pulls hard while a near-straight junction barely pulls.
   junction_align_deg: 14.0   # deg — lower so the spin completes more of the turn before lane takeover (was 22, curved too soon)
   junction_spin_speed: 0.40  # rad/s cap for in-place rotation
@@ -124,6 +123,14 @@ orchestrator:
   junction_inside_clear: 0.30   # [new] normalized clearance to the INSIDE line below which we hold the turn straighter
   junction_lane_gain:    1.0    # [new] damping strength: scale = 1 - gain*severity (1.0 -> full straighten when the inside line is at centre)
   junction_lane_floor:   0.0    # [new] minimum turn scale (0.0 -> may fully straighten; raise to keep some turn-in)
+
+  # ---- Dashed-separator lane change ([new]) ----
+  # When a junction turn points INTO a DASHED (legally crossable) inside line (e.g. 10->11),
+  # hold MAP authority (a_lane=0) through the crossing so the lane controller can't re-center
+  # into the original lane after the spin. Released once the dashed line shows on the OPPOSITE
+  # side (= crossed) or the budget expires.
+  dash_cross_enable:     true   # [new] master enable for the dashed-separator crossing hold
+  dash_cross_hold_ticks: 75     # [new] hold budget in ticks (~3 s at 25 Hz)
 
   # ---- Drift auto-correction ----
   # Position fix fires once per node when dist < drift_trigger_radius (NAVIGATING only).
@@ -160,15 +167,16 @@ orchestrator:
   roundabout_offref_ticks: 10   # [new] consecutive off-reference ticks (debounce)
   roundabout_conflict_c:   -0.5 # [new] lenient lane/map cosine-similarity threshold below which a roundabout conflict is counted (lane is unreliable here)
 
-  # ---- Disagreement blend + conflict stop ([new] — new_orchestrator.py only) ----
-  # new_orchestrator blends lane vs map by the cosine similarity c between the
+  # ---- Disagreement blend + conflict stop ([new]) ----
+  # n_orchestrator blends lane vs map by the cosine similarity c between the
   # lane steering proxy and the map heading, and trips a terminal EMERGENCY_STOP
-  # when they sustainedly point >90 deg apart (c < 0). See new_orchestrator.md.
+  # when they sustainedly point >90 deg apart (c < 0). See n_orchestrator.md.
+  use_lane_heading: true     # [new] theta_l from the real lane heading (/lane_controller/info[1]); false = old angular.z proxy (A/B switch). proxy_max_deg below applies only when this is false / no lane geometry.
   conflict_ticks: 12         # [new] consecutive c<0 ticks before EMERGENCY_STOP (debounce)
   conflict_onpath_m: 0.35    # [new] m — only judge a conflict while cross-track to the path is below this. Off-route (e.g. after cutting a corner) the bearing-to-next is large and c collapses to cos(theta_m), so a straight recovering lane would false-trip the stop; that excursion is a recovery FALLBACK owns, not a wrong-way.
   proxy_max_deg:  80.0       # [new] full lane steer (angular.z) maps to this implied heading offset
 
-  # ---- Off-route GPS-style replan ([new] — new_orchestrator.py only, opt-in) ----
+  # ---- Off-route GPS-style replan ([new], opt-in) ----
   # OFF by default: localization-dependent and must never preempt a healthy lane.
   # When enabled it only republishes the goal for a fresh Dijkstra; it never seizes
   # steering. Trips after offroute_ticks ticks beyond 2*offroute_t of cross-track error.
@@ -177,7 +185,7 @@ orchestrator:
   offroute_ticks:  10        # [new] consecutive off-route ticks before a replan (debounce)
   replan_cooldown: 3.0       # [new] s — minimum interval between replans (avoid spamming the planner)
 
-  # ---- Lateral map re-centering (idea 3, [new] new_orchestrator.py only) ----
+  # ---- Lateral map re-centering (idea 3, [new]) ----
   # GPS-style: when the camera is confidently centred on a two-line lane on a STRAIGHT,
   # the robot is on the lane centerline = the map edge, so nudge the map position
   # perpendicular onto the edge. Removes the lateral drift that skips junctions (the
@@ -191,9 +199,19 @@ orchestrator:
   lateral_align_deg:      15.0   # [new] max robot-yaw vs segment-heading to count as "on a straight"
   lateral_min_correct_m:  0.03   # [new] ignore corrections below this (noise floor)
   lateral_max_correct_m:  0.40   # [new] reject corrections above this (broken localization)
+  lateral_theta_alpha:    0.25   # [new] EMA weight of the straight-line YAW fix (the missing half: a yaw error regenerates lateral error continuously). 0 = yaw fix off.
+  lateral_theta_max_deg:  10.0   # [new] reject yaw-correction deltas above this (deg; transient / broken geometry)
 
   # ---- Map pure-pursuit (FALLBACK state) ----
   lookahead_m: 0.50
   map_drive_speed: 0.04      # m/s (slower than lane speed)
   map_kp: 1.2                # angular.z = kp * heading_error
   map_max_angular: 0.80      # rad/s clamp
+
+  # ---- FALLBACK failsafe ([new]) ----
+  # FALLBACK is pure-pursuit on a localization that already proved doubtful (lane lost) —
+  # previously the one state with no excursion check. A sustained cross-track excursion,
+  # or simply staying in FALLBACK too long, now trips the shared terminal EMERGENCY_STOP.
+  fallback_offref_m:     0.60   # [new] m of cross-track from the pursued path before the stop
+  fallback_offref_ticks: 25     # [new] consecutive off-reference ticks (debounce, ~1 s at 25 Hz)
+  fallback_timeout_s:    60.0   # [new] max seconds in FALLBACK before the stop (0 = no timeout)

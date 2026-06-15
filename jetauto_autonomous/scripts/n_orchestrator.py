@@ -1345,15 +1345,16 @@ class NewOrchestrator(Orchestrator):
 
         During a junction turn the painted line on the side we are turning TOWARD
         (the inside line) is the one we would cut by turning too soon. While that
-        line is still confidently seen near the robot centre, scale the turn toward
-        straight (down to `_junc_lane_floor`) so the robot drives on until the line
-        clears — i.e. until the intersection opens — before committing the turn. Once
-        the inside line goes invalid or moves away from centre, scale returns to 1.0
-        and the blend's full turn-in takes over.
+        line is still validly seen ahead — i.e. the intersection has NOT opened yet —
+        scale the turn toward straight (down to `_junc_lane_floor`) so the robot
+        drives up to the node before committing the turn. Once the inside line goes
+        invalid (the intersection mouth opens) the scale returns to 1.0 and the
+        blend's full turn-in (and/or the in-place spin) takes over.
 
         Returns 1.0 (no damping) when: disabled, no fresh lane info, not at a junction,
-        no real turn intended (map heading still ~forward), or the inside line is
-        already clear / not seen. Camera-frame, NAVIGATING approach only.
+        no real turn intended (map heading still ~forward), the inside line is no
+        longer seen (intersection open), or it is a DASHED legal-crossing separator.
+        Camera-frame, NAVIGATING approach only.
         """
         if (not self._junc_lane_correct or C.lane_info is None
                 or not C.is_junction or C.next_id < 0):
@@ -1366,13 +1367,28 @@ class NewOrchestrator(Orchestrator):
         li = C.lane_info
         inside_valid = (li[2] > 0.5) if turn_left else (li[3] > 0.5)
         inside_off   =  li[4]        if turn_left else  li[5]
-        if not inside_valid or abs(inside_off) >= self._junc_inside_clear:
-            return 1.0                   # inside line clear (or unseen) -> commit turn
+        # The intersection "opens" when the inside line stops being painted ahead.
+        # THAT — not the offset shrinking below a small threshold — is the cue to
+        # commit the turn: a correctly-centred inside line sits at ~|0.79| (a full
+        # lane half-width), so the old `|inside_off| >= junc_inside_clear (0.30) ->
+        # commit` test fired on EVERY normal approach and the guardrail only woke up
+        # after the robot had already cut a half-lane inward (the wide node-6 cut).
+        # While the inside line is still validly seen we are still in the approach
+        # lane, so hold the map turn toward straight and drive up to the node; the
+        # line vanishing (or the in-place spin arming) releases it.
+        if not inside_valid:
+            return 1.0                   # intersection opened -> commit turn
         # A DASHED inside line (info[8]/[9]) is a legally crossable separator
         # (lane change, e.g. 10->11) — never hold the turn against it.
         if len(li) >= 10 and ((li[8] > 0.5) if turn_left else (li[9] > 0.5)):
             return 1.0
-        sev = (self._junc_inside_clear - abs(inside_off)) / self._junc_inside_clear
+        # Full hold while the inside line sits at/inside its nominal lane position;
+        # ease as it recedes outward past nominal by up to junction_inside_clear (as
+        # the intersection opens the line drifts toward the image edge before it goes
+        # invalid), so the turn eases in smoothly rather than snapping on the drop-out.
+        half_w = (li[7] / 2.0) if (len(li) >= 8 and li[7] > 0.1) else 0.80
+        over   = abs(inside_off) - half_w
+        sev    = clamp(1.0 - over / max(self._junc_inside_clear, 1e-3), 0.0, 1.0)
         return clamp(1.0 - self._junc_lane_gain * sev, self._junc_lane_floor, 1.0)
 
     def _dash_cross_hold(self, C, a_lane):

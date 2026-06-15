@@ -222,6 +222,17 @@ class Orchestrator(object):
 
         self._rate_hz        = float(rp("rate_hz",            25.0))
         self._stale_timeout  = float(rp("stale_timeout",       0.5))
+        # Output limiting: the base /odom integrates the COMMANDED cmd_vel open-loop
+        # (no encoders; see docs/odometry_drift_analysis.md), so a command the robot
+        # can't physically track becomes map drift. Clamp to the base's manual
+        # envelope (driver clamps manual cmd_vel to lin<=0.2, ang<=0.5) and slew-limit
+        # the change so commanded ~= executed.
+        self._out_max_lin    = float(rp("output_max_linear",   0.20))   # m/s hard clamp
+        self._out_max_ang    = float(rp("output_max_angular",  0.50))   # rad/s hard clamp
+        self._out_acc_lin    = float(rp("output_accel_linear", 0.50))   # m/s^2 slew (0=off)
+        self._out_acc_ang    = float(rp("output_accel_angular", 3.0))   # rad/s^2 slew (0=off)
+        self._last_vx = self._last_vy = self._last_wz = 0.0
+        self._last_cmd_t     = None
         self._hold_ramp      = int  (rp("hold_ramp_ticks",     15))
         self._recovery_ticks = int  (rp("recovery_ticks",       5))
         self._junc_radius    = float(rp("junction_radius",     0.30))
@@ -394,6 +405,46 @@ class Orchestrator(object):
     def _set_lane_enabled(self, on):
         self._enable_pub.publish(Bool(data=bool(on)))
 
+    # ----------------------------------------------- hardware cmd_vel output
+    # Single guarded path to /jetauto_controller/cmd_vel. Driving commands go through
+    # _publish_cmd (envelope clamp + slew limit); hard stops go through _publish_stop
+    # (immediate zero, slew state reset so the next motion ramps up from rest).
+
+    @staticmethod
+    def _slew(prev, target, max_step):
+        """Limit |target - prev| to max_step (0 = limiter off, clamp only)."""
+        if max_step <= 0.0:
+            return target
+        return prev + clamp(target - prev, -max_step, max_step)
+
+    def _publish_cmd(self, twist):
+        """Clamp a driving Twist to the base's manual envelope and slew-limit the
+        change before publishing, so the open-loop odom stays faithful to execution."""
+        now = rospy.Time.now()
+        if self._last_cmd_t is None:
+            dt = 1.0 / max(self._rate_hz, 1.0)
+        else:
+            dt = (now - self._last_cmd_t).to_sec()
+            if dt <= 0.0 or dt > 0.5:          # first tick / stall guard
+                dt = 1.0 / max(self._rate_hz, 1.0)
+        vx = clamp(twist.linear.x,  -self._out_max_lin, self._out_max_lin)
+        vy = clamp(twist.linear.y,  -self._out_max_lin, self._out_max_lin)
+        wz = clamp(twist.angular.z, -self._out_max_ang, self._out_max_ang)
+        vx = self._slew(self._last_vx, vx, self._out_acc_lin * dt)
+        vy = self._slew(self._last_vy, vy, self._out_acc_lin * dt)
+        wz = self._slew(self._last_wz, wz, self._out_acc_ang * dt)
+        self._last_vx, self._last_vy, self._last_wz = vx, vy, wz
+        self._last_cmd_t = now
+        out = Twist()
+        out.linear.x, out.linear.y, out.angular.z = vx, vy, wz
+        self._cmd_pub.publish(out)
+
+    def _publish_stop(self):
+        """Immediate zero (no slew) for hard stops/idle; resets the slew state."""
+        self._last_vx = self._last_vy = self._last_wz = 0.0
+        self._last_cmd_t = rospy.Time.now()
+        self._cmd_pub.publish(Twist())
+
     def _publish_orc_state(self, s):
         if s != self._last_orc_state:
             self._state_pub.publish(String(data=s))
@@ -520,7 +571,7 @@ class Orchestrator(object):
                 rospy.logerr_throttle(2.0, "[orchestrator] step err: %s", e)
             rate.sleep()
         # Clean shutdown
-        self._cmd_pub.publish(Twist())
+        self._publish_stop()
         self._set_lane_enabled(False)
 
 
@@ -851,10 +902,14 @@ class NewOrchestrator(Orchestrator):
         rotating about the remap origin — a theta-only tweak would otherwise
         translate the mapped position by delta x lever-arm.
 
-        Heavily gated as before: NAVIGATING only, never in a junction/roundabout or
-        within the turn-in zone, only on a confident centred well-aligned two-line
-        track, once every `lateral_correct_period` NAVIGATING ticks. Lateral ONLY
-        (perpendicular foot), so along-track node advancement is untouched.
+        Heavily gated: NAVIGATING only, never in a junction/roundabout or within the
+        turn-in zone, on a confident centred well-aligned track, once every
+        `lateral_correct_period` NAVIGATING ticks. Both YAW and the LATERAL nudge fire
+        on a single confident line (TRACKING_CC / SINGLE_L / SINGLE_R) — the narrow
+        FOV rarely shows both, and on a long junction-free straight the lateral pin is
+        the only thing that undoes the lever-arm map drift (it shows up as cross-track
+        there). Lateral is perpendicular-foot ONLY, so along-track node advancement is
+        untouched.
         """
         if not self._lat_correct:
             return
@@ -865,8 +920,18 @@ class NewOrchestrator(Orchestrator):
                 or self._state != self.NAVIGATING or C.in_roundabout or C.is_junction):
             return
         li = C.lane_info
-        if (C.lane_state != "TRACKING_CC" or li[2] <= 0.5 or li[3] <= 0.5
-                or abs(li[6]) > self._lat_centered_clear):
+        # Relaxed gate: a single confidently-tracked line (SINGLE_L/SINGLE_R) drives
+        # BOTH the yaw and the lateral-position fix. The narrow FOV rarely shows both
+        # lines, so requiring TRACKING_CC starved the correction — and on a long
+        # junction-free straight (e.g. the east road) the lateral fix is the ONLY
+        # thing that can undo the lever-arm map drift, which shows up as cross-track
+        # there. With one line the centreline is inferred from the dynamic lane-width
+        # estimate; the centred gate (|center_offset| <= lateral_centered_clear) plus
+        # the EMA and [lateral_min/max_correct_m] bounds keep a single-line pin safe.
+        # Junction/roundabout nodes are already excluded above.
+        have_line = (li[2] > 0.5 or li[3] > 0.5)
+        if (C.lane_state not in ("TRACKING_CC", "SINGLE_L", "SINGLE_R")
+                or not have_line or abs(li[6]) > self._lat_centered_clear):
             return                                       # need a confident, centred track
         # Turn-in-zone gate: only block near the current node when the path actually
         # BENDS there. The old unconditional `dist <= junction_influence_radius`
@@ -920,6 +985,10 @@ class NewOrchestrator(Orchestrator):
         # never recovers" bug. When only YAW fires, the translation is re-anchored
         # so the CURRENT mapped pose is invariant (pivot about the robot) — a
         # theta-only change would otherwise rotate the pose about the remap origin.
+        # Lateral nudge whenever the cross-track sits in the trusted band: it pins the
+        # robot to the lane centreline (= the map edge), the only correction for the
+        # lever-arm map drift on a long single-line straight. The centred gate above
+        # plus this [min,max] band keep a single-line (width-inferred) pin honest.
         do_xy = self._lat_min_m <= cross <= self._lat_max_m
         if dtheta == 0.0 and not do_xy:
             return
@@ -943,7 +1012,7 @@ class NewOrchestrator(Orchestrator):
     def _apply_theta_correction(self, heading_nxt, odom_yaw):
         """Pivot-invariant override of the parent's post-junction theta fix.
 
-        The parent EMA-corrects remap_theta and republishes — but rotating the
+        The parent EMA-corrects remap_theta and republishes, but rotating the
         odom->map transform about the remap ORIGIN translates every mapped point
         by (delta x lever-arm from the origin): metres of position jump for a few
         degrees of theta at this map's scale, immediately after a junction. That
@@ -1033,7 +1102,7 @@ class NewOrchestrator(Orchestrator):
         self._estop_zero_left = max(1, int(0.5 * self._rate_hz))
         self._state     = self.EMERGENCY_STOP
         self._set_lane_enabled(False)              # stop the lane controller driving
-        self._cmd_pub.publish(Twist())             # halt the wheels
+        self._publish_stop()                       # halt the wheels
         self._goal_pub.publish(Int32MultiArray())  # cancel navigation (empty goal)
         self._publish_orc_state(self.EMERGENCY_STOP)
         rospy.logwarn("[nn_orch] EMERGENCY STOP: %s -- navigation halted; "
@@ -1071,7 +1140,7 @@ class NewOrchestrator(Orchestrator):
             if self._estop_zero_left > 0:
                 self._estop_zero_left -= 1
                 self._set_lane_enabled(False)
-                self._cmd_pub.publish(Twist())
+                self._publish_stop()
             self._publish_orc_state(self.EMERGENCY_STOP)
             return
 
@@ -1083,7 +1152,7 @@ class NewOrchestrator(Orchestrator):
         decision = self._obj_det.evaluate()
         if decision.stop:
             self._publish_orc_state(decision.state)   # TRAFFIC_STOP / STOP_SIGN
-            self._cmd_pub.publish(Twist())            # full stop
+            self._publish_stop()                      # full stop
             return
 
         # --- snapshot shared state under one lock (mirrors parent) ---
@@ -1105,7 +1174,7 @@ class NewOrchestrator(Orchestrator):
             # No odom yet (bring-up). Halt only if we were actually driving;
             # spamming zeros here fights manual/remap driving on the same topic.
             if self._state not in (self.IDLE, self.DONE):
-                self._cmd_pub.publish(Twist())
+                self._publish_stop()
             return
 
         active = (info_fresh and nav_info is not None
@@ -1203,7 +1272,7 @@ class NewOrchestrator(Orchestrator):
         if self._state not in (self.IDLE, self.DONE):
             rospy.loginfo("[nn_orch] nav inactive -> DONE")
             self._set_lane_enabled(False)
-            self._cmd_pub.publish(Twist())
+            self._publish_stop()
             self._state          = self.DONE
             self._hold_count     = 0
             self._recv_count     = 0
@@ -1214,10 +1283,10 @@ class NewOrchestrator(Orchestrator):
         # Freerun: pass lane commands through when the dashboard enables lane directly.
         if lane_fresh and lane_state not in self._LANE_BAD:
             self._freerun = True
-            self._cmd_pub.publish(lane_cmd)
+            self._publish_cmd(lane_cmd)
         elif self._freerun:
             self._freerun = False
-            self._cmd_pub.publish(Twist())
+            self._publish_stop()
 
     # ------------------------------------------------------------- NAVIGATING
 
@@ -1289,7 +1358,7 @@ class NewOrchestrator(Orchestrator):
             self._hold_count += 1
             if self._hold_count >= self._hold_ramp:
                 self._enter_fallback("lane lost")
-                self._cmd_pub.publish(self._pursuit_twist((C.rx, C.ry, C.ryaw), C.path_ids))
+                self._publish_cmd(self._pursuit_twist((C.rx, C.ry, C.ryaw), C.path_ids))
                 return
             a_lane = 1.0 - (self._hold_count / float(self._hold_ramp))
         else:
@@ -1327,7 +1396,7 @@ class NewOrchestrator(Orchestrator):
             1.0, "[nn_orch] NAV a_lane=%.2f scale=%.2f lane(v=%.2f w=%+.2f) "
             "map_w=%+.2f -> v=%.2f w=%+.2f", a_lane, scale, lane_lin, lane_ang,
             map_ang, twist.linear.x, twist.angular.z)
-        self._cmd_pub.publish(twist)
+        self._publish_cmd(twist)
 
     def _junction_entry(self, C):
         """Whether to start an in-place rotation at the current junction node."""
@@ -1458,7 +1527,7 @@ class NewOrchestrator(Orchestrator):
         twist = Twist()
         twist.linear.x  = 0.0
         twist.angular.z = (1.0 - self._alpha_junc) * lane_ang + self._alpha_junc * spin_ang
-        self._cmd_pub.publish(twist)
+        self._publish_cmd(twist)
 
     # ------------------------------------------------------------- ROUNDABOUT
 
@@ -1644,7 +1713,7 @@ class NewOrchestrator(Orchestrator):
             # No spline here, so measure deviation against the path the pursuit follows.
             self._round_offset = self._offpath_dist(C.rx, C.ry, C.path_ids)
         if carrot is None:
-            self._cmd_pub.publish(Twist())
+            self._publish_stop()
             return
 
         # Off-reference failsafe -> the SINGLE shared terminal stop (EMERGENCY_STOP).
@@ -1670,7 +1739,7 @@ class NewOrchestrator(Orchestrator):
         twist = Twist()
         twist.linear.x  = self._roundabout_speed
         twist.angular.z = clamp(base + nudge, -self._map_max_w, self._map_max_w)
-        self._cmd_pub.publish(twist)
+        self._publish_cmd(twist)
         rospy.loginfo_throttle(
             1.0, "[nn_orch] ROUND src=%s carrot=(%.2f,%.2f) err=%+.0fdeg "
             "base=%+.2f nudge=%+.2f w=%+.2f", src, carrot[0], carrot[1],
@@ -1763,7 +1832,7 @@ class NewOrchestrator(Orchestrator):
         else:
             self._recv_count = 0
             self._publish_orc_state(self.FALLBACK)
-        self._cmd_pub.publish(self._pursuit_twist((C.rx, C.ry, C.ryaw), C.path_ids))
+        self._publish_cmd(self._pursuit_twist((C.rx, C.ry, C.ryaw), C.path_ids))
 
     # EMERGENCY_STOP is terminal: entered via _enter_emergency_stop(), held at the top
     # of _step(), and cleared only by a new goal (_path_cb). No per-tick handler / no

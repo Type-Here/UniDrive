@@ -14,7 +14,7 @@
 #        - serve_dashboard.py  (port 8000)
 #        - lane_controller_node.py
 #        - waypoint_manager_node.py
-#        - new_orchestrator.py  (sole cmd_vel publisher)
+#        - n_orchestrator.py    (sole cmd_vel publisher)
 #   4. Save PIDs to /tmp/jetauto_autonomous.pids
 #
 # WHAT IT DOES NOT DO:
@@ -92,7 +92,7 @@ echo "[ok] roscore running"
 # twice (PID file overwritten) or a node was started by hand, orphans survive
 # and two orchestrators publishing cmd_vel fight each other. Sweep them here.
 # Patterns are python-prefixed so an editor with the file open is not killed;
-# "orchestrator.py" matches orchestrator/new_orchestrator/nn_orchestrator.
+# "orchestrator.py" matches n_orchestrator.py (and any legacy *orchestrator.py).
 ZOMBIE_PATTERNS=(
   "python.*orchestrator\.py"
   "python.*lane_controller_node\.py"
@@ -187,7 +187,7 @@ echo "[6/7] waypoint_manager (path-tracker)"
 start_proc waypoint_manager \
   $PY "$SCRIPTS_DIR/waypoint_manager_node.py"
 
-echo "[7/7] new_orchestrator (sole cmd_vel publisher)"
+echo "[7/7] n_orchestrator (sole cmd_vel publisher)"
 start_proc orchestrator \
   $PY "$SCRIPTS_DIR/$ORCHESTRATOR_NAME"
 

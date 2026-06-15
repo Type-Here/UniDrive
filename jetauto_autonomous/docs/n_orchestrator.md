@@ -57,6 +57,10 @@ origin — the likely reason the old theta fix was tuned to 0).
 
 `IDLE · NAVIGATING · JUNCTION · ROUNDABOUT · FALLBACK · EMERGENCY_STOP · DONE`
 
+Plus two **transient** object-detection overrides — `TRAFFIC_STOP` / `STOP_SIGN` — that are
+*published* on `/orchestrator/state` but never stored in `_state` (see below), so navigation
+resumes from wherever it was the instant the override clears.
+
 ### NAVIGATING (straights & curves)
 
 ```
@@ -238,6 +242,37 @@ it). **No auto-recovery** — the debounce upstream already absorbs transient no
 is a sustained fault. Resume only by issuing a **new goal** from the dashboard (detected in
 `_path_cb`). The dashboard shows a pulsing red banner + `⛔ EMERGENCY STOP` badge.
 
+### Object-detection override (TRAFFIC_STOP / STOP_SIGN)
+
+Traffic-light and STOP-sign handling lives in a small, self-contained module —
+`object_detection/traffic_sign_handler.py` (`TrafficSignHandler`) — that the orchestrator
+calls **via function**, not a state handler. The handler owns a subscriber to
+`/object_detection/drive` (JSON detections from the on-robot `perception_node.py`), latches
+the light state in its callback, and exposes `evaluate() -> Decision(stop, state)`.
+
+`_step` calls it once per tick, **right after the terminal emergency latch and before the
+state snapshot** (so the emergency latch still wins, but a red light/STOP beats all normal
+driving):
+
+```
+decision = self._obj_det.evaluate()
+if decision.stop:
+    self._publish_orc_state(decision.state)   # TRAFFIC_STOP / STOP_SIGN
+    self._cmd_pub.publish(Twist())            # full stop
+    return                                     # self._state untouched
+```
+
+- **Red light** → latched `TRAFFIC_STOP`: full stop until a **green** is seen (latched, so a
+  frame that detects nothing keeps the last state). Default is GREEN, so a silent/absent
+  detection topic never blocks driving.
+- **STOP sign** → `STOP_SIGN`: full stop for `stop_sign_hold` seconds (default 3.0), then
+  auto-clears and resumes.
+
+Because the override `return`s before touching `self._state`, the FSM is *frozen*, not reset
+— `NAVIGATING`/`JUNCTION`/`ROUNDABOUT`/`FALLBACK` all pick up exactly where they were. Set
+`traffic_light_enable: false` to ignore detections and run the driving stack on its own.
+Pairs with `perception_node.py --mode detection` on the robot (see `architecture.md`).
+
 ## Diagnostics — `/orchestrator/diag` (Float64MultiArray, 25 Hz)
 
 The camera-calibration vs odom-drift separator: if `[7]` ≈ 0 (lane says centred) while `[1]`
@@ -315,6 +350,12 @@ Marked **[code]** = in-code default only, not yet in `lane_params.yaml`.
 | `fallback_offref_ticks` | 25 | debounce (~1 s at 25 Hz) |
 | `fallback_timeout_s` | 60 | max time in FALLBACK (0 = no timeout) |
 | `offroute_enable` | False | opt-in debounced REPLAN (never seizes steering) |
+| `traffic_light_enable` | `true` | object-detection override on; `false` = ignore detections (driving-only) |
+| `traffic_light_topic` | `/object_detection/drive` | perception node's JSON detections topic |
+| `traffic_light_red_label` | `red_TL` | class name that latches `TRAFFIC_STOP` |
+| `traffic_light_green_label` | `green_TL` | class name that releases to GREEN |
+| `stop_sign` | `stop_s` | class name that arms a `STOP_SIGN` hold |
+| `stop_sign_hold` | 3.0 s | how long to hold at a detected stop sign |
 
 Reused from the base class: `junction_radius`, `junction_align_deg`, `junction_spin_speed`,
 `junction_alpha`, `gentle_turn_deg`, `hold_ramp_ticks`, `recovery_ticks`,
@@ -330,8 +371,8 @@ cd jetauto_autonomous && ./start_all.sh
 python2 scripts/n_orchestrator.py
 ```
 
-The base `Orchestrator` class is defined inline in the same file — no external imports
-beyond `map_loader`.
+The base `Orchestrator` class is defined inline in the same file — the only external imports
+are `map_loader` and `object_detection.traffic_sign_handler` (the traffic-light/STOP handler).
 
 ## Offline simulation
 

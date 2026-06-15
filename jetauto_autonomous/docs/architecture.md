@@ -11,6 +11,7 @@ The stack is split across two completely separate Python processes that communic
 | Process | Interpreter | Location | What it does |
 |---|---|---|---|
 | `lane_follower.py` | Python 3 (conda) | `on_jetauto_scripts/drive_segm/` | Neural network inference (ONNX / TensorRT); publishes segmentation masks |
+| `perception_node.py` | Python 3 (conda) | `on_jetauto_scripts/drive_segm/` | YOLO11/TensorRT object detection (traffic lights, STOP signs); publishes JSON detections. Run with `--mode detection` alongside `lane_follower.py` |
 | Everything else | Python 2.7 (system ROS) | `jetauto_autonomous/scripts/` | All control logic, waypoint management, orchestration |
 
 They can never share objects or function calls — the boundary is always a ROS topic message.
@@ -57,6 +58,12 @@ Camera
         └──► /waypoint_manager/nav_info  ──► orchestrator.py
         └──► /waypoint_manager/path      ──► orchestrator.py
         └──► /waypoint_manager/status    ──► dashboard
+
+  perception_node.py  ── Python 3, YOLO11/TensorRT  (--mode detection)
+  (consumes /depth_cam/rgb/image_raw)
+        │
+        └──► /object_detection/drive  (JSON detections) ──► orchestrator.py
+                                            (TRAFFIC_STOP / STOP_SIGN override)
 ```
 
 **Key design principle:** the orchestrator (`n_orchestrator.py`) is the *sole* publisher of `/jetauto_controller/cmd_vel`. No other node touches the hardware command topic. This eliminates the race condition that previously occurred when `lane_controller_node` and `waypoint_manager_node` both published simultaneously during state transitions.
@@ -149,14 +156,41 @@ The brain of the driving system. It is the only node that publishes to `/jetauto
 - `/waypoint_manager/path` — full path node IDs (for pure-pursuit)
 - `/odom` — robot pose (converted to MAP frame internally)
 - `/remap_transform` — coordinate frame update
+- `/object_detection/drive` — perception node's JSON detections, consumed by the
+  `object_detection.traffic_sign_handler.TrafficSignHandler` (called via function each tick;
+  red light / STOP sign → full-stop override). Set `traffic_light_enable: false` to ignore.
 
 **Outputs:**
 - `/jetauto_controller/cmd_vel` — the actual motor command
 - `/lane_controller/enable` — controls whether lane_controller runs its Hough loop
-- `/orchestrator/state` — FSM state for the dashboard (incl. `EMERGENCY_STOP`)
+- `/orchestrator/state` — FSM state for the dashboard (incl. `EMERGENCY_STOP`, plus the
+  transient object-detection overrides `TRAFFIC_STOP` / `STOP_SIGN`)
 - `/orchestrator/diag` — 13-field per-tick diagnostics (cross-track, blend, remap, …)
 - `/remap_transform` — re-published when the drift/straight corrections adjust the frame
 - `/waypoint_manager/goal` — empty goal to cancel navigation on emergency stop (and opt-in replan)
+
+---
+
+### 3.5 `perception_node.py` (Python 3) — object detection
+
+The on-robot YOLO11/TensorRT detection node (lives in `on_jetauto_scripts/drive_segm/`,
+same conda env as `lane_follower.py`). It is a *merged* node (object detection + lane
+segmentation), but for this stack it is run **detection-only** so it does not touch the lane
+pipeline:
+
+```bash
+python3 perception_node.py --mode detection --det-model yolo11s_320x320.engine
+```
+
+**What it outputs:**
+- `/object_detection/drive` — JSON `{"detections": [{class_name, score, box}]}`, consumed by
+  the orchestrator's traffic-light/STOP override.
+- `/object_detection/video` — annotated overlay (optional, for the dashboard).
+
+The orchestrator-side consumer is a small Python 2.7 module —
+`jetauto_autonomous/scripts/object_detection/traffic_sign_handler.py` — that the orchestrator
+calls via function (no extra ROS node on the Python 2.7 side). The `.engine` model is supplied
+at runtime (build it with `on_jetauto_scripts/tensor_rt/convert_to_tensor_rt.py`).
 
 ---
 
@@ -294,6 +328,12 @@ Then, separately, in a conda terminal:
 python3 lane_follower.py --model model.engine --tensorrt
 ```
 
+For traffic-light / STOP handling, also start the detection node in a conda terminal
+(skip it, or set `traffic_light_enable: false`, to run driving-only):
+```bash
+python3 perception_node.py --mode detection --det-model yolo11s_320x320.engine
+```
+
 **What happens when a goal is sent from the dashboard:**
 1. Dashboard publishes `[start_id, end_id]` to `/waypoint_manager/goal`
 2. `waypoint_manager` runs Dijkstra, publishes path, starts publishing `nav_info` with `is_active=1.0`
@@ -318,7 +358,9 @@ python3 lane_follower.py --model model.engine --tensorrt
 | `/odom` | Odometry | hardware | waypoint_manager, orchestrator | robot pose |
 | `/remap_transform` | Float64MultiArray | dashboard, orchestrator | waypoint_manager, orchestrator | live frame update (orchestrator republishes its drift corrections) |
 | `/waypoint_manager/goal` | Int32MultiArray | dashboard, orchestrator | waypoint_manager | [start_id, end_id]; **empty = cancel** (used by the emergency stop) |
-| `/orchestrator/state` | String (latched) | orchestrator | dashboard | FSM state, incl. `EMERGENCY_STOP` |
+| `/object_detection/drive` | String (JSON) | perception_node | orchestrator | detections; drives the `TRAFFIC_STOP` / `STOP_SIGN` override |
+| `/object_detection/video` | Image bgr8 | perception_node | dashboard | annotated detection overlay (optional) |
+| `/orchestrator/state` | String (latched) | orchestrator | dashboard | FSM state, incl. `EMERGENCY_STOP` + transient `TRAFFIC_STOP` / `STOP_SIGN` |
 | `/orchestrator/diag` | Float64MultiArray | orchestrator | logging / plots | 13-field per-tick diagnostics (25 Hz) |
 | `/waypoint_manager/path` | Int32MultiArray (latched) | waypoint_manager | orchestrator | node IDs for pure-pursuit |
 | `/waypoint_manager/nav_info` | Float64MultiArray | waypoint_manager | orchestrator | 8-element, 25 Hz |
@@ -353,6 +395,8 @@ python3 lane_follower.py --model model.engine --tensorrt
 | `junction_spin_speed` | 0.40 rad/s | Max spin speed during rotation |
 | `map_drive_speed` | 0.04 m/s | Speed in FALLBACK pure-pursuit |
 | `map_kp` | 1.2 | Proportional gain for map heading correction |
+| `traffic_light_enable` | `true` | Object-detection override on/off (`false` = ignore detections, driving-only) |
+| `stop_sign_hold` | 3.0 s | How long to hold at a detected STOP sign |
 
 ---
 

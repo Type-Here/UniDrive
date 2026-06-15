@@ -124,6 +124,15 @@ function setupTopics() {
   new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 200, queue_length: 1 })
     .subscribe(m => updateOdom(m));
 
+  new ROSLIB.Topic({ ros, name: '/remap_transform', messageType: 'std_msgs/Float64MultiArray', throttle_rate: 500, queue_length: 1 })
+    .subscribe(m => {
+      if (m.data.length < 4) return;
+      mapTransform.theta = m.data[0];
+      mapTransform.scale = m.data[1];
+      mapTransform.tx    = m.data[2];
+      mapTransform.ty    = m.data[3];
+    });
+
   new ROSLIB.Topic({ ros, name: '/orchestrator/state', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => {
       const b = document.getElementById('mapFollowerBadge');

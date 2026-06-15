@@ -145,7 +145,7 @@ the waypoint manager stays in sync. Gate structure (each bug below was found in 
 | "On a straight" is judged from the **lane** | `\|heading_rad\| ≤ lateral_align_deg`. Gating on the mapped yaw was a catch-22: once accumulated theta error exceeded the gate, the correction that fixes theta could never fire (19.4° injected drift → 1.5° absorbed). The mapped yaw keeps only a loose 45° wrong-segment sanity bound |
 | Cross-track noise floor bounds only the **translation** | yaw runs whenever the lane/segment evidence holds — pinning position while yaw ran away was the old gate order |
 | Turn-in-zone block only where the path actually **bends** | turn angle ≥ `gentle_turn_deg` at the current node; an unconditional `dist ≤ junction_influence_radius` gate starved the correction on dense maps (segments 0.30–0.47 m) |
-| Plus | NAVIGATING only, never junction/roundabout, TRACKING_CC with both lines valid and `\|center_offset\| ≤ lateral_centered_clear` |
+| Plus | NAVIGATING only, never junction/roundabout, `\|center_offset\| ≤ lateral_centered_clear`. YAW fires on a single confident line too (TRACKING_CC / SINGLE_L / SINGLE_R) since the line heading alone pins it; the LATERAL nudge still requires both lines valid (it leans on the centreline) |
 
 Log: `[n_orch] straight correction: cross=… xy=… dtheta=…` (`xy=0` = yaw-only re-anchor).
 

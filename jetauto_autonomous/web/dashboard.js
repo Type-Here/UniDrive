@@ -121,7 +121,7 @@ function setupTopics() {
       }
     });
 
-  new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 200, queue_length: 1 })
+  new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 66, queue_length: 1 })
     .subscribe(m => updateOdom(m));
 
   new ROSLIB.Topic({ ros, name: '/remap_transform', messageType: 'std_msgs/Float64MultiArray', throttle_rate: 500, queue_length: 1 })
@@ -169,7 +169,7 @@ function setupTopics() {
       }
     });
 
-  new ROSLIB.Topic({ ros, name: '/waypoint_manager/nav_info', messageType: 'std_msgs/Float64MultiArray', throttle_rate: 200, queue_length: 1 })
+  new ROSLIB.Topic({ ros, name: '/waypoint_manager/nav_info', messageType: 'std_msgs/Float64MultiArray', throttle_rate: 100, queue_length: 1 })
     .subscribe(m => {
       if (!svgViewBox || !mapData || m.data.length < 8) return;
       const isActive = m.data[7] > 0.5;

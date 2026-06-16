@@ -254,6 +254,11 @@ class Orchestrator(object):
         self._gentle_turn_deg   = float(rp("gentle_turn_deg",    20.0))
         # Roundabout: pure map following at this speed (lane detection unreliable)
         self._roundabout_speed  = float(rp("roundabout_drive_speed", 0.10))
+        # A sharp exit turn (e.g. 28->23->2 doubles back ~160 deg) can't be driven as a
+        # forward pure-pursuit arc (min radius ~ speed/max_w): the robot sweeps wide and
+        # ends up perpendicular to the exit road, only partly rotated (observed at 23).
+        # Above this heading error to the exit carrot, spin in place first then drive.
+        self._round_exit_spin_deg = float(rp("roundabout_exit_spin_deg", 90.0))
 
         # Remap transform (odom -> map frame), mirrors waypoint_manager
         self._remap_theta = 0.0
@@ -626,6 +631,15 @@ class NewOrchestrator(Orchestrator):
         self._fb_offref_m     = float(rp("fallback_offref_m",     0.60))
         self._fb_offref_ticks = int  (rp("fallback_offref_ticks", 25))
         self._fb_timeout_s    = float(rp("fallback_timeout_s",    60.0))
+        # FALLBACK pure-pursuit has no terminal node: at the final waypoint the carrot
+        # stays pinned on the last node and forward speed keeps the robot ORBITING it at
+        # a radius set by odom drift. If that radius exceeds the waypoint manager's
+        # arrival tolerance, arrival never fires and it circles forever (observed). So
+        # count consecutive ticks spent targeting the final node within this radius; once
+        # sustained, end the run terminally (a healthy run arrives in NAVIGATING, so a
+        # FALLBACK arrival is always degraded / unverified localization).
+        self._fb_goal_radius  = float(rp("fallback_goal_radius",  0.50))
+        self._fb_goal_ticks   = int  (rp("fallback_goal_ticks",   50))
         # Distance over which the map progressively blends the robot INTO a junction
         # turn. This approach-blend is what actually curves the robot before the
         # in-place spin arms at junction_radius. It is bounded ABOVE by the length of
@@ -718,6 +732,7 @@ class NewOrchestrator(Orchestrator):
         self._estop_zero_left  = 0      # remaining active-braking ticks after an e-stop
         self._offroute_count   = 0      # consecutive off-route ticks
         self._fb_offref_count  = 0      # consecutive FALLBACK off-reference ticks
+        self._fb_goal_count    = 0      # consecutive ticks orbiting the goal in FALLBACK
         self._fb_entered       = None   # rospy.Time of the last FALLBACK entry
         self._last_a_lane      = 1.0    # last blend weight (diagnostics)
         self._last_scale       = 1.0    # last anti-cut scale (diagnostics)
@@ -1082,6 +1097,7 @@ class NewOrchestrator(Orchestrator):
             self._recv_count     = 0
             self._conflict_count = 0   # off-path excursion is a recovery, not a conflict
             self._fb_offref_count = 0
+            self._fb_goal_count   = 0
             self._fb_entered      = rospy.Time.now()   # for the timeout failsafe
             self._publish_orc_state(self.FALLBACK)
             rospy.loginfo("[nn_orch] -> FALLBACK (%s)", why)
@@ -1733,6 +1749,18 @@ class NewOrchestrator(Orchestrator):
             self._round_offref_count = 0
         heading = math.atan2(carrot[1] - C.ry, carrot[0] - C.rx)
         err     = angle_diff(heading, C.ryaw)
+        # Sharp exit turn -> spin in place first. Driving a ~160deg exit (28->23->2) as a
+        # forward pure-pursuit arc sweeps wide and leaves the robot perpendicular to the
+        # exit road (observed at node 23). When exiting the ring with a large heading
+        # error to the exit carrot, rotate in place (junction-style) and hold forward
+        # speed until roughly aligned, then let normal pursuit resume.
+        if exiting and abs(err) >= math.radians(self._round_exit_spin_deg):
+            out = Twist()
+            out.angular.z = clamp(1.5 * err, -self._junc_spin, self._junc_spin)
+            self._publish_cmd(out)               # linear.x = 0 -> spin in place
+            rospy.loginfo_throttle(
+                1.0, "[nn_orch] ROUND exit spin err=%+.0fdeg", math.degrees(err))
+            return
         base    = clamp(self._map_kp * err, -self._map_max_w, self._map_max_w)
         # Camera-frame guardrail nudge (additive; 0 unless a road edge is close).
         nudge   = self._round_lane_nudge(C)
@@ -1814,8 +1842,32 @@ class NewOrchestrator(Orchestrator):
             self._enter_emergency_stop("fallback timeout %.0fs" % self._fb_timeout_s)
             return
 
+        # Orbiting the goal in FALLBACK. Pure-pursuit has no terminal node: at the final
+        # waypoint (next_id < 0) it keeps driving forward toward a carrot pinned on the
+        # goal and CIRCLES it at a radius set by odom drift. If that radius exceeds the
+        # waypoint manager's arrival tolerance, arrival never fires and it circles forever
+        # (observed). Conversely, when arrival DOES fire mid-FALLBACK the run "completes"
+        # while physically off-road (the broken-localization runaway). Both are the same
+        # degraded case — a healthy run arrives in NAVIGATING — so count consecutive ticks
+        # spent at the final node and, once sustained, end the run on the shared terminal
+        # failsafe: stop the circling AND flag it rather than rubber-stamp the arrival.
+        if C.next_id < 0 and C.dist <= self._fb_goal_radius:
+            self._fb_goal_count += 1
+            if self._fb_goal_count >= self._fb_goal_ticks:
+                self._fb_goal_count = 0
+                self._enter_emergency_stop("goal unreachable in FALLBACK "
+                                           "(lane never recovered)")
+                return
+        else:
+            self._fb_goal_count = 0
+
         # Pure-pursuit on the path; recover only with optical + positional proof.
-        near_path = C.dist <= self._recovery_radius
+        # "Near path" accepts EITHER proximity to the current target node OR being back
+        # on the path by cross-track: after an off-road excursion the robot can be back
+        # on the road yet far from the nearest node on a long segment, where the
+        # node-distance test alone never re-arms NAVIGATING (observed: stayed in FALLBACK).
+        near_path = (C.dist <= self._recovery_radius
+                     or C.offpath <= self._recovery_radius)
         lane_ok   = C.lane_state not in self._LANE_BAD
         if lane_ok and near_path:
             self._recv_count += 1

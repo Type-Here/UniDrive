@@ -177,6 +177,11 @@ orchestrator:
   roundabout_offref_m:     0.40 # [new] m of deviation before tripping the stop
   roundabout_offref_ticks: 10   # [new] consecutive off-reference ticks (debounce)
   roundabout_conflict_c:   -0.5 # [new] lenient lane/map cosine-similarity threshold below which a roundabout conflict is counted (lane is unreliable here)
+  # Sharp-exit spin: a forward pure-pursuit arc can't drive a sharp exit turn (e.g.
+  # 28->23 doubling back ~160 deg) -- it sweeps wide and ends up perpendicular to the
+  # exit road. Above this heading error to the exit carrot, spin in place (linear=0,
+  # junction-style) until roughly aligned, then resume the pursuit drive out. [new]
+  roundabout_exit_spin_deg: 90.0 # [new] deg of heading error to the exit carrot above which to spin in place
 
   # ---- Disagreement blend + conflict stop ([new]) ----
   # n_orchestrator blends lane vs map by the cosine similarity c between the
@@ -226,6 +231,12 @@ orchestrator:
   fallback_offref_m:     0.60   # [new] m of cross-track from the pursued path before the stop
   fallback_offref_ticks: 25     # [new] consecutive off-reference ticks (debounce, ~1 s at 25 Hz)
   fallback_timeout_s:    60.0   # [new] max seconds in FALLBACK before the stop (0 = no timeout)
+  # Goal-orbit failsafe: pure-pursuit has no terminal node, so at the final waypoint it
+  # circles the goal forever (the mapped orbit radius can exceed the waypoint manager's
+  # arrival tolerance, so arrival never fires). A FALLBACK arrival is always degraded (a
+  # healthy run arrives in NAVIGATING), so a sustained presence at the goal ends the run.
+  fallback_goal_radius:  0.50   # [new] m from the final node within which to count goal-orbit ticks
+  fallback_goal_ticks:   50     # [new] consecutive such ticks before the terminal stop (~2 s at 25 Hz)
 
   # ---- Object detection: traffic lights / STOP signs ([new]) ----
   # Consumes the perception node's JSON detections on traffic_light_topic and

@@ -231,11 +231,16 @@ maps/
 # MacOS
 .DS_Store
 
-# Reports and Interna Docs
+# Reports and Internal Docs
 **/report/
 **/reports/
 **/internal_docs/
+/*.md
+!/README.md
+
+
 
 # Outputs
 testing/sim/output/
 testing/sim/out/
+

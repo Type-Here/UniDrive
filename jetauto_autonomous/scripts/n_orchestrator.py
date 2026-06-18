@@ -229,6 +229,11 @@ class Orchestrator(object):
         # the change so commanded ~= executed.
         self._out_max_lin    = float(rp("output_max_linear",   0.20))   # m/s hard clamp
         self._out_max_ang    = float(rp("output_max_angular",  0.50))   # rad/s hard clamp
+        # Tighter angular cap for IN-PLACE rotation (linear=0). Manual in-place spins are
+        # much slower than the 0.5 general clamp; a slow pivot keeps the open-loop odom
+        # faithful (less command-vs-gyro divergence to snap to at spin-stop). Applied by
+        # _publish_cmd(..., in_place=True) at the spin sites; normal driving keeps 0.5.
+        self._out_max_ang_ip = float(rp("output_max_angular_inplace", 0.20))  # rad/s
         self._out_acc_lin    = float(rp("output_accel_linear", 0.50))   # m/s^2 slew (0=off)
         self._out_acc_ang    = float(rp("output_accel_angular", 3.0))   # rad/s^2 slew (0=off)
         self._last_vx = self._last_vy = self._last_wz = 0.0
@@ -238,18 +243,40 @@ class Orchestrator(object):
         self._junc_radius    = float(rp("junction_radius",     0.30))
         self._junc_align     = float(rp("junction_align_deg",  22.0))
         self._junc_spin      = float(rp("junction_spin_speed",       0.40))
+        # Forward creep during in-place spins (m/s). A pure pivot (linear=0) is the
+        # max-wheel-scrub, least odom-faithful mecanum motion; a small forward speed
+        # turns it into a rolling ARC (wheels roll, low slip) like manual/lane driving,
+        # cutting the open-loop yaw drift a spin injects. 0 = pure pivot (old behavior);
+        # the turn arcs wider as this grows, so tune on the robot. Applies to junction
+        # spins and the roundabout exit-spin.
+        self._junc_spin_creep = float(rp("junction_spin_creep",      0.0))
         self._alpha_junc     = float(rp("junction_alpha",            0.9))
         self._lookahead      = float(rp("lookahead_m",               0.50))
         self._recovery_radius = float(rp("fallback_recovery_radius", 0.50))
         self._map_speed      = float(rp("map_drive_speed",      0.04))
         self._map_kp         = float(rp("map_kp",               1.2))
-        self._map_max_w      = float(rp("map_max_angular",      0.80))
+        self._map_max_w      = float(rp("map_max_angular",      0.50))
         # Drift auto-correction (EMA applied at each confirmed node passage / junction)
         self._drift_pos_alpha    = float(rp("drift_pos_alpha",       0.35))
         self._drift_theta_alpha  = float(rp("drift_theta_alpha",     0.30))
         self._drift_min_m        = float(rp("drift_min_correct_m",   0.03))
         self._drift_max_m        = float(rp("drift_max_correct_m",   0.50))
         self._drift_trigger_r    = float(rp("drift_trigger_radius",  0.20))
+        # Gyro-bias feed-forward: /odom yaw is the open-loop integral of a bias-prone gyro
+        # with NO absolute reference (see odometry_drift_analysis.md), so a constant gyro
+        # bias drifts yaw monotonically (~0.1 deg/s, measurable while STOPPED since no
+        # commanded rotation masks it — but the same bias integrates while MOVING too). The
+        # camera yaw fix is the only thing that re-pins it, but it only fires on steady
+        # straights, so the bias accumulates uncorrected through every stop/spin/junction.
+        # We cancel the constant part directly: subtract bias_rate * elapsed from the raw
+        # odom yaw before anything downstream (map_yaw, theta correction) sees it, leaving
+        # the camera fix only the residual (spins + BEV bias) to absorb. SIGN = the observed
+        # drift rate: yaw drifting DOWN ~0.1 deg/s -> set -0.1 (deg/s). 0 = disabled.
+        self._gyro_bias_rate = math.radians(float(rp("gyro_bias_rate", 0.0)))  # deg/s -> rad/s
+        if self._gyro_bias_rate != 0.0:
+            rospy.loginfo("[nn_orch] gyro-bias feed-forward ENABLED: %.4f deg/s",
+                          math.degrees(self._gyro_bias_rate))
+
         # Turn-angle-aware junction: skip full rotation for gentle heading changes
         self._gentle_turn_deg   = float(rp("gentle_turn_deg",    20.0))
         # Roundabout: pure map following at this speed (lane detection unreliable)
@@ -259,6 +286,7 @@ class Orchestrator(object):
         # ends up perpendicular to the exit road, only partly rotated (observed at 23).
         # Above this heading error to the exit carrot, spin in place first then drive.
         self._round_exit_spin_deg = float(rp("roundabout_exit_spin_deg", 90.0))
+
 
         # Remap transform (odom -> map frame), mirrors waypoint_manager
         self._remap_theta = 0.0
@@ -375,6 +403,14 @@ class Orchestrator(object):
     def _odom_cb(self, msg):
         p   = msg.pose.pose.position
         yaw = yaw_from_quat(msg.pose.pose.orientation)
+        # Gyro-bias feed-forward: remove the constant monotonic gyro drift from the raw
+        # odom yaw before anything downstream uses it. Accumulates from the first odom msg;
+        # angle_diff(.,0) re-normalizes into (-pi, pi]. No-op when gyro_bias_rate == 0.
+        if self._gyro_bias_rate != 0.0:
+            stamp = msg.header.stamp if msg.header.stamp != rospy.Time(0) else rospy.Time.now()
+            if self._odom_t0 is None:
+                self._odom_t0 = stamp
+            yaw = angle_diff(yaw - self._gyro_bias_rate * (stamp - self._odom_t0).to_sec(), 0.0)
         mx, my  = self._odom_to_map(p.x, p.y)
         map_yaw = angle_diff(yaw, self._remap_theta)
         with self._lock:
@@ -422,9 +458,13 @@ class Orchestrator(object):
             return target
         return prev + clamp(target - prev, -max_step, max_step)
 
-    def _publish_cmd(self, twist):
+    def _publish_cmd(self, twist, in_place=False):
         """Clamp a driving Twist to the base's manual envelope and slew-limit the
-        change before publishing, so the open-loop odom stays faithful to execution."""
+        change before publishing, so the open-loop odom stays faithful to execution.
+
+        in_place=True applies the tighter in-place angular cap (output_max_angular_inplace)
+        instead of the general 0.5 — manual in-place spins are slow, and a slow pivot keeps
+        the command-integrated yaw close to the gyro so less error snaps in at spin-stop."""
         now = rospy.Time.now()
         if self._last_cmd_t is None:
             dt = 1.0 / max(self._rate_hz, 1.0)
@@ -432,9 +472,10 @@ class Orchestrator(object):
             dt = (now - self._last_cmd_t).to_sec()
             if dt <= 0.0 or dt > 0.5:          # first tick / stall guard
                 dt = 1.0 / max(self._rate_hz, 1.0)
+        ang_cap = self._out_max_ang_ip if in_place else self._out_max_ang
         vx = clamp(twist.linear.x,  -self._out_max_lin, self._out_max_lin)
         vy = clamp(twist.linear.y,  -self._out_max_lin, self._out_max_lin)
-        wz = clamp(twist.angular.z, -self._out_max_ang, self._out_max_ang)
+        wz = clamp(twist.angular.z, -ang_cap, ang_cap)
         vx = self._slew(self._last_vx, vx, self._out_acc_lin * dt)
         vy = self._slew(self._last_vy, vy, self._out_acc_lin * dt)
         wz = self._slew(self._last_wz, wz, self._out_acc_ang * dt)
@@ -622,8 +663,42 @@ class NewOrchestrator(Orchestrator):
         # the robot's true map yaw is seg_yaw + heading_rad, so remap_theta gets
         # EMA-corrected there. Without it the translation-only fix forever chases
         # the lateral error that the yaw error keeps regenerating.
-        self._lat_theta_alpha   = float(rp("lateral_theta_alpha",   0.25))
+        self._lat_theta_alpha   = float(rp("lateral_theta_alpha",   0.18))
+        # Per-fire STEP cap on the yaw fix (was a hard reject — see _apply_straight_corrections).
         self._lat_theta_max     = math.radians(float(rp("lateral_theta_max_deg", 10.0)))
+        # Sanity bound: deltas above this are dropped as a bad lane/segment association;
+        # within it the camera fix is allowed to correct (rate-limited), so a large
+        # post-rotation drift can actually be undone instead of rejected at 10 deg.
+        self._lat_theta_reject  = math.radians(float(rp("lateral_theta_reject_deg", 40.0)))
+        # BEV/camera yaw bias: heading_rad (info[1]) carries a constant offset (a slightly
+        # rotated BEV warp / single-line read), so on a CENTRED STRAIGHT it reads non-zero.
+        # The yaw fix trusts seg_yaw + heading_rad as the robot's true map heading, so that
+        # bias is baked into remap_theta every fire — one-signed, and the lever arm turns it
+        # into a steady map-frame drift (observed: ~+4-5 deg th_l on a centred straight on the
+        # north road dragged the mapped pose south/east). Subtract the measured constant first.
+        # Measure: log /lane_controller/info[1] (heading_rad) mean on a known-straight, centred
+        # segment; set this (deg, SAME sign as info[1]). 0 = off.
+        self._lat_heading_bias  = math.radians(float(rp("lane_heading_bias_deg", 0.0)))
+        # Max cross-track at which the YAW re-pin is still trusted. The position branch is
+        # already bounded (lateral_max_correct_m); the yaw branch used to fire "regardless of
+        # cross-track size", so once localization had drifted (cross=0.46m observed) it pinned
+        # yaw to a segment the robot was nowhere near and amplified the error into a conflict
+        # EMERGENCY_STOP. This is the missing UPPER bound; it still fires before the position
+        # drifts past the noise floor (the "fire early" reasoning bounds the MINIMUM, not this).
+        self._lat_theta_max_cross = float(rp("lateral_theta_max_cross_m", 0.35))
+        # Post-rotation relock: an in-place spin (junction / roundabout exit) integrates
+        # the COMMANDED rotation open-loop and injects tens of degrees of yaw drift that
+        # map-frame alignment cannot self-correct. Arm a one-shot full camera re-pin so
+        # the first confident straight lane after the spin snaps remap_theta to truth.
+        self._yaw_relock_alpha  = float(rp("yaw_relock_alpha", 0.7))
+        # Yaw-glitch guard: /odom integrates WHATEVER lands on /jetauto_controller/cmd_vel,
+        # so a FOREIGN publisher (a stray joystick/teleop node) injecting a big angular.z
+        # spins the robot and dumps yaw into odom that we never commanded — corrupting the
+        # map. We can't stop the physical spin (shared topic), but we refuse to bake it into
+        # remap: if the MEASURED odom yaw-rate exceeds the rate WE commanded by more than
+        # this, suppress the camera yaw/lateral re-pin for a short cooldown.
+        self._yaw_glitch_thresh  = float(rp("yaw_glitch_rate_thresh", 1.0))   # rad/s
+        self._yaw_glitch_ticks   = int  (rp("yaw_glitch_cooldown_ticks", 15)) # ~0.5 s @30Hz
         # FALLBACK failsafe: pure-pursuit on broken localization could previously
         # run away forever (the only state with no excursion check). Sustained
         # cross-track beyond fallback_offref_m, or simply staying in FALLBACK past
@@ -689,6 +764,11 @@ class NewOrchestrator(Orchestrator):
         self._lat_alpha          = float(rp("lateral_correct_alpha",  0.35))
         self._lat_centered_clear = float(rp("lateral_centered_clear", 0.15))
         self._lat_align_deg      = float(rp("lateral_align_deg",      15.0))
+        # Steadiness gate: the yaw/lateral re-pin only fires after the car has tracked a
+        # confident, centred, straight lane for this many CONSECUTIVE ticks. Mid-maneuver
+        # (catching a line, fresh out of FALLBACK) the lane is transiently at an angle, and
+        # re-pinning then bakes that transient into remap as a false yaw error.
+        self._settle_ticks       = int  (rp("lateral_settle_ticks",  15))
         self._lat_min_m          = float(rp("lateral_min_correct_m",  0.03))
         self._lat_max_m          = float(rp("lateral_max_correct_m",  0.40))
         self._lat_tick           = 0    # NAVIGATING-tick counter for the period gate
@@ -734,6 +814,12 @@ class NewOrchestrator(Orchestrator):
         self._fb_offref_count  = 0      # consecutive FALLBACK off-reference ticks
         self._fb_goal_count    = 0      # consecutive ticks orbiting the goal in FALLBACK
         self._fb_entered       = None   # rospy.Time of the last FALLBACK entry
+        self._yaw_relock       = False  # one-shot: snap yaw from the camera after a spin
+        self._prev_odom_yaw    = None   # last odom yaw (yaw-glitch rate estimate)
+        self._prev_odom_t      = None   # rospy.Time of that sample
+        self._odom_t0          = None   # rospy.Time of first odom msg (gyro-bias feed-forward origin)
+        self._glitch_cooldown  = 0      # ticks left suppressing the yaw re-pin after a glitch
+        self._steady_count     = 0      # consecutive steady-tracking ticks (yaw re-pin gate)
         self._last_a_lane      = 1.0    # last blend weight (diagnostics)
         self._last_scale       = 1.0    # last anti-cut scale (diagnostics)
         self._dash_hold        = 0      # remaining dashed-crossing hold ticks (0 = off)
@@ -910,8 +996,12 @@ class NewOrchestrator(Orchestrator):
                 theta_exact = odom_yaw - (seg_yaw + heading_rad).
             This is the half the translation-only fix was missing: a yaw error
             REGENERATES lateral error continuously, so correcting only tx/ty chases
-            a moving target. Deltas above lateral_theta_max_deg are rejected
-            (transient / broken geometry); lateral_theta_alpha=0 disables.
+            a moving target. The delta is correcting-toward, RATE-LIMITED to
+            lateral_theta_max_deg per fire (not rejected at it — that left a >10 deg
+            post-spin drift permanently uncorrectable); only an insane delta above
+            lateral_theta_reject_deg is dropped as a bad association. After an in-place
+            spin a one-shot relock takes the first reading as a near-full re-pin
+            (yaw_relock_alpha). lateral_theta_alpha=0 disables the yaw fix.
         The translation is solved AFTER the theta update, so the frame pivots about
         the ROBOT (its mapped position lands exactly on the foot) instead of
         rotating about the remap origin — a theta-only tweak would otherwise
@@ -928,11 +1018,21 @@ class NewOrchestrator(Orchestrator):
         """
         if not self._lat_correct:
             return
+        # An uncommanded rotation just spun the robot (foreign cmd_vel / slip): the lane
+        # reading and the odom yaw are momentarily inconsistent, so re-pinning now would
+        # bake the glitch into remap. Skip yaw + lateral + relock until the cooldown ends
+        # (the relock stays armed, so it still fires on the first CLEAN straight after).
+        if self._glitch_cooldown > 0:
+            return
         self._lat_tick = (self._lat_tick + 1) % max(1, self._lat_period)
         if self._lat_tick != 0:
             return
         if (self._map is None or C.lane_info is None
                 or self._state != self.NAVIGATING or C.in_roundabout or C.is_junction):
+            return
+        # Only re-pin once the car has been steadily tracking for a while (not mid-maneuver):
+        # the streak is reset by any unsteady/transient/glitch tick in _step.
+        if self._steady_count < self._settle_ticks:
             return
         li = C.lane_info
         # Relaxed gate: a single confidently-tracked line (SINGLE_L/SINGLE_R) drives
@@ -960,6 +1060,9 @@ class NewOrchestrator(Orchestrator):
         if seg is None:
             return
         cdx, cdy, seg_yaw, cross = seg
+        # De-bias the lane heading before it is used as truth (constant BEV/single-line yaw
+        # offset, see _lat_heading_bias): both the straightness gate below and yaw_true use it.
+        heading = angle_diff(li[1] - self._lat_heading_bias, 0.0)
         # "Driving ALONG a straight" is judged from the LANE (|heading_rad| small):
         # the camera is immune to odom/remap drift. Gating on the MAPPED yaw here
         # (the old check) was a catch-22 — once accumulated theta error exceeded
@@ -967,7 +1070,7 @@ class NewOrchestrator(Orchestrator):
         # (observed in sim: 19deg of injected drift, only 1.5deg ever absorbed).
         # The mapped yaw keeps only a LOOSE sanity bound against associating the
         # robot with a perpendicular segment of the path.
-        if abs(li[1]) > math.radians(self._lat_align_deg):
+        if abs(heading) > math.radians(self._lat_align_deg):
             return                                       # lane says we're not tracking straight
         if abs(angle_diff(seg_yaw, C.ryaw)) > math.radians(45.0):
             return                                       # wrong-segment association reject
@@ -982,12 +1085,28 @@ class NewOrchestrator(Orchestrator):
         # continuously, so waiting for the position to drift past the noise floor
         # (the old gate order) let theta run away while position kept being pinned.
         dtheta = 0.0
-        if self._lat_theta_alpha > 0.0:
-            yaw_true    = seg_yaw + li[1]
+        # Gate the YAW re-pin on cross-track: far off the mapped segment, seg_yaw is the wrong
+        # heading to pin to (broken localization), so re-pinning amplifies rather than corrects.
+        if self._lat_theta_alpha > 0.0 and cross <= self._lat_theta_max_cross:
+            yaw_true    = seg_yaw + heading
             theta_exact = angle_diff(odom_yaw, yaw_true)
             delta       = angle_diff(theta_exact, self._remap_theta)
-            if abs(delta) <= self._lat_theta_max:
-                dtheta = self._lat_theta_alpha * delta
+            # The camera is the ONLY absolute yaw reference, so a large delta is to be
+            # ABSORBED, not refused: an in-place spin injects tens of degrees that map-
+            # frame alignment can't fix. Reject only an insane delta (bad lane/segment
+            # association) above lat_theta_reject; within it, step toward truth. Normally
+            # rate-limited to lat_theta_max/fire; on a post-rotation relock, take the
+            # first confident reading as a near-full re-pin (yaw_relock_alpha) so a big
+            # spin drift snaps back in one straight rather than crawling 10 deg/tick.
+            if abs(delta) <= self._lat_theta_reject:
+                if self._yaw_relock and self._yaw_relock_alpha > 0.0:
+                    self._yaw_relock = False
+                    dtheta = self._yaw_relock_alpha * delta
+                    rospy.loginfo("[nn_orch] yaw relock (post-spin): "
+                                  "delta=%+.1fdeg", math.degrees(delta))
+                else:
+                    dtheta = clamp(self._lat_theta_alpha * delta,
+                                   -self._lat_theta_max, self._lat_theta_max)
 
         # --- POSITION: perpendicular FOOT on the segment (lateral only, never the
         # node), gated by the noise floor / broken-localization bounds. Solve the
@@ -1185,6 +1304,25 @@ class NewOrchestrator(Orchestrator):
             lane_info  = (list(self._lane_info)
                           if self._lane_info is not None
                           and self._fresh(self._lane_info_stamp) else None)
+
+        # Flag uncommanded rotation (foreign cmd_vel publisher / gross slip) so the camera
+        # re-pin won't bake a glitch-corrupted reading into remap. Updated every tick.
+        self._update_yaw_glitch(odom_yaw)
+
+        # Tracking steadiness: count consecutive ticks of confident, centred, straight,
+        # glitch-free NAVIGATING tracking. The yaw/lateral re-pin requires a streak so it
+        # fires only when the car is STEADILY following the road — not mid-maneuver
+        # (catching a line, fresh out of FALLBACK), where the transient lane angle would
+        # be baked into remap as a false yaw error. (self._state is the start-of-tick
+        # state, so the first ticks after a FALLBACK/JUNCTION exit still read as unsteady.)
+        steady = (self._state == self.NAVIGATING and self._glitch_cooldown == 0
+                  and lane_state in ("TRACKING_CC", "SINGLE_L", "SINGLE_R")
+                  and lane_info is not None and len(lane_info) >= 8
+                  and (lane_info[2] > 0.5 or lane_info[3] > 0.5)
+                  and abs(lane_info[6]) <= self._lat_centered_clear
+                  and abs(angle_diff(lane_info[1] - self._lat_heading_bias, 0.0))
+                      <= math.radians(self._lat_align_deg))
+        self._steady_count = (self._steady_count + 1) if steady else 0
 
         if pose is None:
             # No odom yet (bring-up). Halt only if we were actually driving;
@@ -1524,6 +1662,39 @@ class NewOrchestrator(Orchestrator):
 
     # --------------------------------------------------------------- JUNCTION
 
+    def _arm_yaw_relock(self):
+        """Arm a one-shot camera yaw re-pin after an in-place spin, and OPEN the
+        straight-correction period gate so it fires on the next eligible NAVIGATING
+        tick rather than up to lateral_correct_period (~2 s) later — a spin's open-loop
+        yaw drift must be fixed promptly, before it regenerates position error."""
+        self._yaw_relock = True
+        self._lat_tick   = self._lat_period - 1   # next period-gate check opens
+
+    def _update_yaw_glitch(self, odom_yaw):
+        """Detect an UNcommanded rotation by comparing the measured odom yaw-rate to the
+        rate we last commanded (`_last_wz`). A big mismatch means something we didn't
+        command rotated the robot — a foreign cmd_vel publisher (stray joystick/teleop)
+        or gross slip — so the camera re-pin must NOT trust this reading. Arms/refreshes
+        `_glitch_cooldown`; decremented on clean ticks. Updated every tick (any state)."""
+        now = rospy.Time.now()
+        glitch = False
+        if (odom_yaw is not None and self._prev_odom_yaw is not None
+                and self._prev_odom_t is not None):
+            dt = (now - self._prev_odom_t).to_sec()
+            if 0.01 < dt < 0.5:
+                rate = angle_diff(odom_yaw, self._prev_odom_yaw) / dt
+                if abs(rate - self._last_wz) > self._yaw_glitch_thresh:
+                    self._glitch_cooldown = self._yaw_glitch_ticks
+                    glitch = True
+                    rospy.logwarn_throttle(
+                        1.0, "[nn_orch] yaw GLITCH: odom %.1f rad/s vs commanded %.1f "
+                        "(foreign cmd_vel? slip?) -> suppressing yaw re-pin %d ticks",
+                        rate, self._last_wz, self._yaw_glitch_ticks)
+        self._prev_odom_yaw = odom_yaw
+        self._prev_odom_t   = now
+        if not glitch and self._glitch_cooldown > 0:
+            self._glitch_cooldown -= 1
+
     def _h_junction(self, C):
         # In-place rotation toward next-waypoint heading (kept from parent).
         self._publish_orc_state(self.JUNCTION)
@@ -1535,15 +1706,19 @@ class NewOrchestrator(Orchestrator):
             self._state = self.NAVIGATING
             self._publish_orc_state(self.NAVIGATING)
             self._apply_theta_correction(C.heading_nxt, C.odom_yaw)
+            # The map-frame alignment above is near-invariant (it pins to the drifting
+            # frame); arm a camera re-pin so the first straight after the turn fixes the
+            # yaw drift the open-loop spin just injected.
+            self._arm_yaw_relock()
             rospy.loginfo("[nn_orch] JUNCTION aligned (err=%.1fdeg) -> NAVIGATING",
                           math.degrees(abs(err)))
             return
 
         lane_ang = C.lane_cmd.angular.z if C.lane_usable else 0.0
         twist = Twist()
-        twist.linear.x  = 0.0
+        twist.linear.x  = self._junc_spin_creep   # 0 = pure pivot; >0 arcs (rolls -> less drift)
         twist.angular.z = (1.0 - self._alpha_junc) * lane_ang + self._alpha_junc * spin_ang
-        self._publish_cmd(twist)
+        self._publish_cmd(twist, in_place=(self._junc_spin_creep == 0.0))
 
     # ------------------------------------------------------------- ROUNDABOUT
 
@@ -1756,8 +1931,12 @@ class NewOrchestrator(Orchestrator):
         # speed until roughly aligned, then let normal pursuit resume.
         if exiting and abs(err) >= math.radians(self._round_exit_spin_deg):
             out = Twist()
+            out.linear.x  = self._junc_spin_creep   # 0 = pure pivot; >0 arcs (less drift)
             out.angular.z = clamp(1.5 * err, -self._junc_spin, self._junc_spin)
-            self._publish_cmd(out)               # linear.x = 0 -> spin in place
+            self._publish_cmd(out, in_place=(self._junc_spin_creep == 0.0))
+            # Same open-loop yaw drift as a junction spin: arm a camera re-pin for the
+            # first straight after the exit (once the lane resumes past the ring).
+            self._arm_yaw_relock()
             rospy.loginfo_throttle(
                 1.0, "[nn_orch] ROUND exit spin err=%+.0fdeg", math.degrees(err))
             return

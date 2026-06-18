@@ -273,8 +273,8 @@ orchestrator:
   # overrides all driving with a full stop: a red light holds until a green is
   # seen; a stop sign holds for stop_sign_hold seconds. Set enable=false to run
   # the driving stack on its own (detections ignored).
-  traffic_light_enable:     true                       # [new] false = driving-only
-  traffic_light_topic:      "/object_detection/drive"  # [new] perception node output
+  object_detection_enable:     true                       # [new] false = driving-only
+  object_detection_topic:      "/object_detection/drive"  # [new] perception node output
   traffic_light_red_label:  "red_TL"                   # [new] class name for red light
   traffic_light_green_label: "green_TL"                # [new] class name for green light
   stop_sign:                "stop_s"                    # [new] class name for stop sign

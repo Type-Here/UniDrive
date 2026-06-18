@@ -850,10 +850,10 @@ class NewOrchestrator(Orchestrator):
         # Object-detection override (traffic lights / STOP signs). Consumes the
         # perception node's JSON detections and, when a red light is latched or a
         # stop sign is active, seizes cmd_vel with a full stop (see _step). Set
-        # traffic_light_enable=false to develop/test the driving stack on its own.
+        # object_detection_enable=false to develop/test the driving stack on its own.
         self._obj_det = TrafficSignHandler(
-            enable      = bool(rp("traffic_light_enable", True)),
-            topic       = rp("traffic_light_topic", "/object_detection/drive"),
+            enable      = bool(rp("tobject_detection_enable", True)),
+            topic       = rp("object_detection_topic", "/object_detection/drive"),
             red_label   = rp("traffic_light_red_label", "red_TL"),
             green_label = rp("traffic_light_green_label", "green_TL"),
             stop_label  = rp("stop_sign", "stop_s"),

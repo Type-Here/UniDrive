@@ -3,7 +3,7 @@
 """Object-detection driving overrides: traffic lights and STOP signs.
 
 This module is the orchestrator-side consumer of the perception node. The
-perception node (``on_jetauto_scripts/drive_segm/perception_node.py``, running
+perception node (``jetauto_autonomous/perception/perception_node.py``, running
 on the Jetson) runs YOLO and publishes its detections as a JSON string on
 ``/object_detection/drive``. This handler turns those detections into a simple
 stop/go decision that ``n_orchestrator.py`` applies once per control tick.

@@ -10,9 +10,10 @@ The stack is split across two completely separate Python processes that communic
 
 | Process | Interpreter | Location | What it does |
 |---|---|---|---|
-| `lane_follower.py` | Python 3 (conda) | `on_jetauto_scripts/drive_segm/` | Neural network inference (ONNX / TensorRT); publishes segmentation masks |
-| `perception_node.py` | Python 3 (conda) | `on_jetauto_scripts/drive_segm/` | YOLO11/TensorRT object detection (traffic lights, STOP signs); publishes JSON detections. Run with `--mode detection` alongside `lane_follower.py` |
+| `perception_node.py` | Python 3 (conda) | `jetauto_autonomous/perception/` | Merged perception node: YOLO11/TensorRT object detection (traffic lights, STOP signs) **and** lane segmentation (ONNX/TensorRT). Launched with `./run-models.sh` |
 | Everything else | Python 2.7 (system ROS) | `jetauto_autonomous/scripts/` | All control logic, waypoint management, orchestration |
+
+> **Superseded:** `on_jetauto_scripts/drive_segm/lane_follower.py` was the original segmentation-only node. It is kept in the repository as a reference but replaced on-robot by `perception_node.py`.
 
 They can never share objects or function calls — the boundary is always a ROS topic message.
 
@@ -25,19 +26,21 @@ Camera
   /depth_cam/rgb/image_raw (640×480, rgb8)
         │
         ▼
-  lane_follower.py  ── Python 3, ONNX/TensorRT
-  (segmentation-only)
+  perception_node.py  ── Python 3, ONNX/TensorRT  (--mode both)
+  (detection + segmentation, launched via ./run-models.sh)
         │
-        └──► /lane_mask_bev    (BEV-warped mask, mono8)
-                    │
-                    ▼
-        lane_controller_node.py  ── Python 2.7
-        (HoughLinesP → polynomial fit → adaptive EMA steering)
-                    │
-                    ├──► /lane_controller/cmd_vel   (proposed Twist)
-                    └──► /lane_controller/state     (OK / HOLD / STOP / DISABLED)
-                                     │
-                    ┌────────────────┘
+        ├──► /lane_mask_bev    (BEV-warped mask, mono8)          -- segmentation
+        │               │
+        │               ▼
+        │   lane_controller_node.py  ── Python 2.7
+        │   (HoughLinesP → polynomial fit → adaptive EMA steering)
+        │               │
+        │               ├──► /lane_controller/cmd_vel   (proposed Twist)
+        │               └──► /lane_controller/state     (OK / HOLD / STOP / DISABLED)
+        │                                │
+        └──► /object_detection/drive  (JSON detections)  -- detection
+             (TRAFFIC_STOP / STOP_SIGN override)
+                    ┌───────────────────┘
                     │          /odom
                     │            │
                     ▼            ▼
@@ -58,12 +61,6 @@ Camera
         └──► /waypoint_manager/nav_info  ──► orchestrator.py
         └──► /waypoint_manager/path      ──► orchestrator.py
         └──► /waypoint_manager/status    ──► dashboard
-
-  perception_node.py  ── Python 3, YOLO11/TensorRT  (--mode detection)
-  (consumes /depth_cam/rgb/image_raw)
-        │
-        └──► /object_detection/drive  (JSON detections) ──► orchestrator.py
-                                            (TRAFFIC_STOP / STOP_SIGN override)
 ```
 
 **Key design principle:** the orchestrator (`n_orchestrator.py`) is the *sole* publisher of `/jetauto_controller/cmd_vel`. No other node touches the hardware command topic. This eliminates the race condition that previously occurred when `lane_controller_node` and `waypoint_manager_node` both published simultaneously during state transitions.
@@ -74,14 +71,24 @@ Camera
 
 ## 3. Node-by-node description
 
-### 3.1 `lane_follower.py` (Python 3)
+### 3.1 `perception_node.py` (Python 3)
 
-Runs the neural network. It is segmentation-only: it **never** publishes a velocity command — its only job is to produce the BEV segmentation mask.
+The merged perception node — runs in `--mode both` on the robot (one camera subscriber, one CUDA context, two models). It is **perception-only**: it **never** publishes a velocity command.
+
+Launched via `./run-models.sh` from `jetauto_autonomous/`; lives in `jetauto_autonomous/perception/`. TensorRT engines are placed in `jetauto_autonomous/perception/models/`.
 
 **What it outputs:**
-- `/lane_mask_bev` — the primary input to the control stack. A 320×128 (or scaled) bird's-eye-view binary mask where pixels are labelled by class: 0=background, 1=road, 2=lane_marking, 3=lane_dashed, 4=zebra.
+- `/lane_mask_bev` — the primary input to the control stack. A 320×128 bird's-eye-view binary mask, class labels: 0=background, 1=road, 2=lane_marking, 3=lane_dashed, 4=zebra. The BEV warp is calibrated on first run, then cached in `perception/calibration.json`.
+- `/object_detection/drive` — JSON `{"detections": [{class_name, score, box}]}`, consumed by the orchestrator's traffic-light/STOP override.
+- `/object_detection/video` — annotated detection overlay (optional, for the dashboard).
+- `/lane_follower/debug_image` — coloured segmentation overlay + BEV mask (when `--debug`, enabled by default).
 
-The BEV warp is calibrated once on first run (interactive corner selection), then cached in `calibration.json`.
+**Modes:**
+- `--mode both` (default): detection + segmentation in the same process/CUDA context.
+- `--mode detection`: object detection only (no `/lane_mask_bev` published).
+- `--mode segmentation`: lane segmentation only (no `/object_detection/*` published).
+
+> **Superseded:** `on_jetauto_scripts/drive_segm/lane_follower.py` was the original segmentation-only node, kept for reference only.
 
 ---
 
@@ -171,26 +178,17 @@ The brain of the driving system. It is the only node that publishes to `/jetauto
 
 ---
 
-### 3.5 `perception_node.py` (Python 3) — object detection
+### 3.5 Startup sequence (updated)
 
-The on-robot YOLO11/TensorRT detection node (lives in `on_jetauto_scripts/drive_segm/`,
-same conda env as `lane_follower.py`). It is a *merged* node (object detection + lane
-segmentation), but for this stack it is run **detection-only** so it does not touch the lane
-pipeline:
+`start_all.sh` starts the Python 2.7 control stack (rosbridge, video server, dashboard, lane controller, waypoint manager, orchestrator). Then, in a separate conda terminal:
 
 ```bash
-python3 perception_node.py --mode detection --det-model yolo11s_320x320.engine
+cd jetauto_autonomous
+./run-models.sh           # starts perception_node.py --mode both in the background
+./stop-models.sh          # graceful shutdown
 ```
 
-**What it outputs:**
-- `/object_detection/drive` — JSON `{"detections": [{class_name, score, box}]}`, consumed by
-  the orchestrator's traffic-light/STOP override.
-- `/object_detection/video` — annotated overlay (optional, for the dashboard).
-
-The orchestrator-side consumer is a small Python 2.7 module —
-`jetauto_autonomous/scripts/object_detection/traffic_sign_handler.py` — that the orchestrator
-calls via function (no extra ROS node on the Python 2.7 side). The `.engine` model is supplied
-at runtime (build it with `on_jetauto_scripts/tensor_rt/convert_to_tensor_rt.py`).
+The orchestrator-side consumer of `/object_detection/drive` is the small Python 2.7 module `jetauto_autonomous/scripts/object_detection/traffic_sign_handler.py`, called via function each tick. Set `object_detection_enable: false` in `lane_params.yaml` to ignore detections and run the driving stack on its own.
 
 ---
 
@@ -325,14 +323,14 @@ Both `waypoint_manager_node` and `orchestrator` apply this transform independent
 
 Then, separately, in a conda terminal:
 ```bash
-python3 lane_follower.py --model model.engine --tensorrt
+cd jetauto_autonomous
+./run-models.sh           # both models (detection + segmentation)
+# ./run-models.sh detection     # detection only (no /lane_mask_bev)
+# ./run-models.sh segmentation  # segmentation only (no /object_detection/*)
 ```
 
-For traffic-light / STOP handling, also start the detection node in a conda terminal
-(skip it, or set `traffic_light_enable: false`, to run driving-only):
-```bash
-python3 perception_node.py --mode detection --det-model yolo11s_320x320.engine
-```
+To disable traffic-light / STOP handling, set `object_detection_enable: false` in
+`lane_params.yaml` and restart the orchestrator (or run `--mode segmentation`).
 
 **What happens when a goal is sent from the dashboard:**
 1. Dashboard publishes `[start_id, end_id]` to `/waypoint_manager/goal`
@@ -348,8 +346,8 @@ python3 perception_node.py --mode detection --det-model yolo11s_320x320.engine
 
 | Topic | Type | Publisher | Subscribers | Notes |
 |---|---|---|---|---|
-| `/depth_cam/rgb/image_raw` | Image | hardware | lane_follower | 640×480 |
-| `/lane_mask_bev` | Image mono8 | lane_follower | lane_controller | BEV warped, 320×128 |
+| `/depth_cam/rgb/image_raw` | Image | hardware | perception_node | 640×480 |
+| `/lane_mask_bev` | Image mono8 | perception_node | lane_controller | BEV warped, 320×128 |
 | `/lane_controller/cmd_vel` | Twist | lane_controller | orchestrator | **proposed only, never to hardware** |
 | `/lane_controller/state` | String | lane_controller | orchestrator | OK/HOLD/STOP/DISABLED |
 | `/lane_controller/enable` | Bool (latched) | orchestrator | lane_controller | sole enable publisher |

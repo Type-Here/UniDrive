@@ -37,7 +37,7 @@ object-detection model and its pre/post-processing belongs to them.
 
 The lane-segmentation half and the merge/integration are ours.
 
-  Object detection authors (other group): <FILL IN NAMES / GITHUB HANDLES>
+  Object detection authors (other group): Carm1neBread, francescaapellegrino
 
 Usage (on the robot, conda Python 3 env):
     # Both models

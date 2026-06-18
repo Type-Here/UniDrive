@@ -107,7 +107,8 @@ orchestrator:
   # becomes map drift. The driver clamps MANUAL cmd_vel to lin<=0.2, ang<=0.5; we mirror
   # that and slew-limit the change so commanded ~= executed. Hard stops bypass the slew.
   output_max_linear:   0.20   # m/s  hard clamp on |linear.x|,|linear.y| (matches driver app clamp)
-  output_max_angular:  0.50   # rad/s hard clamp on |angular.z|         (matches driver app clamp)
+  output_max_angular:  0.60   # rad/s hard clamp on |angular.z|         (matches driver app clamp)
+  output_max_angular_inplace: 0.30  # [new] tighter angular cap for IN-PLACE rotation (linear=0): manual in-place spins are slow, and a slow pivot keeps the command-integrated yaw near the gyro so less error snaps in at spin-stop. Applied at the junction + roundabout exit spins; normal driving keeps output_max_angular.
   output_accel_linear: 0.50   # m/s^2  max change rate of linear (0 = slew off, clamp only)
   output_accel_angular: 3.0   # rad/s^2 max change rate of angular (0 = slew off, clamp only)
 
@@ -120,10 +121,11 @@ orchestrator:
 
   # ---- Junction rotation ----
   junction_radius: 0.30      # m — distance to trigger the in-place spin maneuver
-  junction_influence_radius: 0.50  # m -- distance over which the map blends the robot INTO the turn ([new]). MUST exceed junction_radius, and stay BELOW the entry-segment length (e.g. node 6 fed by the 0.75m 5->6 segment) or the blend pulls toward the post-junction heading while still maneuvering the previous node (0.90 reached past node 5 onto the opposite straight). The magnitude term below — not the width — is what makes the turn engage.
+  junction_influence_radius: 0.40  # m -- distance over which the map blends the robot INTO the turn ([new]). MUST exceed junction_radius, and stay BELOW the entry-segment length (e.g. node 6 fed by the 0.75m 5->6 segment) or the blend pulls toward the post-junction heading while still maneuvering the previous node (0.90 reached past node 5 onto the opposite straight). The magnitude term below — not the width — is what makes the turn engage.
   junction_turn_full_deg: 50.0  # [new] map heading error at which the map fully takes over the approach blend (the magnitude term). Sized below a 90deg crossway so a real turn pulls hard while a near-straight junction barely pulls.
   junction_align_deg: 14.0   # deg -- lower so the spin completes more of the turn before lane takeover (was 22, curved too soon)
-  junction_spin_speed: 0.40  # rad/s cap for in-place rotation
+  junction_spin_speed: 0.20  # rad/s cap for in-place rotation
+  junction_spin_creep: 0.0   # [new] m/s forward during the spin. A pure pivot (0) is the max-wheel-scrub, least odom-faithful mecanum motion; a small forward speed rolls it into an ARC (like manual/lane driving) and cuts the open-loop yaw drift a spin injects. Arcs wider as this grows -> tune on the robot. Applies to junction + roundabout exit spins.
   junction_alpha: 1.0        # spin blend weight on map heading: 1.0 = full map spin (lane hint off); <1.0 mixes in lane angular.z (0 if lane bad)
   # Anti-cut guardrail ([new], NAVIGATING approach only): while the line on the INSIDE
   # of the turn is still validly SEEN ahead (the intersection has not opened yet), scale
@@ -213,10 +215,38 @@ orchestrator:
   lateral_correct_alpha:  0.35   # [new] EMA weight PER CORRECTION toward the edge (sized up to offset the period)
   lateral_centered_clear: 0.15   # [new] max |center_offset| (normalized) to count as "centred"
   lateral_align_deg:      15.0   # [new] max robot-yaw vs segment-heading to count as "on a straight"
+  lateral_settle_ticks:   15     # [new] consecutive steady (centred+straight+glitch-free) NAVIGATING ticks required before the yaw/lateral re-pin fires -- blocks corrections mid-maneuver (catching a line, fresh out of FALLBACK) where a transient lane angle would be baked in. Higher = stricter/slower to trust the camera.
   lateral_min_correct_m:  0.03   # [new] ignore corrections below this (noise floor)
   lateral_max_correct_m:  0.40   # [new] reject corrections above this (broken localization)
-  lateral_theta_alpha:    0.25   # [new] EMA weight of the straight-line YAW fix (the missing half: a yaw error regenerates lateral error continuously). 0 = yaw fix off.
-  lateral_theta_max_deg:  10.0   # [new] reject yaw-correction deltas above this (deg; transient / broken geometry)
+  lateral_theta_alpha:    0.18   # [new] EMA weight of the straight-line YAW fix (the missing half: a yaw error regenerates lateral error continuously). Lowered 0.25->0.18: less per-fire authority -> smaller one-signed steps and less position drag via the lever arm. 0 = yaw fix off.
+  lateral_theta_max_deg:  10.0   # [new] per-fire STEP cap on the yaw fix (deg). Was a hard reject -- a >10deg post-spin drift then stayed permanently uncorrectable; now rate-limits instead.
+  lateral_theta_reject_deg: 40.0 # [new] sanity bound (deg): yaw deltas above this are dropped as a bad lane/segment association (kept under the 45deg wrong-segment guard)
+  lateral_theta_max_cross_m: 0.40 # [new] max cross-track (m) at which the YAW re-pin still fires. Beyond this localization has already drifted, so seg_yaw is the wrong heading to pin to -- re-pinning amplifies into a conflict EMERGENCY_STOP (observed at cross=0.46m). Position branch is already bounded by lateral_max_correct_m; this is the yaw branch's missing UPPER bound.
+  # BEV/camera yaw bias: heading_rad (info[1]) reads a constant non-zero value on a CENTRED
+  # STRAIGHT (slightly rotated BEV warp / single-line read). The yaw fix trusts seg_yaw +
+  # heading_rad as truth, so that bias is baked into remap_theta every fire (one-signed), and
+  # the lever arm turns it into a steady map-frame drift (mapped pose walked south/east on the
+  # north road). Subtract the measured constant first. Measure: log /lane_controller/info[1]
+  # (heading_rad) mean on a known-straight, centred segment; set this (deg, SAME sign as info[1]).
+  lane_heading_bias_deg:  -2.0    # [new] constant BEV/lane heading bias subtracted from heading_rad (0 = off)
+  # In-place spins (junction / roundabout exit) integrate the COMMANDED rotation open-
+  # loop and inject tens of degrees of yaw drift that map-frame alignment cannot self-
+  # correct. After a spin, the first confident straight lane snaps remap_theta with this
+  # weight (a one-shot camera relock), then the rate-limited fix above handles residual.
+  yaw_relock_alpha:       0.7    # [new] EMA weight of the one-shot post-spin yaw re-pin (0 = relock off, fall back to the rate-limited fix)
+  # Yaw-glitch guard: /odom integrates WHATEVER publishes to /jetauto_controller/cmd_vel,
+  # so a foreign publisher (a stray joystick/teleop node) injecting a big angular.z spins
+  # the robot and dumps uncommanded yaw into odom -> map drift. We can't stop the physical
+  # spin (shared topic), but if the MEASURED odom yaw-rate exceeds the rate WE commanded by
+  # more than this, we suppress the camera yaw/lateral re-pin for a cooldown so the glitch
+  # is never baked into remap. (Root fix is still to not run those publishers.)
+  yaw_glitch_rate_thresh:   1.0  # [new] rad/s mismatch (measured odom rate vs commanded) that flags an uncommanded rotation
+  yaw_glitch_cooldown_ticks: 15  # [new] ticks to suppress the yaw/lateral re-pin after a glitch (~0.5 s @ 30 Hz)
+  # Gyro-bias feed-forward: subtract the constant gyro drift from raw odom yaw before
+  # anything downstream uses it (see odometry_drift_analysis.md). Measure it stopped: park
+  # 60 s, fit the slope of /odom yaw. SIGN = the observed drift rate (yaw drifting DOWN
+  # ~0.1 deg/s -> set -0.1). 0 = disabled (default; enable once measured on the robot).
+  gyro_bias_rate: 0.0          # [new] deg/s; constant gyro yaw drift to cancel
 
   # ---- Map pure-pursuit (FALLBACK state) ----
   lookahead_m: 0.50

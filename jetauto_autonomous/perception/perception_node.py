@@ -58,7 +58,8 @@ Options:
     --det-model PATH    YOLO .engine file        (required for detection)
     --seg-model PATH    seg .onnx/.engine file    (required for segmentation)
     --seg-tensorrt      Use TensorRT backend for the seg model (else ONNX)
-    --debug             Publish /lane_follower/debug_image
+    --debug             Publish /lane_follower/debug_image (default: on)
+    --nodebug           Disable /lane_follower/debug_image
     --calibration PATH  Calibration json (default: calibration.json)
     --max-fps FLOAT     Cap the combined loop to this FPS (0 = unlimited)
     --print-debug       Print per-frame timing to console
@@ -76,7 +77,7 @@ import rospy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-from auto_calibration import AutoCalibration
+from jetauto_autonomous.perception.auto_calibration import AutoCalibration
 
 
 # -- Topics --------------------------------------------------------------------
@@ -734,8 +735,10 @@ def main():
                         help="Segmentation .onnx/.engine file (required for segmentation)")
     parser.add_argument("--seg-tensorrt", action="store_true", dest="seg_tensorrt",
                         help="Use TensorRT backend for the seg model (else ONNX)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Publish %s" % DEBUG_TOPIC)
+    parser.add_argument("--debug", action="store_true", default=True,
+                        help="Publish %s (default: on)" % DEBUG_TOPIC)
+    parser.add_argument("--nodebug", action="store_false", dest="debug",
+                        help="Disable %s" % DEBUG_TOPIC)
     parser.add_argument("--calibration", default="calibration.json",
                         help="Path to calibration json file")
     parser.add_argument("--max-fps", type=float, default=0.0, dest="max_fps",

@@ -10,8 +10,10 @@ The stack is split across two completely separate Python processes that communic
 
 | Process | Interpreter | Location | What it does |
 |---|---|---|---|
-| `lane_follower.py` | Python 3 (conda) | `on_jetauto_scripts/drive_segm/` | Neural network inference (ONNX / TensorRT); publishes segmentation masks |
+| `perception_node.py` | Python 3 (conda) | `jetauto_autonomous/perception/` | Merged perception node: YOLO11/TensorRT object detection (traffic lights, STOP signs) **and** lane segmentation (ONNX/TensorRT). Launched with `./run-models.sh` |
 | Everything else | Python 2.7 (system ROS) | `jetauto_autonomous/scripts/` | All control logic, waypoint management, orchestration |
+
+> **Superseded:** `on_jetauto_scripts/drive_segm/lane_follower.py` was the original segmentation-only node. It is kept in the repository as a reference but replaced on-robot by `perception_node.py`.
 
 They can never share objects or function calls — the boundary is always a ROS topic message.
 
@@ -24,19 +26,21 @@ Camera
   /depth_cam/rgb/image_raw (640×480, rgb8)
         │
         ▼
-  lane_follower.py  ── Python 3, ONNX/TensorRT
-  (segmentation-only)
+  perception_node.py  ── Python 3, ONNX/TensorRT  (--mode both)
+  (detection + segmentation, launched via ./run-models.sh)
         │
-        └──► /lane_mask_bev    (BEV-warped mask, mono8)
-                    │
-                    ▼
-        lane_controller_node.py  ── Python 2.7
-        (HoughLinesP → polynomial fit → adaptive EMA steering)
-                    │
-                    ├──► /lane_controller/cmd_vel   (proposed Twist)
-                    └──► /lane_controller/state     (OK / HOLD / STOP / DISABLED)
-                                     │
-                    ┌────────────────┘
+        ├──► /lane_mask_bev    (BEV-warped mask, mono8)          -- segmentation
+        │               │
+        │               ▼
+        │   lane_controller_node.py  ── Python 2.7
+        │   (HoughLinesP → polynomial fit → adaptive EMA steering)
+        │               │
+        │               ├──► /lane_controller/cmd_vel   (proposed Twist)
+        │               └──► /lane_controller/state     (OK / HOLD / STOP / DISABLED)
+        │                                │
+        └──► /object_detection/drive  (JSON detections)  -- detection
+             (TRAFFIC_STOP / STOP_SIGN override)
+                    ┌───────────────────┘
                     │          /odom
                     │            │
                     ▼            ▼
@@ -61,20 +65,30 @@ Camera
 
 **Key design principle:** the orchestrator (`n_orchestrator.py`) is the *sole* publisher of `/jetauto_controller/cmd_vel`. No other node touches the hardware command topic. This eliminates the race condition that previously occurred when `lane_controller_node` and `waypoint_manager_node` both published simultaneously during state transitions.
 
-The legacy `orchestrator.py` (base class, still imported as a library) and `new_orchestrator.py` (superseded experiment) live in `scripts/old/`; only `n_orchestrator.py` is launched.
+`n_orchestrator.py` is self-contained: the former base class `Orchestrator` (remap, drift fix, pure-pursuit, junction spin) is defined inline in the same file and `NewOrchestrator` extends it. The legacy `orchestrator.py` and `new_orchestrator.py` (superseded experiment) have been removed.
 
 ---
 
 ## 3. Node-by-node description
 
-### 3.1 `lane_follower.py` (Python 3)
+### 3.1 `perception_node.py` (Python 3)
 
-Runs the neural network. It is segmentation-only: it **never** publishes a velocity command — its only job is to produce the BEV segmentation mask.
+The merged perception node — runs in `--mode both` on the robot (one camera subscriber, one CUDA context, two models). It is **perception-only**: it **never** publishes a velocity command.
+
+Launched via `./run-models.sh` from `jetauto_autonomous/`; lives in `jetauto_autonomous/perception/`. TensorRT engines are placed in `jetauto_autonomous/perception/models/`.
 
 **What it outputs:**
-- `/lane_mask_bev` — the primary input to the control stack. A 320×128 (or scaled) bird's-eye-view binary mask where pixels are labelled by class: 0=background, 1=road, 2=lane_marking, 3=lane_dashed, 4=zebra.
+- `/lane_mask_bev` — the primary input to the control stack. A 320×128 bird's-eye-view binary mask, class labels: 0=background, 1=road, 2=lane_marking, 3=lane_dashed, 4=zebra. The BEV warp is calibrated on first run, then cached in `perception/calibration.json`.
+- `/object_detection/drive` — JSON `{"detections": [{class_name, score, box}]}`, consumed by the orchestrator's traffic-light/STOP override.
+- `/object_detection/video` — annotated detection overlay (optional, for the dashboard).
+- `/lane_follower/debug_image` — coloured segmentation overlay + BEV mask (when `--debug`, enabled by default).
 
-The BEV warp is calibrated once on first run (interactive corner selection), then cached in `calibration.json`.
+**Modes:**
+- `--mode both` (default): detection + segmentation in the same process/CUDA context.
+- `--mode detection`: object detection only (no `/lane_mask_bev` published).
+- `--mode segmentation`: lane segmentation only (no `/object_detection/*` published).
+
+> **Superseded:** `on_jetauto_scripts/drive_segm/lane_follower.py` was the original segmentation-only node, kept for reference only.
 
 ---
 
@@ -139,7 +153,7 @@ The **remap transform** (theta, scale, tx, ty) converts odom coordinates to the 
 
 ### 3.4 `n_orchestrator.py` (Python 2.7)
 
-The brain of the driving system. It is the only node that publishes to `/jetauto_controller/cmd_vel`. It subclasses the base `scripts/old/orchestrator.py` (which provides the remap machinery, drift correction, pure-pursuit and the junction spin) and overrides the per-tick decision logic — see the dedicated orchestrator doc for the full algorithm (blend, roundabout phases, failsafes).
+The brain of the driving system. It is the only node that publishes to `/jetauto_controller/cmd_vel`. It is self-contained: it defines a base `Orchestrator` class inline (the remap machinery, drift correction, pure-pursuit and the junction spin) and `NewOrchestrator` extends it, overriding the per-tick decision logic — see the dedicated orchestrator doc for the full algorithm (blend, roundabout phases, failsafes).
 
 **Inputs:**
 - `/lane_controller/cmd_vel` — what lane detection wants to do
@@ -149,14 +163,32 @@ The brain of the driving system. It is the only node that publishes to `/jetauto
 - `/waypoint_manager/path` — full path node IDs (for pure-pursuit)
 - `/odom` — robot pose (converted to MAP frame internally)
 - `/remap_transform` — coordinate frame update
+- `/object_detection/drive` — perception node's JSON detections, consumed by the
+  `object_detection.traffic_sign_handler.TrafficSignHandler` (called via function each tick;
+  red light / STOP sign → full-stop override). Set `traffic_light_enable: false` to ignore.
 
 **Outputs:**
 - `/jetauto_controller/cmd_vel` — the actual motor command
 - `/lane_controller/enable` — controls whether lane_controller runs its Hough loop
-- `/orchestrator/state` — FSM state for the dashboard (incl. `EMERGENCY_STOP`)
+- `/orchestrator/state` — FSM state for the dashboard (incl. `EMERGENCY_STOP`, plus the
+  transient object-detection overrides `TRAFFIC_STOP` / `STOP_SIGN`)
 - `/orchestrator/diag` — 13-field per-tick diagnostics (cross-track, blend, remap, …)
 - `/remap_transform` — re-published when the drift/straight corrections adjust the frame
 - `/waypoint_manager/goal` — empty goal to cancel navigation on emergency stop (and opt-in replan)
+
+---
+
+### 3.5 Startup sequence (updated)
+
+`start_all.sh` starts the Python 2.7 control stack (rosbridge, video server, dashboard, lane controller, waypoint manager, orchestrator). Then, in a separate conda terminal:
+
+```bash
+cd jetauto_autonomous
+./run-models.sh           # starts perception_node.py --mode both in the background
+./stop-models.sh          # graceful shutdown
+```
+
+The orchestrator-side consumer of `/object_detection/drive` is the small Python 2.7 module `jetauto_autonomous/scripts/object_detection/traffic_sign_handler.py`, called via function each tick. Set `object_detection_enable: false` in `lane_params.yaml` to ignore detections and run the driving stack on its own.
 
 ---
 
@@ -196,8 +228,9 @@ The brain of the driving system. It is the only node that publishes to `/jetauto
 
 ## 5. Driving decisions in detail
 
-> **Note** — this section describes the *base-class* logic (`scripts/old/orchestrator.py`)
-> that the FSM is built on. The running `n_orchestrator.py` replaces the alpha blend of §5.1
+> **Note** — this section describes the *base-class* logic (the `Orchestrator` class now
+> defined inline in `scripts/n_orchestrator.py`) that the FSM is built on. The running
+> `NewOrchestrator` in the same file replaces the alpha blend of §5.1
 > with a disagreement-driven `a_lane` blend, adds the ROUNDABOUT state (radial ring curve +
 > camera guardrail), the EMERGENCY_STOP failsafes, and continuous map-frame drift corrections.
 > See the dedicated orchestrator doc for the current algorithm; the JUNCTION and FALLBACK
@@ -290,8 +323,14 @@ Both `waypoint_manager_node` and `orchestrator` apply this transform independent
 
 Then, separately, in a conda terminal:
 ```bash
-python3 lane_follower.py --model model.engine --tensorrt
+cd jetauto_autonomous
+./run-models.sh           # both models (detection + segmentation)
+# ./run-models.sh detection     # detection only (no /lane_mask_bev)
+# ./run-models.sh segmentation  # segmentation only (no /object_detection/*)
 ```
+
+To disable traffic-light / STOP handling, set `object_detection_enable: false` in
+`lane_params.yaml` and restart the orchestrator (or run `--mode segmentation`).
 
 **What happens when a goal is sent from the dashboard:**
 1. Dashboard publishes `[start_id, end_id]` to `/waypoint_manager/goal`
@@ -307,8 +346,8 @@ python3 lane_follower.py --model model.engine --tensorrt
 
 | Topic | Type | Publisher | Subscribers | Notes |
 |---|---|---|---|---|
-| `/depth_cam/rgb/image_raw` | Image | hardware | lane_follower | 640×480 |
-| `/lane_mask_bev` | Image mono8 | lane_follower | lane_controller | BEV warped, 320×128 |
+| `/depth_cam/rgb/image_raw` | Image | hardware | perception_node | 640×480 |
+| `/lane_mask_bev` | Image mono8 | perception_node | lane_controller | BEV warped, 320×128 |
 | `/lane_controller/cmd_vel` | Twist | lane_controller | orchestrator | **proposed only, never to hardware** |
 | `/lane_controller/state` | String | lane_controller | orchestrator | OK/HOLD/STOP/DISABLED |
 | `/lane_controller/enable` | Bool (latched) | orchestrator | lane_controller | sole enable publisher |
@@ -317,7 +356,9 @@ python3 lane_follower.py --model model.engine --tensorrt
 | `/odom` | Odometry | hardware | waypoint_manager, orchestrator | robot pose |
 | `/remap_transform` | Float64MultiArray | dashboard, orchestrator | waypoint_manager, orchestrator | live frame update (orchestrator republishes its drift corrections) |
 | `/waypoint_manager/goal` | Int32MultiArray | dashboard, orchestrator | waypoint_manager | [start_id, end_id]; **empty = cancel** (used by the emergency stop) |
-| `/orchestrator/state` | String (latched) | orchestrator | dashboard | FSM state, incl. `EMERGENCY_STOP` |
+| `/object_detection/drive` | String (JSON) | perception_node | orchestrator | detections; drives the `TRAFFIC_STOP` / `STOP_SIGN` override |
+| `/object_detection/video` | Image bgr8 | perception_node | dashboard | annotated detection overlay (optional) |
+| `/orchestrator/state` | String (latched) | orchestrator | dashboard | FSM state, incl. `EMERGENCY_STOP` + transient `TRAFFIC_STOP` / `STOP_SIGN` |
 | `/orchestrator/diag` | Float64MultiArray | orchestrator | logging / plots | 13-field per-tick diagnostics (25 Hz) |
 | `/waypoint_manager/path` | Int32MultiArray (latched) | waypoint_manager | orchestrator | node IDs for pure-pursuit |
 | `/waypoint_manager/nav_info` | Float64MultiArray | waypoint_manager | orchestrator | 8-element, 25 Hz |
@@ -352,6 +393,8 @@ python3 lane_follower.py --model model.engine --tensorrt
 | `junction_spin_speed` | 0.40 rad/s | Max spin speed during rotation |
 | `map_drive_speed` | 0.04 m/s | Speed in FALLBACK pure-pursuit |
 | `map_kp` | 1.2 | Proportional gain for map heading correction |
+| `traffic_light_enable` | `true` | Object-detection override on/off (`false` = ignore detections, driving-only) |
+| `stop_sign_hold` | 3.0 s | How long to hold at a detected STOP sign |
 
 ---
 

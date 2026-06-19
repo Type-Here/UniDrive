@@ -19,7 +19,7 @@ lane_controller:
   # ---- Velocity ---- Validated Velocity linear_x_speed 0.10/0.15 m/s, max_angular_z 0.80/1.20 rad/s
   linear_x_speed: 0.15   # m/s forward
   max_linear_y:   0.08   # m/s strafe (mecanum)
-  max_angular_z:  0.90   # rad/s (classic)
+  max_angular_z:  0.50   # rad/s (classic)
 
   # ---- Drive mode ----
   drive_mode: "classic"  # "mecanum" -> linear.y | "classic" -> angular.z
@@ -93,46 +93,66 @@ waypoint_manager:
 # orchestrator — sole publisher of /jetauto_controller/cmd_vel
 # Owns: junction rotation, map fallback, lane/map blending
 #
-# Both orchestrator.py (classic) and new_orchestrator.py (experimental) read from
-# this same `orchestrator/` namespace — run one or the other, never both (same
-# node name). Most keys are shared; keys marked [new] are read ONLY by
-# new_orchestrator.py and are harmlessly ignored by the classic node.
+# n_orchestrator.py reads from this `orchestrator/` namespace. It bundles the base
+# Orchestrator (classic keys) plus the disagreement-blend extensions; keys marked
+# [new] drive those extensions.
 # =============================================================================
 orchestrator:
-  rate_hz: 25.0
+  rate_hz: 30.0
   stale_timeout: 0.5         # seconds before a stale proposal is treated as zero
+
+  # ---- Output limiting (keep commands inside the base's manual/calibrated envelope) ----
+  # The base /odom integrates the COMMANDED cmd_vel open-loop (no encoders; see
+  # docs/odometry_drift_analysis.md), so a command the robot can't physically follow
+  # becomes map drift. The driver clamps MANUAL cmd_vel to lin<=0.2, ang<=0.5; we mirror
+  # that and slew-limit the change so commanded ~= executed. Hard stops bypass the slew.
+  output_max_linear:   0.20   # m/s  hard clamp on |linear.x|,|linear.y| (matches driver app clamp)
+  output_max_angular:  0.60   # rad/s hard clamp on |angular.z|         (matches driver app clamp)
+  output_max_angular_inplace: 0.30  # [new] tighter angular cap for IN-PLACE rotation (linear=0): manual in-place spins are slow, and a slow pivot keeps the command-integrated yaw near the gyro so less error snaps in at spin-stop. Applied at the junction + roundabout exit spins; normal driving keeps output_max_angular.
+  output_accel_linear: 0.50   # m/s^2  max change rate of linear (0 = slew off, clamp only)
+  output_accel_angular: 3.0   # rad/s^2 max change rate of angular (0 = slew off, clamp only)
 
   # ---- Fallback blending (lane=primary; map only when lane lost) ----
   # alpha=0 -> pure lane (always during NAVIGATING)
   # alpha ramps 0->1 over hold_ramp_ticks when lane is HOLD/STOP
   hold_ramp_ticks: 22        # HOLD ticks before full FALLBACK (raised: a brief lane loss mid-turn shouldn't escalate before reacquire)
   recovery_ticks: 3          # consecutive OK+near ticks before exiting FALLBACK
-  fallback_recovery_radius: 0.50  # m — must be within this dist of a path node to exit FALLBACK
+  fallback_recovery_radius: 0.50  # m -- must be within this dist of a path node to exit FALLBACK
 
   # ---- Junction rotation ----
   junction_radius: 0.30      # m — distance to trigger the in-place spin maneuver
-  junction_influence_radius: 0.50  # m — distance over which the map blends the robot INTO the turn (new_orchestrator only). MUST exceed junction_radius, and stay BELOW the entry-segment length (e.g. node 6 fed by the 0.75m 5->6 segment) or the blend pulls toward the post-junction heading while still maneuvering the previous node (0.90 reached past node 5 onto the opposite straight). The magnitude term below — not the width — is what makes the turn engage.
+  junction_influence_radius: 0.40  # m -- distance over which the map blends the robot INTO the turn ([new]). MUST exceed junction_radius, and stay BELOW the entry-segment length (e.g. node 6 fed by the 0.75m 5->6 segment) or the blend pulls toward the post-junction heading while still maneuvering the previous node (0.90 reached past node 5 onto the opposite straight). The magnitude term below — not the width — is what makes the turn engage.
   junction_turn_full_deg: 50.0  # [new] map heading error at which the map fully takes over the approach blend (the magnitude term). Sized below a 90deg crossway so a real turn pulls hard while a near-straight junction barely pulls.
-  junction_align_deg: 14.0   # deg — lower so the spin completes more of the turn before lane takeover (was 22, curved too soon)
-  junction_spin_speed: 0.40  # rad/s cap for in-place rotation
+  junction_align_deg: 14.0   # deg -- lower so the spin completes more of the turn before lane takeover (was 22, curved too soon)
+  junction_spin_speed: 0.20  # rad/s cap for in-place rotation
+  junction_spin_creep: 0.0   # [new] m/s forward during the spin. A pure pivot (0) is the max-wheel-scrub, least odom-faithful mecanum motion; a small forward speed rolls it into an ARC (like manual/lane driving) and cuts the open-loop yaw drift a spin injects. Arcs wider as this grows -> tune on the robot. Applies to junction + roundabout exit spins.
   junction_alpha: 1.0        # spin blend weight on map heading: 1.0 = full map spin (lane hint off); <1.0 mixes in lane angular.z (0 if lane bad)
   # Anti-cut guardrail ([new], NAVIGATING approach only): while the line on the INSIDE
-  # of the turn is still confidently seen near the robot centre, scale the turn command
-  # toward straight so the robot waits until that line clears (the intersection opens)
-  # before committing — avoids cutting the corner into FALLBACK. Camera-frame, additive.
+  # of the turn is still validly SEEN ahead (the intersection has not opened yet), scale
+  # the turn command toward straight so the robot drives up to the node before committing
+  # — avoids cutting the corner (wide node-6 left turn). Releases when the inside line
+  # goes invalid (mouth opens) or is a dashed legal crossing. Camera-frame, additive.
   junction_lane_correct: true   # [new] master enable for the junction anti-cut guardrail
-  junction_inside_clear: 0.30   # [new] normalized clearance to the INSIDE line below which we hold the turn straighter
-  junction_lane_gain:    1.0    # [new] damping strength: scale = 1 - gain*severity (1.0 -> full straighten when the inside line is at centre)
+  junction_inside_clear: 0.30   # [new] anti-cut now HOLDS the turn straight while the inside line is still seen (intersection not yet open); this is the normalized band beyond the line's nominal lane-edge offset over which the hold eases off as the line recedes/drops out
+  junction_lane_gain:    1.0    # [new] damping strength: scale = 1 - gain*severity (1.0 -> full straighten while the inside line is at/inside its nominal position)
   junction_lane_floor:   0.0    # [new] minimum turn scale (0.0 -> may fully straighten; raise to keep some turn-in)
+
+  # ---- Dashed-separator lane change ([new]) ----
+  # When a junction turn points INTO a DASHED (legally crossable) inside line (e.g. 10->11),
+  # hold MAP authority (a_lane=0) through the crossing so the lane controller can't re-center
+  # into the original lane after the spin. Released once the dashed line shows on the OPPOSITE
+  # side (= crossed) or the budget expires.
+  dash_cross_enable:     true   # [new] master enable for the dashed-separator crossing hold
+  dash_cross_hold_ticks: 75     # [new] hold budget in ticks (~3 s at 25 Hz)
 
   # ---- Drift auto-correction ----
   # Position fix fires once per node when dist < drift_trigger_radius (NAVIGATING only).
   # Theta fix fires at each JUNCTION completion (robot intentionally aligned).
-  drift_pos_alpha: 0.0         # EMA weight for tx/ty (0=disabled, 1=snap)
-  drift_theta_alpha: 0.0       # EMA weight for theta (0=disabled, 1=snap)
+  drift_pos_alpha: 0.0         # EMA weight for tx/ty NODE-passage fix (0=disabled, 1=snap). Kept OFF: snapping position to a node on passage proved too imprecise (worse more often than better).
+  drift_theta_alpha: 0.3       # EMA weight for the JUNCTION-completion theta fix (0=disabled). Re-enabled: the in-place spin aligns to a KNOWN map heading, the cleanest yaw reference we have; the pivot-invariant override re-solves t so the robot's mapped pose stays put (no position jump).
   drift_min_correct_m: 0.03    # ignore errors smaller than this (noise floor)
   drift_max_correct_m: 0.50    # reject errors larger than this (broken remap)
-  drift_trigger_radius: 0.20   # m — fire position fix when closer than this to target node
+  drift_trigger_radius: 0.20   # m -- fire position fix when closer than this to target node
 
   # ---- Turn-angle-aware junction ----
   gentle_turn_deg: 20.0      # junctions with turn angle below this skip the rotation maneuver
@@ -141,7 +161,7 @@ orchestrator:
   # The classic node uses only roundabout_drive_speed (pure node pure-pursuit at
   # this speed). All other roundabout keys below are [new] (radial curve, camera
   # guardrail, off-reference failsafe) and ignored by the classic node.
-  roundabout_drive_speed: 0.10  # m/s — map-following speed inside roundabout
+  roundabout_drive_speed: 0.10  # m/s -- map-following speed inside roundabout
   # Curve following (item 1): per-segment radial arc through the ring nodes. [new]
   roundabout_lookahead_m:  0.25 # [new] carrot lookahead along the curve (smaller = hugs tighter, larger = smoother / less spin-in-place)
   roundabout_spline_res_m: 0.03 # [new] dense-curve sample spacing (m)
@@ -159,25 +179,31 @@ orchestrator:
   roundabout_offref_m:     0.40 # [new] m of deviation before tripping the stop
   roundabout_offref_ticks: 10   # [new] consecutive off-reference ticks (debounce)
   roundabout_conflict_c:   -0.5 # [new] lenient lane/map cosine-similarity threshold below which a roundabout conflict is counted (lane is unreliable here)
+  # Sharp-exit spin: a forward pure-pursuit arc can't drive a sharp exit turn (e.g.
+  # 28->23 doubling back ~160 deg) -- it sweeps wide and ends up perpendicular to the
+  # exit road. Above this heading error to the exit carrot, spin in place (linear=0,
+  # junction-style) until roughly aligned, then resume the pursuit drive out. [new]
+  roundabout_exit_spin_deg: 90.0 # [new] deg of heading error to the exit carrot above which to spin in place
 
-  # ---- Disagreement blend + conflict stop ([new] — new_orchestrator.py only) ----
-  # new_orchestrator blends lane vs map by the cosine similarity c between the
+  # ---- Disagreement blend + conflict stop ([new]) ----
+  # n_orchestrator blends lane vs map by the cosine similarity c between the
   # lane steering proxy and the map heading, and trips a terminal EMERGENCY_STOP
-  # when they sustainedly point >90 deg apart (c < 0). See new_orchestrator.md.
+  # when they sustainedly point >90 deg apart (c < 0). See n_orchestrator.md.
+  use_lane_heading: true     # [new] theta_l from the real lane heading (/lane_controller/info[1]); false = old angular.z proxy (A/B switch). proxy_max_deg below applies only when this is false / no lane geometry.
   conflict_ticks: 12         # [new] consecutive c<0 ticks before EMERGENCY_STOP (debounce)
-  conflict_onpath_m: 0.35    # [new] m — only judge a conflict while cross-track to the path is below this. Off-route (e.g. after cutting a corner) the bearing-to-next is large and c collapses to cos(theta_m), so a straight recovering lane would false-trip the stop; that excursion is a recovery FALLBACK owns, not a wrong-way.
+  conflict_onpath_m: 0.35    # [new] m -- only judge a conflict while cross-track to the path is below this. Off-route (e.g. after cutting a corner) the bearing-to-next is large and c collapses to cos(theta_m), so a straight recovering lane would false-trip the stop; that excursion is a recovery FALLBACK owns, not a wrong-way.
   proxy_max_deg:  80.0       # [new] full lane steer (angular.z) maps to this implied heading offset
 
-  # ---- Off-route GPS-style replan ([new] — new_orchestrator.py only, opt-in) ----
+  # ---- Off-route GPS-style replan ([new], opt-in) ----
   # OFF by default: localization-dependent and must never preempt a healthy lane.
   # When enabled it only republishes the goal for a fresh Dijkstra; it never seizes
   # steering. Trips after offroute_ticks ticks beyond 2*offroute_t of cross-track error.
   offroute_enable: false     # [new] master enable for the off-route replan
-  offroute_t:      0.40      # [new] m — off-route threshold (FALLBACK at >=t, REPLAN at >=2t)
+  offroute_t:      0.40      # [new] m -- off-route threshold (FALLBACK at >=t, REPLAN at >=2t)
   offroute_ticks:  10        # [new] consecutive off-route ticks before a replan (debounce)
-  replan_cooldown: 3.0       # [new] s — minimum interval between replans (avoid spamming the planner)
+  replan_cooldown: 3.0       # [new] s -- minimum interval between replans (avoid spamming the planner)
 
-  # ---- Lateral map re-centering (idea 3, [new] new_orchestrator.py only) ----
+  # ---- Lateral map re-centering (idea 3, [new]) ----
   # GPS-style: when the camera is confidently centred on a two-line lane on a STRAIGHT,
   # the robot is on the lane centerline = the map edge, so nudge the map position
   # perpendicular onto the edge. Removes the lateral drift that skips junctions (the
@@ -189,11 +215,67 @@ orchestrator:
   lateral_correct_alpha:  0.35   # [new] EMA weight PER CORRECTION toward the edge (sized up to offset the period)
   lateral_centered_clear: 0.15   # [new] max |center_offset| (normalized) to count as "centred"
   lateral_align_deg:      15.0   # [new] max robot-yaw vs segment-heading to count as "on a straight"
+  lateral_settle_ticks:   15     # [new] consecutive steady (centred+straight+glitch-free) NAVIGATING ticks required before the yaw/lateral re-pin fires -- blocks corrections mid-maneuver (catching a line, fresh out of FALLBACK) where a transient lane angle would be baked in. Higher = stricter/slower to trust the camera.
   lateral_min_correct_m:  0.03   # [new] ignore corrections below this (noise floor)
   lateral_max_correct_m:  0.40   # [new] reject corrections above this (broken localization)
+  lateral_theta_alpha:    0.18   # [new] EMA weight of the straight-line YAW fix (the missing half: a yaw error regenerates lateral error continuously). Lowered 0.25->0.18: less per-fire authority -> smaller one-signed steps and less position drag via the lever arm. 0 = yaw fix off.
+  lateral_theta_max_deg:  10.0   # [new] per-fire STEP cap on the yaw fix (deg). Was a hard reject -- a >10deg post-spin drift then stayed permanently uncorrectable; now rate-limits instead.
+  lateral_theta_reject_deg: 40.0 # [new] sanity bound (deg): yaw deltas above this are dropped as a bad lane/segment association (kept under the 45deg wrong-segment guard)
+  lateral_theta_max_cross_m: 0.40 # [new] max cross-track (m) at which the YAW re-pin still fires. Beyond this localization has already drifted, so seg_yaw is the wrong heading to pin to -- re-pinning amplifies into a conflict EMERGENCY_STOP (observed at cross=0.46m). Position branch is already bounded by lateral_max_correct_m; this is the yaw branch's missing UPPER bound.
+  # BEV/camera yaw bias: heading_rad (info[1]) reads a constant non-zero value on a CENTRED
+  # STRAIGHT (slightly rotated BEV warp / single-line read). The yaw fix trusts seg_yaw +
+  # heading_rad as truth, so that bias is baked into remap_theta every fire (one-signed), and
+  # the lever arm turns it into a steady map-frame drift (mapped pose walked south/east on the
+  # north road). Subtract the measured constant first. Measure: log /lane_controller/info[1]
+  # (heading_rad) mean on a known-straight, centred segment; set this (deg, SAME sign as info[1]).
+  lane_heading_bias_deg:  -2.0    # [new] constant BEV/lane heading bias subtracted from heading_rad (0 = off)
+  # In-place spins (junction / roundabout exit) integrate the COMMANDED rotation open-
+  # loop and inject tens of degrees of yaw drift that map-frame alignment cannot self-
+  # correct. After a spin, the first confident straight lane snaps remap_theta with this
+  # weight (a one-shot camera relock), then the rate-limited fix above handles residual.
+  yaw_relock_alpha:       0.7    # [new] EMA weight of the one-shot post-spin yaw re-pin (0 = relock off, fall back to the rate-limited fix)
+  # Yaw-glitch guard: /odom integrates WHATEVER publishes to /jetauto_controller/cmd_vel,
+  # so a foreign publisher (a stray joystick/teleop node) injecting a big angular.z spins
+  # the robot and dumps uncommanded yaw into odom -> map drift. We can't stop the physical
+  # spin (shared topic), but if the MEASURED odom yaw-rate exceeds the rate WE commanded by
+  # more than this, we suppress the camera yaw/lateral re-pin for a cooldown so the glitch
+  # is never baked into remap. (Root fix is still to not run those publishers.)
+  yaw_glitch_rate_thresh:   1.0  # [new] rad/s mismatch (measured odom rate vs commanded) that flags an uncommanded rotation
+  yaw_glitch_cooldown_ticks: 15  # [new] ticks to suppress the yaw/lateral re-pin after a glitch (~0.5 s @ 30 Hz)
+  # Gyro-bias feed-forward: subtract the constant gyro drift from raw odom yaw before
+  # anything downstream uses it (see odometry_drift_analysis.md). Measure it stopped: park
+  # 60 s, fit the slope of /odom yaw. SIGN = the observed drift rate (yaw drifting DOWN
+  # ~0.1 deg/s -> set -0.1). 0 = disabled (default; enable once measured on the robot).
+  gyro_bias_rate: 0.0          # [new] deg/s; constant gyro yaw drift to cancel
 
   # ---- Map pure-pursuit (FALLBACK state) ----
   lookahead_m: 0.50
-  map_drive_speed: 0.04      # m/s (slower than lane speed)
+  map_drive_speed: 0.10      # m/s (slower than lane speed)
   map_kp: 1.2                # angular.z = kp * heading_error
-  map_max_angular: 0.80      # rad/s clamp
+  map_max_angular: 0.50      # rad/s clamp
+
+  # ---- FALLBACK failsafe ([new]) ----
+  # FALLBACK is pure-pursuit on a localization that already proved doubtful (lane lost) —
+  # previously the one state with no excursion check. A sustained cross-track excursion,
+  # or simply staying in FALLBACK too long, now trips the shared terminal EMERGENCY_STOP.
+  fallback_offref_m:     0.60   # [new] m of cross-track from the pursued path before the stop
+  fallback_offref_ticks: 25     # [new] consecutive off-reference ticks (debounce, ~1 s at 25 Hz)
+  fallback_timeout_s:    60.0   # [new] max seconds in FALLBACK before the stop (0 = no timeout)
+  # Goal-orbit failsafe: pure-pursuit has no terminal node, so at the final waypoint it
+  # circles the goal forever (the mapped orbit radius can exceed the waypoint manager's
+  # arrival tolerance, so arrival never fires). A FALLBACK arrival is always degraded (a
+  # healthy run arrives in NAVIGATING), so a sustained presence at the goal ends the run.
+  fallback_goal_radius:  0.50   # [new] m from the final node within which to count goal-orbit ticks
+  fallback_goal_ticks:   50     # [new] consecutive such ticks before the terminal stop (~2 s at 25 Hz)
+
+  # ---- Object detection: traffic lights / STOP signs ([new]) ----
+  # Consumes the perception node's JSON detections on traffic_light_topic and
+  # overrides all driving with a full stop: a red light holds until a green is
+  # seen; a stop sign holds for stop_sign_hold seconds. Set enable=false to run
+  # the driving stack on its own (detections ignored).
+  object_detection_enable:     true                       # [new] false = driving-only
+  object_detection_topic:      "/object_detection/drive"  # [new] perception node output
+  traffic_light_red_label:  "red_TL"                   # [new] class name for red light
+  traffic_light_green_label: "green_TL"                # [new] class name for green light
+  stop_sign:                "stop_s"                    # [new] class name for stop sign
+  stop_sign_hold:           3.0                         # [new] seconds to hold at a stop sign

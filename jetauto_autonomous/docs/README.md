@@ -67,9 +67,7 @@ environment level; they communicate only via ROS topics.
 | `scripts/lane_controller_node.py` | ROS node: rosparam/pub/sub wiring, handles TRACKING/SINGLE/STOP/DISABLED states |
 | `scripts/lane_core.py` | Pure logic (no ROS): Hough, polynomial fit, steering with adaptive EMA - also importable from the offline tester |
 | `scripts/waypoint_manager_node.py` | ROS node: Dijkstra + waypoint sequencing; publishes `nav_info` (plans, does not drive) |
-| `scripts/n_orchestrator.py` | ROS node: sole publisher of `cmd_vel`; lane/map disagreement blend, junctions, roundabout, drift corrections, fallback pure-pursuit, terminal EMERGENCY_STOP |
-| `scripts/old/orchestrator.py` | Base class of `n_orchestrator` (remap, drift fix, pure-pursuit, junction spin) - imported as a library, no longer run as a node |
-| `scripts/old/new_orchestrator.py` | Superseded experimental orchestrator (kept for reference) |
+| `scripts/n_orchestrator.py` | ROS node, self-contained sole publisher of `cmd_vel`: bundles the base `Orchestrator` (remap, drift fix, pure-pursuit, junction spin) plus lane/map disagreement blend, junctions, roundabout, drift corrections, fallback pure-pursuit, terminal EMERGENCY_STOP |
 | `scripts/map_loader.py` | YAML loading + NetworkX graph, node classification |
 | `scripts/serve_dashboard.py` | Standalone mini HTTP server for the dashboard |
 | `config/lane_params.yaml` | All parameters (speeds, Hough thresholds, BEV, orchestrator, etc.) |

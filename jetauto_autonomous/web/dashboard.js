@@ -20,18 +20,20 @@ let currentTopicMode = 'camera';
 function topicForMode(mode) {
   if (mode === 'camera')  return CONFIG.topic_camera;
   if (mode === 'lfDebug') return CONFIG.topic_lfDebug;
+  if (mode === 'objDet')  return CONFIG.topic_objDet;
   return CONFIG.topic_debug;
 }
 
 function labelForMode(mode) {
   if (mode === 'camera')  return CONFIG.topic_camera;
   if (mode === 'lfDebug') return CONFIG.topic_lfDebug;
+  if (mode === 'objDet')  return CONFIG.topic_objDet;
   return CONFIG.topic_debug;
 }
 
 function switchTopic(mode) {
   currentTopicMode = mode;
-  ['camera', 'debug', 'lfDebug'].forEach(m => {
+  ['camera', 'debug', 'lfDebug', 'objDet'].forEach(m => {
     const id = 'btn' + m.charAt(0).toUpperCase() + m.slice(1);
     document.getElementById(id).classList.toggle('active', m === mode);
   });
@@ -47,6 +49,7 @@ function renderVideo(topic) {
   QUALITY[CONFIG.topic_camera]  = 30;
   QUALITY[CONFIG.topic_debug]   = 65;
   QUALITY[CONFIG.topic_lfDebug] = 40;
+  QUALITY[CONFIG.topic_objDet]  = 50;
   const quality = QUALITY[topic] !== undefined ? QUALITY[topic] : 40;
   const url   = `${CONFIG.video_server_url}/stream?topic=${topic}&type=mjpeg&quality=${quality}`;
   wrap.innerHTML = '';
@@ -118,8 +121,17 @@ function setupTopics() {
       }
     });
 
-  new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 200, queue_length: 1 })
+  new ROSLIB.Topic({ ros, name: '/odom', messageType: 'nav_msgs/Odometry', throttle_rate: 66, queue_length: 1 })
     .subscribe(m => updateOdom(m));
+
+  new ROSLIB.Topic({ ros, name: '/remap_transform', messageType: 'std_msgs/Float64MultiArray', throttle_rate: 500, queue_length: 1 })
+    .subscribe(m => {
+      if (m.data.length < 4) return;
+      mapTransform.theta = m.data[0];
+      mapTransform.scale = m.data[1];
+      mapTransform.tx    = m.data[2];
+      mapTransform.ty    = m.data[3];
+    });
 
   new ROSLIB.Topic({ ros, name: '/orchestrator/state', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => {
@@ -144,12 +156,20 @@ function setupTopics() {
         b.style.display = '';
         b.className = 'badge nav';
         b.textContent = 'ROUNDABOUT';
+      } else if (s === 'TRAFFIC_STOP') {
+        b.style.display = '';
+        b.className = 'badge stop';
+        b.textContent = '🚦 RED LIGHT';
+      } else if (s === 'STOP_SIGN') {
+        b.style.display = '';
+        b.className = 'badge single-line';
+        b.textContent = '🛑 STOP SIGN';
       } else {
         b.style.display = 'none';
       }
     });
 
-  new ROSLIB.Topic({ ros, name: '/waypoint_manager/nav_info', messageType: 'std_msgs/Float64MultiArray', throttle_rate: 200, queue_length: 1 })
+  new ROSLIB.Topic({ ros, name: '/waypoint_manager/nav_info', messageType: 'std_msgs/Float64MultiArray', throttle_rate: 100, queue_length: 1 })
     .subscribe(m => {
       if (!svgViewBox || !mapData || m.data.length < 8) return;
       const isActive = m.data[7] > 0.5;
@@ -212,9 +232,10 @@ function updateOdom(msg) {
   const siny = 2*(q.w*q.z + q.x*q.y);
   const cosy = 1 - 2*(q.y*q.y + q.z*q.z);
 
-  // save raw position for calibration
+  // save raw position + yaw for calibration / quick remap
   lastRawOdom.x = p.x;
   lastRawOdom.y = p.y;
+  lastRawYaw    = Math.atan2(siny, cosy);   // gyro-fused odom heading (rad)
 
   // transform raw odom -> map frame using current calibration/remap transform
   const mapped = odomToMap(p.x, p.y);
@@ -223,6 +244,7 @@ function updateOdom(msg) {
   document.getElementById('odomY').textContent   = mapped.y.toFixed(3);
   document.getElementById('odomYaw').textContent = (Math.atan2(siny,cosy)*180/Math.PI).toFixed(1);
   document.getElementById('odomVx').textContent  = Math.hypot(v.x, v.y).toFixed(3);
+  document.getElementById('remapTheta').textContent = (mapTransform.theta*180/Math.PI).toFixed(1);
   updateRobot(mapped.x, mapped.y);
 
   // Show nearest node estimate — helps user choose correct start before NAVIGA
@@ -397,6 +419,7 @@ function renderMap() {
 // inverse (odomToMap):                   map  = R(-θ) / scale * (odom - t)
 let mapTransform = { theta: 0, scale: 1, tx: 0, ty: 0 };
 let lastRawOdom  = { x: 0, y: 0 };   // last raw position received from /odom
+let lastRawYaw   = 0;                 // last raw odom heading (rad), for quick remap
 let currentPath  = [];                // active path received from /waypoint_manager/path
 
 // --- Route snapping ----------------------------------------------------------
@@ -605,6 +628,53 @@ document.getElementById('calibBtn').onclick = () => {
     btn.style.color = '';
     btn.style.borderColor = '';
   }, 2000);
+};
+
+// --- Quick Remap (static single-pose alignment, no driving) -------------------
+// Solve the FULL remap (theta + tx/ty) from the robot's current odom pose alone,
+// assuming it is placed AT the Start node and facing along the Start->next-node
+// edge. Unlike the drive-based Remap it needs no motion, so it is immune to the
+// short-baseline angle amplification and odom drift that a brief measured drive
+// suffers; theta comes straight from the gyro-fused odom yaw. Scale is preserved
+// from the existing transform (odom is already metric + correction-factored).
+//   map_yaw = odom_yaw - theta, and we want map_yaw = heading(Start->next), so
+//   theta = odom_yaw - heading;  then t solved so the Start node maps to the
+//   current odom position (same convention as Remap/Calibra).
+document.getElementById('quickRemapBtn').onclick = () => {
+  if (!mapData) { alert('Mappa non caricata'); return; }
+  const startId = +document.getElementById('startInput').value;
+  const nodeA   = mapData.nodes[startId];
+  if (!nodeA) { alert('Nodo Start non valido'); return; }
+
+  const fwd = findForwardPath(startId, 1);
+  if (fwd.path.length < 2) {
+    alert('Nessun nodo in avanti dalla Start per definire la direzione. Controlla la mappa.');
+    return;
+  }
+  const nodeB = mapData.nodes[fwd.path[1]];
+  const heading = Math.atan2(nodeB.y - nodeA.y, nodeB.x - nodeA.x);  // map-frame dir Start->next
+
+  const scale = mapTransform.scale || 1;                 // keep existing scale
+  const theta = lastRawYaw - heading;                    // odom_yaw - heading
+  const cosT  = Math.cos(theta), sinT = Math.sin(theta);
+  mapTransform = {
+    theta, scale,
+    tx: lastRawOdom.x - scale * (cosT * nodeA.x - sinT * nodeA.y),
+    ty: lastRawOdom.y - scale * (sinT * nodeA.x + cosT * nodeA.y)
+  };
+  publishAndSaveTransform();
+  document.getElementById('mapFrame').textContent = (mapData.frame || 'odom') + ' ✓remapped';
+
+  const btn = document.getElementById('quickRemapBtn');
+  const orig = btn.textContent;
+  btn.textContent = '✓ Quick remap';
+  btn.style.background  = 'rgba(54,211,153,.18)';
+  btn.style.color       = 'var(--green)';
+  btn.style.borderColor = 'var(--green)';
+  setTimeout(() => {
+    btn.textContent = orig;
+    btn.style.background = btn.style.color = btn.style.borderColor = '';
+  }, 3000);
 };
 
 // --- Remap (auto-drive similarity transform) ----------------------------------

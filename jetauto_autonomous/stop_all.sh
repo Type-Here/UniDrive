@@ -5,14 +5,14 @@
 # Stop all processes started by start_all.sh, reading PIDs from
 # /tmp/jetauto_autonomous.pids, then sweep any orphans by name (a stale or
 # overwritten PID file would otherwise leave nodes running — the recurring
-# "zombie new_orchestrator.py" problem).
+# "zombie n_orchestrator.py" problem).
 # =============================================================================
 
 PID_FILE="/tmp/jetauto_autonomous.pids"
 
 # Same patterns as the start_all.sh pre-check. Python-prefixed so an editor
 # with the file open is not killed; "orchestrator.py" matches
-# orchestrator/new_orchestrator/nn_orchestrator.
+# n_orchestrator.py (and any legacy *orchestrator.py).
 ZOMBIE_PATTERNS=(
   "python.*orchestrator\.py"
   "python.*lane_controller_node\.py"

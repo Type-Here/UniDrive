@@ -1,6 +1,9 @@
 # Lane Segmentation Pipeline
 
-Fine-tuning pipeline for SegFormer on a custom lane marking dataset.
+Fine-tuning pipeline for a compact semantic-segmentation model on a custom lane-marking
+dataset. The default backbone is **MobileNetV3-Large + LR-ASPP** (best accuracy/speed
+balance on the Jetson); **FastSCNN** and **SegFormer (MiT-B0/B1)** are also supported via
+`config.yaml` or `--model`.
 
 ## Project structure
 
@@ -18,7 +21,7 @@ data/
         images/               original JPGs from LabelMe
         labels/               LabelMe JSON files (same stem as image)
     dataset/
-        train/images/         preprocessed training images (640x256)
+        train/images/         preprocessed training images (320x128)
         train/masks/          segmentation masks (uint8, values 0-4)
         val/
         test/
@@ -61,7 +64,12 @@ pip install torch torchvision transformers albumentations \
 
 # Optional for export verification and simplification
 pip install onnxruntime onnx onnxsim
+
+# Optional, only for the fastscnn / segformer backbones
+pip install segmentation-models-pytorch transformers
 ```
+
+> The default `mobilenet_v3` backbone needs only `torch` + `torchvision`.
 
 ## Step by step
 
@@ -76,8 +84,8 @@ paths:
 
 image:
   crop_top_frac: 0.45    # fraction of image height to remove from top
-  model_h: 256           # must be multiple of 32
-  model_w: 640
+  model_h: 128           # must be multiple of 32
+  model_w: 320
 
 training:
   epochs: 100
@@ -86,7 +94,7 @@ training:
   class_weights: [0.5, 1.0, 3.0, 4.0, 5.0]   # update from step 1 output
 
 model:
-  name: "nvidia/mit-b1"  # or "nvidia/mit-b0" for lighter model
+  name: "mobilenet_v3"   # default; also: fastscnn | segformer-b0 | segformer-b1
 ```
 
 ### 2. Prepare dataset
@@ -102,9 +110,12 @@ Outputs:
 
 **Relevant Operations:**
 - Crop top 45% of image to remove sky/noise and focus on road
-- Resize to 640x256 (must be multiple of 32 for SegFormer)
+- Resize to 320x128 (W x H; both must be multiples of 32)
 - Convert LabelMe JSON annotations to single-channel masks with class IDs
-- Train/val/test split (80/10/10 by default)
+  (rendered in class order so precise classes overwrite coarse ones on overlap)
+- Train/val/test split (70/15/15 by default), **stratified by illumination prefix**
+  (`normal_`, `reflex_`, `night_`) so every lighting condition is proportionally
+  represented in each split
 - Calculate class frequencies and suggest `class_weights` to handle imbalance
 
 **Notes:**
@@ -140,16 +151,17 @@ The formula applied per channel is:
 ```
     pixel_out = (pixel_in / 255.0 - mean) / std
 ```
-This because SegFormer's backbone (MixTransformer, mit-b1) was pretrained on ImageNet.
+This because the pretrained backbone (MobileNetV3, or MixTransformer for SegFormer) was
+trained on ImageNet. The same constants are used at inference time in `lane_follower.py`.
 
 ### 4. Train
 
 ```bash
-# B1 model (default)
+# Default model (MobileNetV3-Large + LR-ASPP)
 python3 3_train.py --config config.yaml
 
-# B0 model (lighter, faster on Jetson Nano)
-python3 3_train.py --config config.yaml --model nvidia/mit-b0
+# Override the backbone: mobilenet_v3 | fastscnn | segformer-b0 | segformer-b1
+python3 3_train.py --config config.yaml --model segformer-b0
 
 # Resume after interruption
 python3 3_train.py --config config.yaml --resume checkpoints/last.pth
@@ -175,8 +187,9 @@ The weights help to balance classes that are underrepresented in the dataset.
 which is a common choice for fine-tuning transformer-based models.
 
 #### Scheduler
-**CosineAnnealingLR** with `T_max` equal to the number of epochs, which gradually reduces the learning rate 
-following a cosine curve, allowing for better convergence.  
+**CosineAnnealingLR** with `T_max = epochs - warmup_epochs` and `eta_min = 1e-7`, which gradually
+reduces the learning rate following a cosine curve, allowing for better convergence.
+(`scheduler: poly` with power 0.9 is also available.)
 A warmup phase is implemented in the first 5 epochs where the learning rate starts from a small value 
 and increases to the initial learning rate, which can help stabilize training in the early stages.
 
@@ -232,6 +245,13 @@ python3 5_export.py --checkpoint checkpoints/best.pth \
                     --simplify --verify
 ```
 
+The export wraps the model so the ONNX graph is self-contained: it upsamples logits to
+320x128 and returns the per-pixel `argmax` as a `(B, H, W)` int64 mask, so the consumer
+gets a ready-to-use class map. For **TensorRT 8.2.1 on the Jetson**, the default `opset 11`
+uses the legacy tracer with a **static batch size of 1** (LayerNorm is decomposed into
+primitives TRT 8.2.1 supports; dynamic batch is only used for opset > 11). `--simplify`
+runs onnx-simplifier; `--verify` checks ONNX Runtime output against PyTorch (atol 1e-3).
+
 ### 7. Convert to TensorRT on Jetson Nano
 
 ```bash
@@ -261,6 +281,8 @@ Run `1_prepare_dataset.py` and copy the suggested `class_weights` into
 Reduce `batch_size` in config or pass `--batch 4` on the command line.
 With B0 and batch 4 you need about 6 GB VRAM.
 
-**B0 vs B1:**
-Train B1 first for best accuracy. If it does not meet the FPS requirement
-on the Jetson, retrain with B0 using the same config.
+**Choosing a backbone:**
+`mobilenet_v3` (default) is the best accuracy/speed balance on the Jetson. If you need
+higher accuracy and can afford the latency, try `segformer-b1`; if SegFormer does not meet
+the FPS requirement on the Jetson, fall back to `segformer-b0` or `mobilenet_v3` with the
+same config.

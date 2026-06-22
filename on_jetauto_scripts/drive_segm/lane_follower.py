@@ -50,7 +50,7 @@ import rospy
 # cv_bridge is not used -- raw numpy conversion avoids Python 2/3 issues
 from sensor_msgs.msg import Image
 
-from auto_calibration import AutoCalibration
+from jetauto_autonomous.perception.auto_calibration import AutoCalibration
 
 import ctypes
 import ctypes.util

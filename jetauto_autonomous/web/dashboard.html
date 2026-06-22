@@ -29,6 +29,7 @@
         <button class="topic-btn active" id="btnCamera"  onclick="switchTopic('camera')">📷 Camera raw</button>
         <button class="topic-btn" id="btnDebug"   onclick="switchTopic('debug')">🔍 Controller (mask+linea)</button>
         <button class="topic-btn" id="btnLfDebug" onclick="switchTopic('lfDebug')">🛤 Follower (BEV+err)</button>
+        <button class="topic-btn" id="btnObjDet"  onclick="switchTopic('objDet')">🎯 Object Detection</button>
       </div>
 
       <!-- Drive enable/disable -->
@@ -74,6 +75,7 @@
       <span>Y: <b id="odomY">--</b> m</span>
       <span>θ: <b id="odomYaw">--</b>°</span>
       <span>|v|: <b id="odomVx">--</b> m/s</span>
+      <span>remap θ: <b id="remapTheta">--</b>°</span>
     </div>
 
     <!-- Waypoint / navigation controls -->
@@ -93,6 +95,7 @@
       <button class="btn stop"  id="stopBtn" title="Annulla navigazione corrente">■ STOP NAV</button>
       <button class="btn calib" id="calibBtn" title="Imposta posizione attuale come origine del nodo Start selezionato">⊕ Calibra</button>
       <button class="btn remap" id="remapBtn" title="Guida automaticamente 1 nodo avanti (~45 cm) e calibra rotazione + scala">🔄 Remap</button>
+      <button class="btn remap" id="quickRemapBtn" title="Calibra rotazione + posizione dalla posa odometrica corrente (robot fermo sul nodo Start, rivolto verso il nodo successivo) — niente guida">⚡ Quick remap</button>
       <button class="btn ghost" id="remapInfoBtn" style="padding:7px 10px;" title="Come usare Remap">ⓘ</button>
     </div>
   </section>
@@ -120,6 +123,7 @@
     <li>Il robot si ferma dopo ~45 cm (failsafe timeout 1.5×)</li>
     <li>La mappa viene ricalibrata: <b>traslazione + rotazione + scala</b></li>
     <li><b>⚠ Timeout</b>: odometria lenta o robot fermo — riposiziona e riprova</li>
+    <li><b>⚡ Quick remap</b> (alternativa, senza guida): posiziona il robot sul nodo Start <b>rivolto verso il nodo successivo</b> e premi — calcola rotazione + traslazione dalla posa odometrica attuale (rotazione dallo yaw fuso col giroscopio). Più robusto agli errori di posizione/baseline; richiede però un buon allineamento angolare manuale</li>
   </ol>
   <button class="btn ghost" onclick="toggleRemapInfo(false)" style="width:100%;margin-top:6px;">✕ Chiudi</button>
 </div>
@@ -135,6 +139,7 @@ const CONFIG = {
   topic_camera:     '/depth_cam/rgb/image_raw',
   topic_debug:      '/lane_debug/image',
   topic_lfDebug:    '/lane_follower/debug_image',
+  topic_objDet:     '/object_detection/video',
 };
 
 const NAV_CONFIRM_DIST = 0.30;  // m — below this, proceed silently

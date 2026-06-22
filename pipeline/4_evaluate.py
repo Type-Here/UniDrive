@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import yaml
 from transformers import SegformerForSemanticSegmentation
-
+SEGFORMER_MODELS = ("segformer-b0", "segformer-b1", "nvidia/mit-b0", "nvidia/mit-b1")
 
 # -- Config --------------------------------------------------------------------
 
@@ -80,13 +80,13 @@ def load_model(checkpoint_path: Path, device: torch.device):
             classes=num_cls,
         )
 
-    elif model_name in ("segformer-b0", "segformer-b1"):
+    elif model_name in SEGFORMER_MODELS:
         from transformers import SegformerForSemanticSegmentation
         model_cfg = cfg["model"]
         id2label  = {int(k): v for k, v in model_cfg["id2label"].items()}
         label2id  = model_cfg["label2id"]
-        hf_name   = ("nvidia/mit-b0" if model_name == "segformer-b0"
-                     else "nvidia/mit-b1")
+        hf_name   = ("nvidia/mit-b1" if model_name in ("segformer-b1", "nvidia/mit-b1")
+                     else "nvidia/mit-b0")
         base_model = SegformerForSemanticSegmentation.from_pretrained(
             hf_name,
             num_labels=num_cls,
@@ -163,10 +163,10 @@ def predict_batch(model, images: torch.Tensor,
                   model_name: str) -> torch.Tensor:
     with torch.no_grad():
         outputs = model(pixel_values=images.to(device)) \
-            if model_name in ("segformer-b0", "segformer-b1") \
+            if model_name in SEGFORMER_MODELS \
             else model(images.to(device))
 
-        if model_name in ("segformer-b0", "segformer-b1"):
+        if model_name in SEGFORMER_MODELS:
             logits = outputs.logits
         else:
             logits = outputs["out"]

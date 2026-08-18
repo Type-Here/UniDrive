@@ -1,7 +1,35 @@
-from typing import Union
+"""
+BEV auto-calibration: find the four lane corners in a segmentation mask and
+build the perspective warp that turns the mask into a bird's-eye view.
+
+The calibration is split into three independent steps so that a caller can
+preview a candidate calibration before committing to it (see
+``bev_calibration_session.py``):
+
+    compute()      pure -- scans the mask, returns a CalibrationResult.
+                   Touches no instance state and writes nothing.
+    apply_points() commits a result into this instance (invalidates the
+                   cached warp matrix).
+    save()         persists the committed calibration to JSON (atomic).
+
+``calibrate()`` is the original one-shot convenience wrapper that chains all
+three; it is kept so existing callers (offline tester, legacy lane_follower)
+work unchanged.
+"""
+import json
+import os
+from collections import namedtuple
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import cv2
+
+
+# Result of a calibration attempt. ``ok`` False means nothing usable was found
+# and ``reason`` carries a human-readable explanation (surfaced in the UI).
+CalibrationResult = namedtuple(
+    "CalibrationResult", ["ok", "src_points", "angle", "reason"])
+
 
 class AutoCalibration:
     def __init__(self, top_line:int, bottom_line:Union[int, None],
@@ -24,23 +52,41 @@ class AutoCalibration:
         else:
             self._use_cuda = False
 
-    def calibrate(self, segm_output:np.ndarray, lane_label:int) -> float:
+    # -- Calibration steps -----------------------------------------------------
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self._last_src_pts is not None
+
+    @property
+    def src_points(self) -> Optional[np.ndarray]:
+        return self._last_src_pts
+
+    def compute(self, segm_output: np.ndarray, lane_label: int) -> CalibrationResult:
         """
-        Given the segmentation output, compute the average x position of the lane pixels
-        in the masked area. This can be used to estimate the horizontal offset of the lane.
+        Scan the segmentation mask for the lane corners and derive the warp
+        source points, WITHOUT modifying this instance and WITHOUT saving.
+
+        Looks at two rows (``top_line`` and ``bottom_line``): the leftmost and
+        rightmost pixel carrying ``lane_label`` on each row give the four
+        corners TL, TR, BR, BL.
         """
         # Here we suppose that top-left mask image is point (0,0)
         mask_w = segm_output.shape[1]
         mask_h = segm_output.shape[0]
 
         if not (0 <= self.top_line < mask_h):
-            print("Warning: top_line is out of bounds.")
-            return 0.0
+            return CalibrationResult(
+                False, None, 0.0,
+                "top_line (%d) out of bounds for a %d-row mask"
+                % (self.top_line, mask_h))
 
         bottom = self.bottom_line if self.bottom_line is not None else mask_h - 1
         if not (self.top_line < bottom < mask_h):
-            print("Warning: bottom_line is out of bounds.")
-            return 0.0
+            return CalibrationResult(
+                False, None, 0.0,
+                "bottom_line (%d) out of bounds for a %d-row mask"
+                % (bottom, mask_h))
 
         # Find TL, TR points: use top_line height and search for
         # the first pixel and the last pixel with lane_label
@@ -48,8 +94,11 @@ class AutoCalibration:
         row = segm_output[self.top_line]
         lane_pixels = np.where(row == lane_label)[0]  # get x indices of lane pixels in the top line
         if lane_pixels.size == 0:
-            print("Warning: no lane pixels found in the top line.")
-            return 0.0
+            return CalibrationResult(
+                False, None, 0.0,
+                "no lane pixels on the top line (row %d): aim the camera at a "
+                "stretch of road where both lane markings are visible"
+                % self.top_line)
 
         tl = lane_pixels[0]  # leftmost lane pixel
         tr = lane_pixels[-1] # rightmost lane pixel
@@ -57,8 +106,12 @@ class AutoCalibration:
         bottom_row = segm_output[bottom]
         lane_pixels_bottom = np.where(bottom_row == lane_label)[0]
         if lane_pixels_bottom.size == 0:
-            print("Warning: no lane pixels found in the bottom line.")
-            return 0.0
+            return CalibrationResult(
+                False, None, 0.0,
+                "no lane pixels on the bottom line (row %d): aim the camera at "
+                "a stretch of road where both lane markings are visible"
+                % bottom)
+
         bl = lane_pixels_bottom[0]
         br = lane_pixels_bottom[-1]
 
@@ -68,14 +121,12 @@ class AutoCalibration:
         bl = max(0, bl - 10)
         br = min(mask_w - 1, br + 10)
 
-        # Store last calibration points for BEV warp
-        self._last_src_pts = np.float32([
+        src_pts = np.float32([
             [tl, self.top_line],
             [tr, self.top_line],
             [br, bottom],
             [bl, bottom],
         ])
-        self._cached_M = None  # invalidate cached matrix on recalibration
 
         # Calculate the angle to warp image based on tl, tr, bl, br point in order to get them aligned vertically
         # We can use the average of the angles between (tl, bl) and (tr, br)
@@ -84,30 +135,61 @@ class AutoCalibration:
         angle_tr_br = np.arctan2(dy, br - tr)
         angle = (angle_tl_bl + angle_tr_br) / 2
         angle = float(np.clip(angle, -self.max_angle, self.max_angle))
-        self.calibration_angle = angle
 
-        # Save src points and angle in json file as
-        # points and angle names
-        with open(self.save_path, "w") as f:
-            import json
-            json.dump({
-                "src_points": self._last_src_pts.tolist(),
-                "calibration_angle": self.calibration_angle,
-            }, f, indent=2)
+        return CalibrationResult(True, src_pts, angle, "")
 
+    def apply_points(self, src_points: np.ndarray, angle: float) -> None:
+        """Commit a calibration into this instance (used from the next frame on)."""
+        self._last_src_pts = np.float32(src_points)
+        self.calibration_angle = float(angle)
+        self._cached_M = None  # invalidate cached matrix on recalibration
 
-        return angle
+    def save(self, path: str = None) -> str:
+        """
+        Persist the committed calibration as JSON. Written to a temporary file
+        and renamed, so a crash mid-write cannot leave a truncated file behind.
+        Returns the path written.
+        """
+        if self._last_src_pts is None:
+            raise ValueError("nothing to save: no calibration has been applied")
+        target = path or self.save_path
+        payload = {
+            "src_points": np.asarray(self._last_src_pts).tolist(),
+            "calibration_angle": self.calibration_angle,
+        }
+        tmp = target + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, target)
+        return target
 
+    def calibrate(self, segm_output:np.ndarray, lane_label:int) -> float:
+        """
+        One-shot calibration: compute, commit and save. Returns the calibration
+        angle, or 0.0 if no lane corners could be found (in which case nothing
+        is committed and nothing is written).
+        """
+        result = self.compute(segm_output, lane_label)
+        if not result.ok:
+            print("Warning: " + result.reason)
+            return 0.0
+        self.apply_points(result.src_points, result.angle)
+        self.save()
+        return result.angle
 
-    def _compute_warp_points(self, segm_output: np.ndarray):
+    # -- Warp ------------------------------------------------------------------
+
+    def _compute_warp_points(self, segm_output: np.ndarray,
+                             src_pts: np.ndarray = None):
         mask_w = segm_output.shape[1]
         mask_h = segm_output.shape[0]
         bottom = self.bottom_line if self.bottom_line is not None else mask_h - 1
         if not (0 <= self.top_line < bottom < mask_h):
             return None
-        if self._last_src_pts is None:
+        if src_pts is None:
+            src_pts = self._last_src_pts
+        if src_pts is None:
             return None
-        src_pts = self._last_src_pts
         # dst_pts span the full output height so warpPerspective stretches directly
         # to the final size -- no separate crop+resize needed
         dst_pts = np.float32([
@@ -116,7 +198,7 @@ class AutoCalibration:
             [mask_w - 1.0, mask_h - 1.0],
             [0.0, mask_h - 1.0],
         ])
-        return bottom, src_pts, dst_pts
+        return bottom, np.float32(src_pts), dst_pts
 
     @staticmethod
     def _colorize_mask(mask_u8: np.ndarray) -> np.ndarray:
@@ -129,24 +211,38 @@ class AutoCalibration:
         ], dtype=np.uint8)
         return colors[mask_u8.clip(0, 4)]
 
-    def save_debug(self, segm_output: np.ndarray, prefix: str = "lane_calibration") -> None:
+    def render_debug(self, segm_output: np.ndarray, src_pts: np.ndarray = None
+                     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Build the two calibration debug images in memory (BGR):
+
+            points  colorized mask with the four source corners marked
+            warp    the BEV those corners produce (None if not calibrated)
+
+        ``src_pts`` lets a caller preview a *candidate* calibration without
+        committing it; defaults to the committed one.
+        """
         mask_u8 = segm_output.astype(np.uint8, copy=False)
         mask_h, mask_w = mask_u8.shape[:2]
         colored = self._colorize_mask(mask_u8)
-        pts = self._compute_warp_points(mask_u8)
+        pts = self._compute_warp_points(mask_u8, src_pts)
         if pts is None:
-            cv2.imwrite(prefix + "_points.jpg", colored)
-            return
-        bottom, src_pts, dst_pts = pts
+            return colored, None
+        bottom, src, dst = pts
         vis = colored.copy()
-        for (x, y) in src_pts:
+        for (x, y) in src:
             cv2.circle(vis, (int(x), int(y)), 5, (255, 255, 255), -1)
-        cv2.imwrite(prefix + "_points.jpg", vis)
-        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        M = cv2.getPerspectiveTransform(src, dst)
         warped = cv2.warpPerspective(
             colored, M, (mask_w, mask_h),
             flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        cv2.imwrite(prefix + "_warp.jpg", warped)
+        return vis, warped
+
+    def save_debug(self, segm_output: np.ndarray, prefix: str = "lane_calibration") -> None:
+        points_img, warp_img = self.render_debug(segm_output)
+        cv2.imwrite(prefix + "_points.jpg", points_img)
+        if warp_img is not None:
+            cv2.imwrite(prefix + "_warp.jpg", warp_img)
 
     def make_bev(self, segm_output:np.ndarray) -> np.ndarray:
         """
@@ -162,8 +258,16 @@ class AutoCalibration:
 
         pts = self._compute_warp_points(segm_output)
         if pts is None:
+            # Uncalibrated fallback: plain crop of the near region, stretched
+            # back to the full mask size. Keeping the output shape constant
+            # matters -- downstream consumers (lane_controller) size their ROI
+            # and pixel thresholds off it.
             bottom = self.bottom_line if self.bottom_line is not None else mask_h - 1
-            return segm_output[self.top_line:bottom, :]
+            crop = segm_output[self.top_line:bottom, :]
+            if crop.size == 0:
+                return segm_output.astype(np.uint8, copy=False)
+            return cv2.resize(crop.astype(np.uint8, copy=False), (mask_w, mask_h),
+                              interpolation=cv2.INTER_NEAREST)
 
         bottom, src_pts, dst_pts = pts
 

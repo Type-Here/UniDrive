@@ -279,3 +279,41 @@ orchestrator:
   traffic_light_green_label: "green_TL"                # [new] class name for green light
   stop_sign:                "stop_s"                    # [new] class name for stop sign
   stop_sign_hold:           3.0                         # [new] seconds to hold at a stop sign
+
+
+# =============================================================================
+# perception_supervisor_node -- start/stop the Python 3 perception node from the
+# dashboard, and tell the dashboard whether a BEV calibration exists.
+#
+# The perception node runs in a conda Python 3.6 environment, while this stack
+# runs on the system Python 2.7. run-models.sh activates the environment itself
+# when conda_env is set below, so the supervisor (which inherits start_all.sh's
+# system environment) launches the right interpreter.
+# =============================================================================
+
+perception:
+  # ---- Topics ----
+  cmd_topic:    "/perception/cmd"      # "start" | "stop" | "restart"
+  status_topic: "/perception/status"   # latched JSON status for the dashboard
+
+  # ---- Conda environment of the perception node ----
+  # TODO: set this to the name of the conda env on the Jetson that has
+  # tensorrt + rospy for Python 3 (the one you `conda activate` before running
+  # ./run-models.sh by hand). Leave empty to use whatever python3 is on PATH --
+  # which will NOT work when perception is started from the dashboard.
+  conda_env: ""
+  # Path to conda's shell hook. Leave empty to try the usual locations
+  # (~/miniconda3, ~/anaconda3, /opt/conda, $CONDA_PREFIX).
+  conda_sh:  ""
+
+  # ---- What to launch ----
+  mode:       "both"    # both | detection | segmentation
+  extra_args: ""        # extra flags forwarded verbatim to perception_node.py
+
+  # ---- Paths (empty/absent = alongside this package) ----
+  # run_script / stop_script / calibration_file default to
+  #   <pkg>/run-models.sh, <pkg>/stop-models.sh, <pkg>/perception/calibration.json
+
+  # ---- Liveness ----
+  process_pattern: "perception_node.py"  # pgrep -f pattern, as in the shell scripts
+  status_rate_hz:  1.0                   # status republish rate

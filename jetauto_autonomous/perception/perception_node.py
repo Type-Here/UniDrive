@@ -60,12 +60,20 @@ Options:
     --seg-tensorrt      Use TensorRT backend for the seg model (else ONNX)
     --debug             Publish /lane_follower/debug_image (default: on)
     --nodebug           Disable /lane_follower/debug_image
-    --calibration PATH  Calibration json (default: calibration.json)
+    --calibration PATH  Calibration json (default: perception/calibration.json)
     --max-fps FLOAT     Cap the combined loop to this FPS (0 = unlimited)
     --print-debug       Print per-frame timing to console
+
+BEV calibration
+---------------
+The BEV warp can be (re)calibrated at runtime from the web dashboard -- see
+`bev_calibration_session.py`. The node subscribes /bev_calibration/cmd and
+publishes /bev_calibration/status plus two preview JPEGs; a candidate is only
+committed when the user applies it, so aborting leaves the live warp untouched.
 """
 import argparse
 import ctypes
+import os
 import threading
 import time
 import json
@@ -77,7 +85,14 @@ import rospy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-from jetauto_autonomous.perception.auto_calibration import AutoCalibration
+# Works both as a package (repo root on PYTHONPATH) and when the node is run
+# directly from this directory, which is what run-models.sh does.
+try:
+    from jetauto_autonomous.perception.auto_calibration import AutoCalibration
+    from jetauto_autonomous.perception.bev_calibration_session import BevCalibrationSession
+except ImportError:
+    from auto_calibration import AutoCalibration
+    from bev_calibration_session import BevCalibrationSession
 
 
 # -- Topics --------------------------------------------------------------------
@@ -117,6 +132,11 @@ CLASS_COLORS = np.array([
 # Top/bottom cut of the BEV (kept for AutoCalibration parametrisation)
 TOP_LINE    = MODEL_H - (MODEL_H // 3)
 BOTTOM_LINE = MODEL_H - 20
+
+# Anchored to this file so the calibration is read from and written to the same
+# place whatever working directory the node was launched from.
+PERCEPTION_DIR      = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CALIBRATION = os.path.join(PERCEPTION_DIR, "calibration.json")
 
 
 # =============================================================================
@@ -457,19 +477,36 @@ class PerceptionNode:
 
             self.calib_lane_label = CLASS_LANE_MARKING
             self.log_calibration_once = True
-            points, angle = self.check_calibration(args.calibration)
+            self.calibration_file = os.path.abspath(args.calibration)
+            points, angle = self.check_calibration(self.calibration_file)
+            # save_path is passed explicitly: without it the calibrator would
+            # read --calibration but write ./calibration.json.
+            self.auto_calib = AutoCalibration(
+                TOP_LINE, BOTTOM_LINE, last_src_pts=points,
+                calib_angle=angle if angle is not None else 0.0,
+                save_path=self.calibration_file)
             if points is None:
-                self.auto_calib = AutoCalibration(TOP_LINE, BOTTOM_LINE)
-                self.pending_calibration = self._prompt_calibration()
-                if not self.pending_calibration:
-                    rospy.signal_shutdown("Calibration declined")
-                    raise SystemExit(0)
+                rospy.logwarn("[perception] No calibration at %s",
+                              self.calibration_file)
             else:
-                rospy.loginfo(
-                    "[perception] Loaded calibration from: %s", args.calibration)
-                self.auto_calib = AutoCalibration(
-                    TOP_LINE, BOTTOM_LINE, last_src_pts=points, calib_angle=angle)
-                self.pending_calibration = False
+                rospy.loginfo("[perception] Loaded calibration from: %s",
+                              self.calibration_file)
+
+            # Interactive (re)calibration driven from the dashboard.
+            self.calib_session = BevCalibrationSession(
+                self.auto_calib, self.calib_lane_label, self.calibration_file)
+            if points is None:
+                # No calibration on disk. Keep the historical behaviour -- ask,
+                # and calibrate off the first frame -- so a headless run started
+                # by run-models.sh (which answers "y" on stdin) still works.
+                # Declining is no longer fatal: the dashboard can calibrate at
+                # any time, so we come up uncalibrated and wait instead.
+                if self._prompt_calibration():
+                    self.calib_session.arm()
+                else:
+                    rospy.logwarn(
+                        "[perception] Calibration declined -- BEV falls back to "
+                        "a plain crop. Calibrate from the dashboard.")
 
             # Seg input buffer
             self._inp_buf = np.empty((1, 3, MODEL_H, MODEL_W), dtype=np.float32)
@@ -495,6 +532,13 @@ class PerceptionNode:
                 LANE_MASK_BEV_TOPIC, Image, queue_size=1)
         if self.debug and self.run_segmentation:
             self.debug_pub = rospy.Publisher(DEBUG_TOPIC, Image, queue_size=1)
+        if not self.run_segmentation:
+            # Detection-only run: advertise the status anyway so the dashboard
+            # can say why calibration is not on offer.
+            self.calib_session = BevCalibrationSession(
+                AutoCalibration(TOP_LINE, BOTTOM_LINE), CLASS_LANE_MARKING,
+                DEFAULT_CALIBRATION, available=False)
+        self.calib_session.start_ros()
 
         # -- Shared frame buffer (camera cb writes, inference thread reads) ----
         self.frames_total = 0
@@ -650,16 +694,17 @@ class PerceptionNode:
         if mask.ndim == 3:
             mask = mask[0]
 
-        # Calibration on the first valid frame
-        if self.pending_calibration:
-            self.auto_calib.calibrate(mask, self.calib_lane_label)
-            self.pending_calibration = False
+        # Consume any pending dashboard command and, when armed, capture this
+        # mask as the calibration candidate. Runs on the inference thread so the
+        # calibrator is never mutated from two threads.
+        self.calib_session.poll(mask)
 
         bev_mask    = self.auto_calib.make_bev(mask)
         bev_mask_u8 = np.clip(bev_mask, 0, 255).astype(np.uint8, copy=False)
 
         if self.log_calibration_once:
-            self.auto_calib.save_debug(mask, prefix="lane_calibration")
+            self.auto_calib.save_debug(
+                mask, prefix=os.path.join(PERCEPTION_DIR, "lane_calibration"))
             rospy.loginfo("[perception] Saved calibration debug images")
             self.log_calibration_once = False
 
@@ -739,8 +784,9 @@ def main():
                         help="Publish %s (default: on)" % DEBUG_TOPIC)
     parser.add_argument("--nodebug", action="store_false", dest="debug",
                         help="Disable %s" % DEBUG_TOPIC)
-    parser.add_argument("--calibration", default="calibration.json",
-                        help="Path to calibration json file")
+    parser.add_argument("--calibration", default=DEFAULT_CALIBRATION,
+                        help="Path to calibration json file "
+                             "(default: perception/calibration.json)")
     parser.add_argument("--max-fps", type=float, default=0.0, dest="max_fps",
                         help="Cap the combined loop to this FPS (0 = unlimited)")
     parser.add_argument("--print-debug", action="store_true", dest="print_debug",

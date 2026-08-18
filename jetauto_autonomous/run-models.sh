@@ -29,6 +29,11 @@
 # Prerequisites:
 #   * roscore (and the camera driver) are already running.
 #   * Run inside the conda Python 3 environment that has tensorrt + rospy.
+#     Alternatively export PERCEPTION_CONDA_ENV=<env name> and this script
+#     activates it itself (that is how perception_supervisor_node.py, and so
+#     the dashboard's "start perception" button, launches it -- that process
+#     inherits the system Python 2 environment and cannot activate conda
+#     beforehand). PERCEPTION_CONDA_SH overrides the conda hook location.
 #   * The TensorRT engines live in perception/models/ with these exact names:
 #         perception/models/segmentation.engine
 #         perception/models/object_detection.engine
@@ -41,6 +46,51 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PERCEPTION_DIR="${SCRIPT_DIR}/perception"
 MODELS_DIR="${PERCEPTION_DIR}/models"
+REPO_ROOT="$(dirname "${SCRIPT_DIR}")"
+
+# perception_node.py imports auto_calibration as
+# jetauto_autonomous.perception.auto_calibration when the repo root is
+# importable, and falls back to a plain local import otherwise. Put the repo
+# root on PYTHONPATH so the package form works too.
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+# Activate the conda env ourselves when asked (see the header note). A caller
+# that has already activated it leaves PERCEPTION_CONDA_ENV unset and nothing
+# happens here.
+if [ -n "${PERCEPTION_CONDA_ENV:-}" ]; then
+    CONDA_SH="${PERCEPTION_CONDA_SH:-}"
+    if [ -z "${CONDA_SH}" ]; then
+        for candidate in \
+            "${CONDA_PREFIX:-}/etc/profile.d/conda.sh" \
+            "${HOME}/miniconda3/etc/profile.d/conda.sh" \
+            "${HOME}/anaconda3/etc/profile.d/conda.sh" \
+            "/opt/conda/etc/profile.d/conda.sh"
+        do
+            if [ -n "${candidate}" ] && [ -f "${candidate}" ]; then
+                CONDA_SH="${candidate}"
+                break
+            fi
+        done
+    fi
+    if [ -z "${CONDA_SH}" ] || [ ! -f "${CONDA_SH}" ]; then
+        echo "Cannot activate conda env '${PERCEPTION_CONDA_ENV}': conda.sh not found." >&2
+        echo "Set PERCEPTION_CONDA_SH (or perception/conda_sh in config/lane_params.yaml)" >&2
+        echo "to the full path of <conda>/etc/profile.d/conda.sh." >&2
+        exit 1
+    fi
+    # conda's shell hook dereferences unset variables; -u would abort on it.
+    set +u
+    # shellcheck disable=SC1090
+    . "${CONDA_SH}"
+    if ! conda activate "${PERCEPTION_CONDA_ENV}"; then
+        set -u
+        echo "conda activate '${PERCEPTION_CONDA_ENV}' failed." >&2
+        echo "Check perception/conda_env in config/lane_params.yaml." >&2
+        exit 1
+    fi
+    set -u
+    echo "[conda] activated '${PERCEPTION_CONDA_ENV}' ($(command -v python3))"
+fi
 
 DET_MODEL="${MODELS_DIR}/object_detection.engine"
 SEG_MODEL="${MODELS_DIR}/segmentation.engine"

@@ -98,6 +98,7 @@ ZOMBIE_PATTERNS=(
   "python.*lane_controller_node\.py"
   "python.*waypoint_manager_node\.py"
   "python.*serve_dashboard\.py"
+  "python.*perception_supervisor_node\.py"
   "rosbridge_websocket"
   "web_video_server"
 )
@@ -138,7 +139,7 @@ mkdir -p "$LOG_DIR"
 > "$PID_FILE"
 
 # ---- 1. Load YAML parameters into rosparam ----
-echo "[1/7] rosparam load $PARAMS_FILE"
+echo "[1/8] rosparam load $PARAMS_FILE"
 rosparam load "$PARAMS_FILE"
 
 # ---- Helper function to launch a background process + log + PID ----
@@ -158,17 +159,17 @@ start_proc () {
 }
 
 # ---- 2. rosbridge_websocket (port 9090) ----
-echo "[2/7] rosbridge_websocket"
+echo "[2/8] rosbridge_websocket"
 start_proc rosbridge \
   rosrun rosbridge_server rosbridge_websocket _port:=9090
 
 # ---- 3. web_video_server (port 8080) ----
-echo "[3/7] web_video_server"
+echo "[3/8] web_video_server"
 start_proc web_video_server \
   rosrun web_video_server web_video_server _port:=8080
 
 # ---- 4. dashboard HTTP (port 8000) ----
-echo "[4/7] serve_dashboard"
+echo "[4/8] serve_dashboard"
 start_proc dashboard_http \
   $PY "$SCRIPTS_DIR/serve_dashboard.py" \
        --port 8000 \
@@ -176,20 +177,26 @@ start_proc dashboard_http \
        --map "$MAP_FILE"
 
 # ---- 5. our nodes ----
-echo "[5/7] lane_controller"
+echo "[5/8] lane_controller"
 start_proc lane_controller \
   $PY "$SCRIPTS_DIR/lane_controller_node.py"
 
 # Override map path (to avoid using $(find ...))
 rosparam set "waypoint_manager/map_file" "$MAP_FILE"
 
-echo "[6/7] waypoint_manager (path-tracker)"
+echo "[6/8] waypoint_manager (path-tracker)"
 start_proc waypoint_manager \
   $PY "$SCRIPTS_DIR/waypoint_manager_node.py"
 
-echo "[7/7] n_orchestrator (sole cmd_vel publisher)"
+echo "[7/8] n_orchestrator (sole cmd_vel publisher)"
 start_proc orchestrator \
   $PY "$SCRIPTS_DIR/$ORCHESTRATOR_NAME"
+
+# Lets the dashboard start/stop the Python 3 perception node and run the BEV
+# calibration. It does not start perception by itself.
+echo "[8/8] perception_supervisor (dashboard start/stop of the models)"
+start_proc perception_supervisor \
+  $PY "$SCRIPTS_DIR/perception_supervisor_node.py"
 
 # ---- Summary ----
 echo
@@ -208,8 +215,10 @@ echo "  To watch a log: tail -f $LOG_DIR/lane_controller.log
                   tail -f $LOG_DIR/orchestrator.log"
 echo "================================================="
 echo
-echo "REMINDER: lane_follower.py must be started separately"
-echo "          in its conda Python 3.6.9 environment."
+echo "REMINDER: the perception node (perception_node.py) is NOT started here."
+echo "          Start it from the dashboard (\"Avvia percezione\"), which needs"
+echo "          perception/conda_env set in $PARAMS_FILE, or by hand:"
+echo "              conda activate <env> && ./run-models.sh"
 echo "          Without it, /lane_mask_bev is not published"
 echo "          and lane_controller stays in STOP state."
 

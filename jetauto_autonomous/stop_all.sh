@@ -18,6 +18,7 @@ ZOMBIE_PATTERNS=(
   "python.*lane_controller_node\.py"
   "python.*waypoint_manager_node\.py"
   "python.*serve_dashboard\.py"
+  "python.*perception_supervisor_node\.py"
   "rosbridge_websocket"
   "web_video_server"
 )

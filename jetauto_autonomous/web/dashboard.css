@@ -169,6 +169,41 @@
   .remap-popup b  { color: var(--text); }
   .remap-overlay  { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 99; }
 
+  /* Perception bar: one more button than the drive bar, so let it wrap
+     instead of squeezing the labels onto two lines. */
+  .drive-bar.perception { flex-wrap: wrap; }
+  .drive-bar.perception .btn,
+  .drive-bar.perception .drive-state { white-space: nowrap; }
+
+  .perc-error {
+    margin-top: 6px; padding: 6px 10px; border-radius: 4px;
+    background: rgba(255,107,107,.10); border: 1px solid var(--red);
+    color: var(--red); font-size: 11px; line-height: 1.5; word-break: break-word;
+  }
+
+  /* BEV calibration popup (reuses .remap-popup, wider for the two previews) */
+  .bev-popup { min-width: 380px; max-width: 560px; max-height: 88vh; overflow-y: auto; }
+  .bev-popup h3 { color: var(--teal); }
+  .bev-msg  { margin: 0 0 12px; color: var(--text); font-size: 13px; line-height: 1.5; }
+  .bev-msg.error { color: var(--red); }
+  .bev-reason { display: inline-block; margin-top: 4px; font-size: 12px; opacity: .85; }
+  .bev-figure { margin: 0 0 10px; }
+  .bev-figure img {
+    display: block; width: 100%; border-radius: 4px;
+    border: 1px solid var(--border); background: #0a0c10;
+    image-rendering: pixelated;   /* 320x128 masks: keep the pixels crisp */
+  }
+  .bev-figure figcaption { margin-top: 3px; font-size: 11px; color: var(--muted); }
+  .bev-points {
+    margin: 0 0 10px; font-family: monospace; font-size: 11px; color: var(--muted);
+    word-break: break-all;
+  }
+  .bev-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+  .bev-actions .btn { flex: 1 1 auto; }
+  .bev-hint { margin: 10px 0 0; font-size: 11px; color: var(--muted); line-height: 1.5; }
+  .drive-state.starting { color: var(--yellow); }
+  .drive-state.error    { color: var(--red); }
+
   /* Buttons */
   .btn { border: none; padding: 7px 16px; border-radius: 4px; font-weight: 600; font-size: 13px; cursor: pointer; transition: opacity .15s; }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }

@@ -40,6 +40,16 @@
         <span class="drive-state stopped" id="driveState">● FERMA</span>
       </div>
 
+      <!-- Perception node (Python 3 models) + BEV calibration -->
+      <div class="drive-bar perception">
+        <span class="drive-label">Percezione</span>
+        <button class="btn enable" id="percStartBtn">▶ AVVIA MODELLI</button>
+        <button class="btn disable" id="percStopBtn">■ FERMA MODELLI</button>
+        <button class="btn calib" id="bevCalibBtn" title="Ricalibra la vista dall'alto (BEV)">📐 Calibra BEV</button>
+        <span class="drive-state stopped" id="percState">● --</span>
+      </div>
+      <div class="perc-error" id="percError" style="display:none"></div>
+
       <!-- Lane / nav badges -->
       <div class="status-bar">
         <span class="badge" id="laneState">LANE: --</span>
@@ -128,6 +138,34 @@
   <button class="btn ghost" onclick="toggleRemapInfo(false)" style="width:100%;margin-top:6px;">✕ Chiudi</button>
 </div>
 
+<div class="remap-overlay" id="bevCalibOverlay" style="display:none"></div>
+<div class="remap-popup bev-popup" id="bevCalibPopup" style="display:none">
+  <h3 id="bevCalibTitle">📐 Calibrazione BEV</h3>
+  <p class="bev-msg" id="bevCalibMsg">Avviare la calibrazione BEV?</p>
+
+  <div id="bevCalibPreviews" style="display:none">
+    <figure class="bev-figure">
+      <img id="bevPointsImg" alt="Punti rilevati">
+      <figcaption>Punti rilevati sulla maschera di segmentazione</figcaption>
+    </figure>
+    <figure class="bev-figure">
+      <img id="bevWarpImg" alt="Risultato BEV">
+      <figcaption>Vista dall'alto risultante</figcaption>
+    </figure>
+    <p class="bev-points" id="bevCalibPoints"></p>
+  </div>
+
+  <div class="bev-actions">
+    <button class="btn start" id="bevYesBtn">✔ Sì, calibra</button>
+    <button class="btn ghost" id="bevNoBtn">✕ No</button>
+    <button class="btn start" id="bevApplyBtn"  style="display:none">✔ Applica</button>
+    <button class="btn remap" id="bevRedoBtn"   style="display:none">↻ Rifai</button>
+    <button class="btn stop"  id="bevAbortBtn"  style="display:none">✕ Annulla</button>
+  </div>
+  <p class="bev-hint" id="bevCalibHint">La guida autonoma viene fermata durante la calibrazione.
+     Inquadra un tratto di strada con entrambe le linee ben visibili.</p>
+</div>
+
 <script src="vendor/eventemitter2.min.js"></script>
 <script src="vendor/roslib.min.js"></script>
 <script>
@@ -140,6 +178,12 @@ const CONFIG = {
   topic_debug:      '/lane_debug/image',
   topic_lfDebug:    '/lane_follower/debug_image',
   topic_objDet:     '/object_detection/video',
+  topic_percCmd:    '/perception/cmd',
+  topic_percStatus: '/perception/status',
+  topic_bevCmd:     '/bev_calibration/cmd',
+  topic_bevStatus:  '/bev_calibration/status',
+  topic_bevPoints:  '/bev_calibration/preview_points',
+  topic_bevWarp:    '/bev_calibration/preview_warp',
 };
 
 const NAV_CONFIRM_DIST = 0.30;  // m — below this, proceed silently

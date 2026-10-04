@@ -69,9 +69,11 @@ environment level; they communicate only via ROS topics.
 | `scripts/waypoint_manager_node.py` | ROS node: Dijkstra + waypoint sequencing; publishes `nav_info` (plans, does not drive) |
 | `scripts/n_orchestrator.py` | ROS node, self-contained sole publisher of `cmd_vel`: bundles the base `Orchestrator` (remap, drift fix, pure-pursuit, junction spin) plus lane/map disagreement blend, junctions, roundabout, drift corrections, fallback pure-pursuit, terminal EMERGENCY_STOP |
 | `scripts/map_loader.py` | YAML loading + NetworkX graph, node classification |
+| `scripts/perception_supervisor_node.py` | ROS node: starts/stops the Python 3 perception node from the dashboard (`run-models.sh` / `stop-models.sh`), reports `/perception/status` |
 | `scripts/serve_dashboard.py` | Standalone mini HTTP server for the dashboard |
 | `config/lane_params.yaml` | All parameters (speeds, Hough thresholds, BEV, orchestrator, etc.) |
-| `web/dashboard.html` | UI: video feed + SVG map + controls |
+| `web/dashboard.html` | UI: video feed + SVG map + controls + BEV calibration panel |
+| `perception/bev_calibration_session.py` | Python 3: the dashboard-driven BEV calibration session (preview / apply / redo / abort) |
 | `maps/map_clean-edited_smooth.yaml` | The track map (32 nodes, 36 directed edges) |
 | `start_all.sh` | Starts the whole ROS stack (rosbridge, web_video, dashboard, lane_controller, waypoint_manager, orchestrator) |
 | `stop_all.sh` | Stops everything + publishes a zero Twist |
@@ -133,18 +135,27 @@ What it launches:
 5. `lane_controller_node.py` - lateral control (proposes cmd_vel)
 6. `waypoint_manager_node.py` - waypoint management (plans, publishes nav_info)
 7. `n_orchestrator.py` - sole publisher of `/jetauto_controller/cmd_vel` (FSM, blend, roundabout, fallback)
+8. `perception_supervisor_node.py` - lets the dashboard start/stop the perception node
 
 Logs go to `/tmp/jetauto_autonomous_logs/`.
 Process PIDs to `/tmp/jetauto_autonomous.pids`.
 
-## In another terminal: start the lane follower
+## Start the perception node (the models)
 
-In a **separate terminal** (it lives in a different Python environment):
+`start_all.sh` does **not** start it: it runs in a different Python
+environment. Two ways:
+
+**From the dashboard** (preferred) - press **▶ AVVIA MODELLI** in the
+"Percezione" bar. This needs `perception/conda_env` set in
+`config/lane_params.yaml` to the name of the conda env that has tensorrt +
+rospy for Python 3; `run-models.sh` activates it itself.
+
+**By hand**, in a separate terminal:
 
 ```bash
 conda activate <env_name>
-cd ~/path/to/UniDrive/on_jetauto_scripts/drive_segm
-python lane_follower.py [usual args]
+cd ~/jetauto_autonomous
+./run-models.sh              # both models; ./stop-models.sh to stop
 ```
 
 Verify with:
@@ -152,6 +163,26 @@ Verify with:
 ```bash
 rostopic hz /lane_mask_bev
 ```
+
+## BEV calibration from the dashboard
+
+The bird's-eye-view warp is derived from four lane corners found in the
+segmentation mask, cached in `perception/calibration.json`. Press
+**📐 Calibra BEV** with the models running:
+
+1. *"Avviare la calibrazione BEV?"* - **Sì** stops autonomous driving and
+   captures the next mask.
+2. Two previews appear: the corners picked on the mask, and the BEV they
+   produce. Then *"Applicare la calibrazione?"*:
+   - **Applica** - commit and save. Effective on the next frame, no engine
+     reload.
+   - **Rifai** - recompute from a fresh frame (aim at a stretch of road where
+     both lane markings are clearly visible).
+   - **Annulla** - discard. The previous calibration is kept untouched: the
+     candidate is only staged until you apply it.
+
+If no calibration exists when the models come up, the panel opens by itself.
+A calibration that finds no lane pixels reports why and can simply be redone.
 
 ## Open the dashboard
 

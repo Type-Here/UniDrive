@@ -27,7 +27,7 @@ in **Python 3** (conda, ONNX Runtime or TensorRT), all control nodes run in **Py
 | Path | Content |
 |---|---|
 | `jetauto_autonomous/` | The on-robot stack: perception node, lane controller, waypoint manager, orchestrator, web dashboard, track map, `start_all.sh`/`stop_all.sh`, `run-models.sh`/`stop-models.sh` |
-| `jetauto_autonomous/perception/` | `perception_node.py` (Python 3) — merged detection + segmentation node + `auto_calibration.py` + TensorRT engines (`models/`) |
+| `jetauto_autonomous/perception/` | `perception_node.py` (Python 3) — merged detection + segmentation node + `auto_calibration.py` + `bev_calibration_session.py` + TensorRT engines (`models/`) |
 | `jetauto_autonomous/docs/` | [Architecture](jetauto_autonomous/docs/architecture.md), [setup/usage README](jetauto_autonomous/docs/README.md), ROS topic reference, LaTeX report |
 | `on_jetauto_scripts/` | Utility scripts for the robot: maintenance shells, TensorRT conversion, dataset extraction, map builder, model smoke tests — see [`on_jetauto_scripts/README.md`](on_jetauto_scripts/README.md) |
 | `on_jetauto_scripts/drive_segm/` | Superseded segmentation-only node `lane_follower.py` — kept for reference |
@@ -52,9 +52,12 @@ cd jetauto_autonomous
 #    http://<ROBOT_IP>:8000/
 ```
 
-First `run-models.sh` run without a `perception/calibration.json` auto-answers the BEV
-calibration prompt. Stop the perception node with `./stop-models.sh`; stop everything
-else with `./stop_all.sh`.
+The perception node can also be started, stopped and **calibrated from the dashboard**
+(the "Percezione" bar and the 📐 Calibra BEV panel) — set `perception/conda_env` in
+`config/lane_params.yaml` first so `run-models.sh` can activate the right conda
+environment on its own. Without a `perception/calibration.json` the dashboard offers a
+calibration as soon as the models are up. Stop the perception node with
+`./stop-models.sh`; stop everything else with `./stop_all.sh`.
 
 See [`jetauto_autonomous/docs/README.md`](jetauto_autonomous/docs/README.md) for
 prerequisites, installation, tuning and troubleshooting.
@@ -89,6 +92,9 @@ the bottom 55% of the camera frame. See [`pipeline/README.md`](pipeline/README.m
   fallback timeout) converges on a terminal, debounced `EMERGENCY_STOP`.
 - **Testable without hardware** — pure-logic core modules, an offline video tester, and a
   deterministic closed-loop simulator that re-runs the historical failure scenarios.
+- **Reversible BEV calibration** — the warp is recalibrated from the web UI with a visual
+  preview of the picked lane corners; the candidate is staged in the perception node and
+  the live warp is only touched on apply, so aborting cannot break a working setup.
 
 ## Platform
 

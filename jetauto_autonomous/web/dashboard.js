@@ -89,6 +89,8 @@ function syncDriveUI(val) {
 
 // --- ROS topics ---------------------------------------------------------------
 let goalPub = null;
+let percCmdPub = null;   // std_msgs/String: start | stop | restart
+let bevCmdPub  = null;   // std_msgs/String: start | redo | apply | abort
 
 function setupTopics() {
   goalPub = new ROSLIB.Topic({
@@ -103,6 +105,26 @@ function setupTopics() {
   remapCmdPub = new ROSLIB.Topic({
     ros, name: '/jetauto_controller/cmd_vel', messageType: 'geometry_msgs/Twist'
   });
+  percCmdPub = new ROSLIB.Topic({
+    ros, name: CONFIG.topic_percCmd, messageType: 'std_msgs/String'
+  });
+  bevCmdPub = new ROSLIB.Topic({
+    ros, name: CONFIG.topic_bevCmd, messageType: 'std_msgs/String'
+  });
+
+  // Perception process + BEV calibration. Both status topics are latched, so
+  // these fire once immediately with the current state.
+  new ROSLIB.Topic({ ros, name: CONFIG.topic_percStatus, messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
+    .subscribe(m => updatePerceptionStatus(m.data));
+
+  new ROSLIB.Topic({ ros, name: CONFIG.topic_bevStatus, messageType: 'std_msgs/String', queue_length: 1 })
+    .subscribe(m => updateBevStatus(m.data));
+
+  new ROSLIB.Topic({ ros, name: CONFIG.topic_bevPoints, messageType: 'sensor_msgs/CompressedImage', queue_length: 1 })
+    .subscribe(m => setBevPreview('bevPointsImg', m.data));
+
+  new ROSLIB.Topic({ ros, name: CONFIG.topic_bevWarp, messageType: 'sensor_msgs/CompressedImage', queue_length: 1 })
+    .subscribe(m => setBevPreview('bevWarpImg', m.data));
 
   new ROSLIB.Topic({ ros, name: '/waypoint_manager/status', messageType: 'std_msgs/String', throttle_rate: 500, queue_length: 1 })
     .subscribe(m => updateNavBadge(m.data));
@@ -838,6 +860,189 @@ function toggleRemapInfo(show) {
   popup.style.display = overlay.style.display = visible ? '' : 'none';
 }
 document.getElementById('remapInfoBtn').onclick = () => toggleRemapInfo();
+
+// --- Perception node (Python 3 models) ----------------------------------------
+// The models run in their own conda process, supervised by
+// perception_supervisor_node.py. We only send commands and mirror the real
+// state it reports -- never assume our own publish took effect.
+
+let percStatus = null;
+let bevPromptShown = false;   // auto-prompt for a missing calibration: once per page
+
+const PERC_LABEL = {
+  STOPPED: '● FERMI', STARTING: '● AVVIO…', RUNNING: '● IN ESECUZIONE',
+  STOPPING: '● ARRESTO…', ERROR: '● ERRORE',
+};
+const PERC_CLASS = {
+  STOPPED: 'stopped', STARTING: 'starting', RUNNING: 'running',
+  STOPPING: 'starting', ERROR: 'error',
+};
+
+function updatePerceptionStatus(raw) {
+  let st;
+  try { st = JSON.parse(raw); } catch (e) { return; }
+  percStatus = st;
+
+  const el = document.getElementById('percState');
+  el.textContent = PERC_LABEL[st.state] || ('● ' + st.state);
+  el.className   = 'drive-state ' + (PERC_CLASS[st.state] || 'stopped');
+  el.title       = st.message || '';
+
+  const busy = (st.state === 'STARTING' || st.state === 'STOPPING');
+  document.getElementById('percStartBtn').disabled = busy || st.state === 'RUNNING';
+  document.getElementById('percStopBtn').disabled  = busy || st.state === 'STOPPED';
+  // Calibration reads a live segmentation mask, so it needs the models running.
+  document.getElementById('bevCalibBtn').disabled  = (st.state !== 'RUNNING');
+
+  // A failed start is almost always a misconfigured conda env: show why,
+  // rather than leaving it in a tooltip.
+  const err = document.getElementById('percError');
+  if (st.state === 'ERROR' && st.message) {
+    err.textContent   = '⚠ ' + st.message;
+    err.style.display = '';
+    console.warn('[perception]', st.message);
+  } else {
+    err.style.display = 'none';
+  }
+
+  // First run with no calibration on disk: offer one instead of letting the
+  // robot drive on an uncalibrated BEV.
+  if (!bevPromptShown && st.state === 'RUNNING' && st.calibrated === false) {
+    bevPromptShown = true;
+    openBevCalib(true);
+  }
+}
+
+function sendPerceptionCmd(cmd) {
+  if (!percCmdPub) { alert('ROS non connesso'); return; }
+  percCmdPub.publish(new ROSLIB.Message({ data: cmd }));
+}
+
+document.getElementById('percStartBtn').onclick = () => sendPerceptionCmd('start');
+document.getElementById('percStopBtn').onclick  = () => sendPerceptionCmd('stop');
+
+// --- BEV calibration panel ----------------------------------------------------
+// Flow: Sì -> the node captures the next mask and publishes two previews
+// (PREVIEW) -> Applica / Rifai / Annulla. Annulla is safe by construction: the
+// candidate is staged in the perception node and the live warp is only touched
+// on Applica.
+
+let bevLast    = null;    // last /bev_calibration/status payload
+let bevOpen    = false;
+let bevClosing = false;   // suppress the IDLE that follows APPLIED
+
+function setBevPreview(imgId, b64) {
+  if (!b64) return;
+  document.getElementById(imgId).src = 'data:image/jpeg;base64,' + b64;
+}
+
+function openBevCalib(auto) {
+  bevOpen = true;
+  document.getElementById('bevCalibOverlay').style.display = '';
+  document.getElementById('bevCalibPopup').style.display   = '';
+  document.getElementById('bevCalibTitle').textContent = auto
+    ? '📐 Nessuna calibrazione BEV trovata'
+    : '📐 Calibrazione BEV';
+  renderBevPanel(bevLast || { state: 'IDLE', reason: '' });
+}
+
+function closeBevCalib() {
+  bevOpen = false;
+  document.getElementById('bevCalibOverlay').style.display = 'none';
+  document.getElementById('bevCalibPopup').style.display   = 'none';
+}
+
+function updateBevStatus(raw) {
+  let st;
+  try { st = JSON.parse(raw); } catch (e) { return; }
+  bevLast = st;
+  if (bevOpen) renderBevPanel(st);
+}
+
+function sendBevCmd(cmd) {
+  if (!bevCmdPub) { alert('ROS non connesso'); return; }
+  bevCmdPub.publish(new ROSLIB.Message({ data: cmd }));
+}
+
+function _bevButtons(yes, no, apply, redo, abort) {
+  document.getElementById('bevYesBtn').style.display   = yes   ? '' : 'none';
+  document.getElementById('bevNoBtn').style.display    = no    ? '' : 'none';
+  document.getElementById('bevNoBtn').textContent      = yes ? '✕ No' : '✕ Chiudi';
+  // The hint is about running a calibration; hide it where none can be run.
+  document.getElementById('bevCalibHint').style.display = (yes || apply || redo) ? '' : 'none';
+  document.getElementById('bevApplyBtn').style.display = apply ? '' : 'none';
+  document.getElementById('bevRedoBtn').style.display  = redo  ? '' : 'none';
+  document.getElementById('bevAbortBtn').style.display = abort ? '' : 'none';
+}
+
+function renderBevPanel(st) {
+  if (bevClosing) return;
+  const msg      = document.getElementById('bevCalibMsg');
+  const previews = document.getElementById('bevCalibPreviews');
+  const pts      = document.getElementById('bevCalibPoints');
+  msg.className  = 'bev-msg';
+  previews.style.display = 'none';
+
+  switch (st.state) {
+    case 'CAPTURING':
+      msg.textContent = 'Acquisizione del prossimo fotogramma…';
+      _bevButtons(false, false, false, false, true);
+      break;
+
+    case 'PREVIEW':
+      msg.textContent = 'Applicare la calibrazione?';
+      previews.style.display = '';
+      pts.textContent = st.staged_points
+        ? 'Punti: ' + JSON.stringify(st.staged_points) +
+          '   angolo: ' + (st.angle_deg !== undefined ? st.angle_deg.toFixed(1) : '--') + '°'
+        : '';
+      _bevButtons(false, false, true, true, true);
+      break;
+
+    case 'FAILED':
+      // The reason comes from the perception node (English, same text as its
+      // log line); frame it in Italian rather than trying to translate it here.
+      msg.className = 'bev-msg error';
+      msg.innerHTML = '⚠ Calibrazione non riuscita.<br><span class="bev-reason"></span>';
+      msg.querySelector('.bev-reason').textContent = st.reason || '';
+      _bevButtons(false, false, false, true, true);
+      break;
+
+    case 'APPLIED':
+      msg.textContent = '✔ Calibrazione applicata e salvata.';
+      _bevButtons(false, false, false, false, false);
+      bevClosing = true;
+      setTimeout(() => { bevClosing = false; closeBevCalib(); }, 1600);
+      break;
+
+    case 'UNAVAILABLE':
+      msg.className   = 'bev-msg error';
+      msg.textContent = 'Il nodo di percezione è avviato senza segmentazione '
+                      + '(--mode detection): nessuna maschera da calibrare.';
+      _bevButtons(false, true, false, false, false);
+      break;
+
+    default:   // IDLE
+      msg.textContent = st.calibrated
+        ? 'Esiste già una calibrazione. Avviarne una nuova?'
+        : 'Avviare la calibrazione BEV?';
+      _bevButtons(true, true, false, false, false);
+  }
+}
+
+// Calibration means looking at a static scene: stop driving first, exactly like
+// the FERMA button. Re-enabling stays manual.
+function bevSafetyStop() {
+  if (goalPub) goalPub.publish(new ROSLIB.Message({ data: [] }));
+  setDriveEnabled(false);
+}
+
+document.getElementById('bevCalibBtn').onclick = () => openBevCalib(false);
+document.getElementById('bevNoBtn').onclick    = closeBevCalib;
+document.getElementById('bevYesBtn').onclick   = () => { bevSafetyStop(); sendBevCmd('start'); };
+document.getElementById('bevRedoBtn').onclick  = () => { bevSafetyStop(); sendBevCmd('redo'); };
+document.getElementById('bevApplyBtn').onclick = () => sendBevCmd('apply');
+document.getElementById('bevAbortBtn').onclick = () => { sendBevCmd('abort'); closeBevCalib(); };
 
 // --- Init ---------------------------------------------------------------------
 loadMap();
